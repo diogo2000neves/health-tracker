@@ -1,0 +1,10 @@
+# Never bake secrets or local data into the image — the token is injected at
+# runtime via Secret Manager.
+credentials/
+data/
+venv/
+__pycache__/
+*.pyc
+.git
+.gitignore
+README.md

@@ -1,0 +1,5 @@
+Flask>=3.0
+gunicorn>=21.2
+google-genai>=1.0
+google-api-python-client>=2.100
+google-auth>=2.28

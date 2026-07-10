@@ -1,0 +1,16 @@
+# Secrets — never commit
+credentials/
+.env
+
+# Local data
+data/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+.python-version
+
+# IDEs & System files
+.idea/
+.DS_Store
