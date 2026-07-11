@@ -78,3 +78,14 @@ python -m src.fetch_weight
 ```
 
 Output lands in `data/bronze/weight_<timestamp>.json`.
+
+## Continuous deployment
+
+Pushing to `main` auto-builds and redeploys both Cloud Run targets via Cloud
+Build (`cloudbuild.yaml`, trigger `health-tracker-deploy` in `europe-west1`):
+
+- `health-tracker-daily` (Job) — built from `./Dockerfile`
+- `health-tracker-ingest` (Service) — built from `./ingest/Dockerfile`
+
+Images are tagged with the commit SHA; deploys swap only the image, so each
+target keeps its env vars and Secret Manager bindings.
