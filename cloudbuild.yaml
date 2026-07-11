@@ -1,0 +1,45 @@
+# Cloud Build pipeline — on push to main, build and deploy both Cloud Run targets:
+#   * health-tracker-daily  (Cloud Run Job)     from ./Dockerfile
+#   * health-tracker-ingest (Cloud Run Service) from ./ingest/Dockerfile
+#
+# Image tag = commit SHA, so every running revision is traceable to a commit.
+# `jobs update --image` / `deploy --image` swap ONLY the image and preserve each
+# target's env vars + secret bindings (e.g. the daily job's health-oauth-token
+# pin and HEALTH_START_DATE, the ingest service's Gemini/Drive secrets).
+substitutions:
+  _REGION: europe-west1
+  _AR: europe-west1-docker.pkg.dev/health-tracker-501322/cloud-run-source-deploy
+
+steps:
+  # --- daily job (Cloud Run Job) ---
+  - id: build-daily
+    name: gcr.io/cloud-builders/docker
+    args: ['build', '-f', 'Dockerfile', '-t', '${_AR}/health-tracker-daily:$COMMIT_SHA', '.']
+  - id: push-daily
+    name: gcr.io/cloud-builders/docker
+    args: ['push', '${_AR}/health-tracker-daily:$COMMIT_SHA']
+  - id: deploy-daily
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args: ['run', 'jobs', 'update', 'health-tracker-daily',
+           '--image', '${_AR}/health-tracker-daily:$COMMIT_SHA', '--region', '${_REGION}']
+
+  # --- ingest service (Cloud Run Service) ---
+  - id: build-ingest
+    name: gcr.io/cloud-builders/docker
+    args: ['build', '-f', 'ingest/Dockerfile', '-t', '${_AR}/health-tracker-ingest:$COMMIT_SHA', 'ingest']
+  - id: push-ingest
+    name: gcr.io/cloud-builders/docker
+    args: ['push', '${_AR}/health-tracker-ingest:$COMMIT_SHA']
+  - id: deploy-ingest
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args: ['run', 'deploy', 'health-tracker-ingest',
+           '--image', '${_AR}/health-tracker-ingest:$COMMIT_SHA', '--region', '${_REGION}']
+
+images:
+  - '${_AR}/health-tracker-daily:$COMMIT_SHA'
+  - '${_AR}/health-tracker-ingest:$COMMIT_SHA'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
