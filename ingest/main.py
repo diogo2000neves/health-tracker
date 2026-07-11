@@ -46,9 +46,12 @@ MEALS_FOLDER_ID = os.environ.get("MEALS_FOLDER_ID", "")
 TZ = ZoneInfo(os.environ.get("HEALTH_TZ", "Europe/Lisbon"))
 MEALS_TAB = "meals"
 
-# New columns are appended at the end so previously written rows stay aligned.
+# One row per meal. `items` is a JSON array breaking the plate into ingredients,
+# each with its own portion + macros; the flat calories/protein/carbs/fat columns
+# are the row totals (sum of items) that the daily job rolls up. `date` is dropped
+# — it's derivable from `datetime`.
 MEALS_HEADERS = [
-    "datetime", "date", "foods", "calories",
+    "datetime", "foods", "items", "calories",
     "protein_g", "carbs_g", "fat_g", "confidence", "photo_url",
     "portion_g", "notes",
 ]
@@ -56,37 +59,39 @@ LAST_COL = chr(ord("A") + len(MEALS_HEADERS) - 1)  # "K"
 
 PROMPT = """You are a meticulous nutrition analyst examining a photo of a meal.
 
-STEP 1 — IDENTIFY PRECISELY.
-Name the specific food(s). Never give a generic category when a specific one is
-visible. Actively distinguish look-alike foods using visual cues (size relative
-to other objects, skin/peel texture, colour, segment count, stem/leaves, cut,
-marbling, packaging). Examples of distinctions you must not blur:
+STEP 1 — IDENTIFY EVERY COMPONENT SEPARATELY.
+Break the plate into its distinct foods and list each as its own item. A plate of
+"meat with rice" is TWO items (the meat and the rice), not one. Name each item
+specifically — never a generic category when a specific one is visible. Actively
+distinguish look-alikes using visual cues (size relative to other objects,
+skin/peel texture, colour, segment count, cut, marbling, packaging): e.g.
 tangerine/clementine vs orange; sweet potato vs potato; salmon vs trout;
-prosciutto vs bacon vs cooked ham; yoghurt vs cream.
+prosciutto vs bacon vs cooked ham; yoghurt vs cream; white vs brown rice.
 
-STEP 2 — ESTIMATE THE PORTION.
-Find a scale reference in the image (plate or bowl diameter, cutlery, a hand,
-a can/bottle, standard packaging) and use it to estimate the real edible weight
-in grams of what is actually shown. Do NOT assume a standard serving size and do
-NOT default to 100 g. Exclude inedible parts (peel, rind, bones, shells, stones).
+STEP 2 — ESTIMATE EACH PORTION.
+For every item, find a scale reference (plate/bowl diameter, cutlery, a hand,
+a can/bottle, standard packaging) and estimate the real edible weight in grams of
+THAT item as actually shown. Do NOT assume standard servings and do NOT default
+to 100 g. Exclude inedible parts (peel, rind, bones, shells, stones).
 
-STEP 3 — COMPUTE NUTRITION FOR THAT EXACT PORTION.
-Derive calories and macros for the grams you estimated in step 2 — not per 100 g
-and not a generic serving. Account for visible cooking fat, oil, sauces,
-dressings and skin. Sanity-check yourself: calories must be within ~10% of
+STEP 3 — COMPUTE NUTRITION PER ITEM.
+For each item, derive calories and macros for the grams you estimated — not per
+100 g. Account for visible cooking fat, oil, sauces, dressings and skin. For each
+item, sanity-check: calories must be within ~10% of
 (protein_g x 4) + (carbs_g x 4) + (fat_g x 9). Fix the numbers if they disagree.
 
 RULES.
-- If two foods are plausible, pick the most likely and LOWER the confidence.
-- confidence reflects identification AND portion certainty together.
-- If the image contains no food, return foods="not food" and 0 for all numbers.
+- One food = one item. Split composite plates into their components.
+- If an item's identity is uncertain, pick the most likely and LOWER confidence.
+- confidence (0-1) reflects identification AND portion certainty across the meal.
+- If the image contains NO food, return "items": [].
 
 Reply with ONLY a JSON object, no markdown:
-{"foods": string, "portion_g": number, "calories": number, "protein_g": number,
- "carbs_g": number, "fat_g": number, "confidence": number,
- "notes": string}
+{"items": [{"name": string, "portion_g": number, "calories": number,
+ "protein_g": number, "carbs_g": number, "fat_g": number}, ...],
+ "confidence": number, "notes": string}
 "notes" = one short sentence naming the scale reference you used and your key
-assumption."""
+assumption for the meal."""
 
 # Sheets: service-account ADC. Gemini: client's own ADC.
 _sheets_creds, _ = google.auth.default(
@@ -117,6 +122,32 @@ def _extract_image():
     return data, mime
 
 
+def _normalize_items(raw) -> list:
+    """Coerce the model's item list into clean {name, portion_g, +macros} dicts."""
+    def f(x):
+        try:
+            return round(float(x), 1)
+        except (TypeError, ValueError):
+            return 0.0
+
+    items = []
+    for it in raw or []:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("name", "")).strip()[:120]
+        if not name:
+            continue
+        items.append({
+            "name": name,
+            "portion_g": f(it.get("portion_g")),
+            "calories": f(it.get("calories")),
+            "protein_g": f(it.get("protein_g")),
+            "carbs_g": f(it.get("carbs_g")),
+            "fat_g": f(it.get("fat_g")),
+        })
+    return items
+
+
 def analyze(img: bytes, mime: str) -> dict:
     """Try each model in order; fall back when one is overloaded/unavailable."""
     last_err = None
@@ -130,13 +161,17 @@ def analyze(img: bytes, mime: str) -> dict:
                 ),
             )
             data = json.loads(resp.text)
+            items = _normalize_items(data.get("items"))
+            total = lambda k: round(sum(i[k] for i in items), 1)
             return {
-                "foods": str(data.get("foods", "unknown"))[:200],
-                "portion_g": round(float(data.get("portion_g", 0)), 1),
-                "calories": round(float(data.get("calories", 0)), 1),
-                "protein_g": round(float(data.get("protein_g", 0)), 1),
-                "carbs_g": round(float(data.get("carbs_g", 0)), 1),
-                "fat_g": round(float(data.get("fat_g", 0)), 1),
+                "items": items,
+                # Human-readable summary label built from the item names.
+                "foods": ", ".join(i["name"] for i in items) if items else "not food",
+                "portion_g": total("portion_g"),
+                "calories": total("calories"),
+                "protein_g": total("protein_g"),
+                "carbs_g": total("carbs_g"),
+                "fat_g": total("fat_g"),
                 "confidence": round(float(data.get("confidence", 0)), 2),
                 "notes": str(data.get("notes", ""))[:300],
                 "model": model,
@@ -187,10 +222,11 @@ def _ensure_meals_tab() -> None:
 
 def append_meal(nut: dict, photo_url: str, when: datetime) -> None:
     row = [
-        when.isoformat(timespec="seconds"), when.date().isoformat(),
-        nut["foods"], nut["calories"], nut["protein_g"],
-        nut["carbs_g"], nut["fat_g"], nut["confidence"], photo_url,
-        nut["portion_g"], nut["notes"],
+        when.isoformat(timespec="seconds"),
+        nut["foods"],
+        json.dumps(nut["items"], ensure_ascii=False),
+        nut["calories"], nut["protein_g"], nut["carbs_g"], nut["fat_g"],
+        nut["confidence"], photo_url, nut["portion_g"], nut["notes"],
     ]
     _ensure_meals_tab()
     _sheets.spreadsheets().values().append(
