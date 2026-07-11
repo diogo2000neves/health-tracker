@@ -1,6 +1,11 @@
-# Cloud Build pipeline — on push to main, build and deploy both Cloud Run targets:
-#   * health-tracker-daily  (Cloud Run Job)     from ./Dockerfile
-#   * health-tracker-ingest (Cloud Run Service) from ./ingest/Dockerfile
+# Cloud Build pipeline — on push to main: run the unit tests, then build and
+# deploy every Cloud Run target:
+#   * health-tracker-daily   (Job)     from ./Dockerfile
+#   * health-tracker-weekly  (Job)     same image, different entrypoint args
+#   * health-tracker-ingest  (Service) from ./ingest/Dockerfile
+#
+# The test step is the deploy gate: a failing test stops the build before any
+# image is built, so production keeps running the previous version.
 #
 # Image tag = commit SHA, so every running revision is traceable to a commit.
 # `jobs update --image` / `deploy --image` swap ONLY the image and preserve each
@@ -11,7 +16,16 @@ substitutions:
   _AR: europe-west1-docker.pkg.dev/health-tracker-501322/cloud-run-source-deploy
 
 steps:
-  # --- daily job (Cloud Run Job) ---
+  # --- gate: unit tests ---
+  - id: test
+    name: python:3.12-slim
+    entrypoint: bash
+    args:
+      - -c
+      - pip install -q -r requirements.txt -r ingest/requirements.txt pytest
+        && python -m pytest tests -q
+
+  # --- daily + weekly jobs (shared image) ---
   - id: build-daily
     name: gcr.io/cloud-builders/docker
     args: ['build', '-f', 'Dockerfile', '-t', '${_AR}/health-tracker-daily:$COMMIT_SHA', '.']
@@ -23,8 +37,13 @@ steps:
     entrypoint: gcloud
     args: ['run', 'jobs', 'update', 'health-tracker-daily',
            '--image', '${_AR}/health-tracker-daily:$COMMIT_SHA', '--region', '${_REGION}']
+  - id: deploy-weekly
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args: ['run', 'jobs', 'update', 'health-tracker-weekly',
+           '--image', '${_AR}/health-tracker-daily:$COMMIT_SHA', '--region', '${_REGION}']
 
-  # --- ingest service (Cloud Run Service) ---
+  # --- ingest service ---
   - id: build-ingest
     name: gcr.io/cloud-builders/docker
     args: ['build', '-f', 'ingest/Dockerfile', '-t', '${_AR}/health-tracker-ingest:$COMMIT_SHA', 'ingest']

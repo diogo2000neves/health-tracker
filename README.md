@@ -24,17 +24,42 @@ Step 1 in this repo covers the bronze pull for weight.
 
 ```
 Health Tracker/
+├── cloudbuild.yaml         # CI/CD: test gate → build → deploy all targets
+├── Dockerfile              # image for the daily + weekly jobs
 ├── requirements.txt
-├── credentials/
-│   ├── oauth_client.json   # your GCP OAuth (Desktop) client — git-ignored
-│   └── token.json          # created on first login — git-ignored
-├── data/bronze/            # raw API responses land here
-└── src/
-    ├── auth.py             # OAuth flow + token refresh
-    ├── google_health.py    # tiny Google Health API v4 client
-    ├── authenticate.py     # one-time login: python -m src.authenticate
-    └── fetch_weight.py     # Step 1 entry point: python -m src.fetch_weight
+├── credentials/            # OAuth client + token — git-ignored
+├── data/bronze/            # raw API responses (local runs) — git-ignored
+├── ingest/
+│   ├── Dockerfile
+│   ├── main.py             # Cloud Run service: POST /ingest (photo), POST /feel
+│   └── requirements.txt
+├── src/
+│   ├── auth.py             # OAuth flow + token refresh (local)
+│   ├── authenticate.py     # one-time login: python -m src.authenticate
+│   ├── fetch_weight.py     # local debug pull: python -m src.fetch_weight
+│   ├── google_health.py    # Google Health API v4 client (with retries)
+│   ├── sheets.py           # schema + merge-upsert Sheet client
+│   ├── run_daily.py        # daily job: physique + nutrition roll-up + dashboard
+│   ├── weekly_insights.py  # weekly job: Gemini trend summary → `insights` tab
+│   └── maintenance.py      # idempotent schema/dashboard sync (run after schema changes)
+└── tests/                  # unit tests — the CI deploy gate
 ```
+
+## Endpoints (Cloud Run service, `X-Auth-Token` gated)
+
+- `POST /ingest` — meal photo (raw or multipart). De-dupes by image hash,
+  estimates per-ingredient nutrition, archives the photo to Drive, appends to
+  `meals`, and replies with the meal + the day's running totals.
+- `POST /feel` — `{"score": 1-10[, "date": "YYYY-MM-DD"]}` → writes
+  `subjective_feel` on that day's `daily_summary` row (`{"score": null}` clears).
+
+## Tests
+
+```bash
+python -m pytest tests -q
+```
+The same suite gates every deploy in Cloud Build — a red test means nothing
+ships and production keeps the previous version.
 
 ## One-time Google Cloud setup
 
