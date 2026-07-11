@@ -20,7 +20,7 @@ from src.sheets import DAILY_TAB, INSIGHTS_TAB, SheetClient
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 INSIGHTS_HEADERS = ["week_ending", "insights", "model", "updated_at"]
 
-DEFAULT_MODELS = "gemini-3.1-flash-lite,gemini-3.5-flash,gemini-3-flash-preview"
+DEFAULT_MODELS = "gemini-3.5-flash,gemini-3-flash-preview,gemini-3.1-flash-lite"
 WINDOW_DAYS = 35
 
 # Only columns with signal today; blank cells are expected and fine.

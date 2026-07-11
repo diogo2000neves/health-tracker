@@ -30,6 +30,7 @@ import io
 import json
 import os
 import re
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -63,10 +64,13 @@ LAST_COL = chr(ord("A") + len(MEALS_HEADERS) - 1)  # "L"
 # Rows excluded from all totals (kept in sync with src/run_daily.py NON_MEALS).
 NON_MEALS = {"not food", "analysis failed"}
 
-# flash-lite first, deliberately: the bigger Flash models 503 on most free-tier
-# calls (adding 10-40s of fallback latency), and a *consistent* estimator gives
-# cleaner day-to-day trend deltas than a mix of models with different biases.
-DEFAULT_MODELS = "gemini-3.1-flash-lite,gemini-3.5-flash,gemini-3-flash-preview"
+# Strongest model first (accuracy over speed — response time isn't critical).
+# These are the strongest models available on the FREE tier; Pro models require
+# a paid plan (429 on the free key), so they're intentionally not here. If you
+# enable billing, prepend "gemini-3.1-pro-preview" via the GEMINI_MODELS env.
+# Each model is retried GEMINI_RETRIES times (transient 503s) before falling back.
+DEFAULT_MODELS = "gemini-3.5-flash,gemini-3-flash-preview,gemini-3.1-flash-lite"
+DEFAULT_RETRIES = 3
 
 PROMPT = """You are an expert nutritionist and food scientist doing computer-
 vision meal analysis. Estimate every ingredient in the photo, its cooked weight
@@ -120,14 +124,22 @@ Sanity-check each: calories should be within ~10% of 4*protein + 4*carbs +
 9*fat; fix the numbers if they disagree. Give PER-ITEM numbers only — do NOT sum
 the meal yourself, the totals are computed automatically.
 
+CONFIDENCE — use this EXACT scale (0-1) so the score means the same thing no
+matter which model produces it. Report ONE value for the whole meal, set by your
+least-certain major item:
+  0.90-1.00  clear photo, foods unambiguous, a reliable scale reference present
+             or a readable nutrition label.
+  0.70-0.89  foods clearly identified; portion estimated from a decent reference.
+  0.40-0.69  some ambiguity in identity or portion, or only a weak/partial
+             reference to work from.
+  0.10-0.39  heavy guesswork: no usable scale reference, or occluded/blurry food.
+
 Rules:
 - Never omit an ingredient because it is hard to quantify — estimate it and let
   it lower confidence instead of leaving it out.
 - Caloric drinks (juice, soda, milk, beer) are items; water, plain tea and black
   coffee are ignored.
 - If the image contains no food or drink, return items: [].
-- confidence (0-1) reflects identification AND portion certainty for the whole
-  meal; lower it when references are missing or items are ambiguous.
 - notes: one short sentence — the scale reference you used (or that none was
   available) and the single assumption most likely to be wrong."""
 
@@ -288,28 +300,49 @@ def _sha12(data: bytes) -> str:
 
 
 # -- Gemini --------------------------------------------------------------------
+def _is_permanent(err: Exception) -> bool:
+    """A not-found / bad-request error won't fix on retry — skip to the next model
+    immediately instead of burning the retry budget on it."""
+    msg = str(err)
+    return any(tok in msg for tok in ("404", "NOT_FOUND", "400", "INVALID_ARGUMENT"))
+
+
 def analyze(img: bytes, mime: str) -> Dict[str, Any]:
-    """Try each model in order; fall back when one is overloaded/unavailable."""
+    """Analyse a meal photo, strongest model first.
+
+    Each model is retried up to GEMINI_RETRIES times on transient failures
+    (503 overloaded, 429, timeouts) with exponential backoff before falling back
+    to the next, weaker model — response time isn't critical, accuracy is.
+    """
+    models = _models()
+    retries = max(1, int(os.environ.get("GEMINI_RETRIES", str(DEFAULT_RETRIES))))
     last_err: Optional[Exception] = None
-    for model in _models():
-        try:
-            resp = _genai().models.generate_content(
-                model=model,
-                contents=[types.Part.from_bytes(data=img, mime_type=mime), PROMPT],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=RESPONSE_SCHEMA,
-                    temperature=0.1,
-                ),
-            )
-            data = json.loads(resp.text)
-            items = _normalize_items(data.get("items"))
-            return _meal_from_items(items, data.get("confidence"),
-                                    data.get("notes"), model)
-        except Exception as err:  # 503 overloaded, 429 rate-limited, parse, ...
-            last_err = err
-            app.logger.warning("model %s unavailable: %s", model, err)
-    raise RuntimeError(f"all models failed ({_models()}); last error: {last_err}")
+    for model in models:
+        for attempt in range(1, retries + 1):
+            try:
+                resp = _genai().models.generate_content(
+                    model=model,
+                    contents=[types.Part.from_bytes(data=img, mime_type=mime), PROMPT],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=RESPONSE_SCHEMA,
+                        temperature=0.1,
+                    ),
+                )
+                data = json.loads(resp.text)
+                items = _normalize_items(data.get("items"))
+                return _meal_from_items(items, data.get("confidence"),
+                                        data.get("notes"), model)
+            except Exception as err:  # 503 overloaded, 429, parse, not-found, ...
+                last_err = err
+                if _is_permanent(err):
+                    app.logger.warning("model %s unusable, skipping: %s", model, err)
+                    break
+                app.logger.warning("model %s attempt %d/%d failed: %s",
+                                   model, attempt, retries, err)
+                if attempt < retries:
+                    time.sleep(min(2 ** attempt, 10))
+    raise RuntimeError(f"all models failed ({models}); last error: {last_err}")
 
 
 # -- Drive ---------------------------------------------------------------------

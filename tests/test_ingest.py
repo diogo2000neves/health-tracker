@@ -102,6 +102,22 @@ def test_authorized_uses_constant_time_compare(monkeypatch):
     assert not ingest._authorized(Req(""))  # empty token never authorises
 
 
+def test_is_permanent_error_classification():
+    # not-found / bad-request => skip model; transient => retry same model
+    assert ingest._is_permanent(Exception("404 NOT_FOUND models/foo"))
+    assert ingest._is_permanent(Exception("400 INVALID_ARGUMENT"))
+    assert not ingest._is_permanent(Exception("503 UNAVAILABLE high demand"))
+    assert not ingest._is_permanent(Exception("429 RESOURCE_EXHAUSTED"))
+
+
+def test_default_chain_is_strongest_first_and_free_tier():
+    # strongest free model first; no Pro model (paid-only) in the default chain
+    chain = ingest.DEFAULT_MODELS.split(",")
+    assert chain[0] == "gemini-3.5-flash"
+    assert chain[-1] == "gemini-3.1-flash-lite"
+    assert not any("pro" in m for m in chain)
+
+
 def test_sha12_stable():
     assert ingest._sha12(b"abc") == ingest._sha12(b"abc")
     assert len(ingest._sha12(b"abc")) == 12
