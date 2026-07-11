@@ -150,10 +150,16 @@ Service account: `health-tracker-job@health-tracker-501322.iam.gserviceaccount.c
   different biases. If every model fails, the photo is archived and an
   `analysis failed` stub row is logged — a meal is never silently lost.
 - Output is enforced with a typed `response_schema` (structured JSON), not
-  prompt-format begging. The prompt forces: per-ingredient breakdown (meat+rice
-  = two items), oils/sauces >5 g fat as their own item, nutrition labels read
-  when visible, portions from a visual scale reference (cooked, as served), and
-  a per-item self-consistency check (kcal ≈ 4P + 4C + 9F).
+  prompt-format begging, with a `reasoning` field generated FIRST so the model
+  works through scale and hidden fats before committing to numbers — that
+  ordering is the main accuracy lever. The prompt forces: opportunistic scale
+  calibration (use whatever reference is actually in frame, apply typical sizes
+  only when sure, lower confidence when none exists), a dedicated hidden-fats
+  step (absorbed cooking oil, sauces, added sugar — the biggest calorie-error
+  source), per-ingredient breakdown with cooking method, weight from size +
+  density including occluded food, and a per-item kcal ≈ 4P + 4C + 9F check.
+  Meal totals are summed in code from the items, never by the model (avoids
+  arithmetic errors).
 
 ## 7. Cost
 

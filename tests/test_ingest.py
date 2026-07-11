@@ -30,6 +30,23 @@ def test_normalize_items_coerces_and_filters():
     assert items[1]["protein_g"] == 0.0  # unparseable -> 0
 
 
+def test_normalize_items_carries_cooking_method_when_present():
+    items = ingest._normalize_items([
+        {"name": "chicken thigh", "cooking_method": " Fried ", "portion_g": 100,
+         "calories": 220, "protein_g": 25, "carbs_g": 0, "fat_g": 13},
+        {"name": "apple", "portion_g": 150, "calories": 78, "protein_g": 0,
+         "carbs_g": 21, "fat_g": 0},  # raw -> no cooking_method key
+    ])
+    assert items[0]["cooking_method"] == "Fried"
+    assert "cooking_method" not in items[1]
+
+
+def test_response_schema_reasons_before_numbers():
+    # reasoning must be present and generated first so it conditions the numbers
+    assert "reasoning" in ingest.RESPONSE_SCHEMA.required
+    assert ingest.RESPONSE_SCHEMA.property_ordering[0] == "reasoning"
+
+
 def test_meal_from_items_totals_and_label():
     items = ingest._normalize_items([
         {"name": "chicken", "portion_g": 120, "calories": 198,

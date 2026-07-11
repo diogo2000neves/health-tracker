@@ -68,51 +68,87 @@ NON_MEALS = {"not food", "analysis failed"}
 # cleaner day-to-day trend deltas than a mix of models with different biases.
 DEFAULT_MODELS = "gemini-3.1-flash-lite,gemini-3.5-flash,gemini-3-flash-preview"
 
-PROMPT = """You are a meticulous nutrition analyst examining a photo of a meal.
+PROMPT = """You are an expert nutritionist and food scientist doing computer-
+vision meal analysis. Estimate every ingredient in the photo, its cooked weight
+in grams, and its macros as accurately as possible. Being honest about
+uncertainty matters more than giving confident round numbers.
 
-STEP 1 — IDENTIFY EVERY COMPONENT SEPARATELY.
-Break the plate into its distinct foods and list each as its own item. A plate
-of "meat with rice" is TWO items. Include every plate/bowl in frame. Name each
-item specifically — never a generic category when a specific one is visible.
-Distinguish look-alikes using visual cues (size vs nearby objects, skin/peel
-texture, colour, cut, marbling, packaging): tangerine vs orange; sweet potato vs
-potato; salmon vs trout; prosciutto vs bacon vs cooked ham; white vs brown rice.
-Name items in lowercase singular English (e.g. "grilled chicken breast").
+Work through steps 1-5 IN ORDER inside the `reasoning` field FIRST, then fill in
+`items`, `confidence` and `notes`. Do not skip the reasoning — thinking through
+scale and hidden fats before committing to numbers is what makes them accurate.
 
-STEP 2 — ESTIMATE EACH PORTION.
-For every item, find a scale reference (plate/bowl diameter, cutlery, a hand, a
-can/bottle, standard packaging) and estimate the real edible weight in grams of
-THAT item as served (cooked state). Do NOT assume standard servings and do NOT
-default to 100 g. Exclude inedible parts (peel, rind, bones, shells, stones).
+1) CALIBRATE SCALE from whatever is actually in the photo.
+Use any object that reveals real-world size — a plate/bowl, cutlery, a hand, a
+can/bottle, packaging, a coin. Use only references genuinely present; NEVER
+assume a specific item is there or is "standard". When you can confidently
+identify a reference, use its typical size to calibrate (a dinner plate is
+usually ~26-28 cm, a fork ~19 cm, a 330 ml can ~12 cm tall) — but only if you're
+sure what the object is. Correct for camera angle (food shot at an angle looks
+larger or smaller than top-down). If there is NO reliable reference, say so, fall
+back to typical serving sizes, and lower your confidence.
 
-STEP 3 — COMPUTE NUTRITION PER ITEM.
-Derive calories and macros for the grams you estimated — not per 100 g.
-- If a nutrition label is visible on packaging, READ IT and scale to the
-  visible portion; labels beat estimation.
-- When cooking oil, butter, dressing or sauce contributes more than ~5 g of
-  fat, list it as its OWN item so its macros are attributed honestly.
-- Caloric drinks (juice, soda, milk, beer) are items; water, plain tea and
-  black coffee are ignored.
-- Sanity-check each item: calories within ~10% of 4*protein + 4*carbs + 9*fat.
-  Fix the numbers if they disagree.
+2) FULL INVENTORY — including hidden ingredients.
+List every visible component, even small ones (garnishes, seeds, herbs, cheese,
+nuts, sauces, dressings). Then explicitly account for what is usually present but
+NOT visible — this is the single largest source of calorie error, never skip it:
+  - cooking oil/butter absorbed into or coating the food (anything fried,
+    sauteed or roasted — estimate the fat, e.g. "pan-fried -> ~10 g oil"),
+  - dressings, sauces or marinades soaked in,
+  - added sugar, syrup or honey.
 
-RULES.
-- If an item's identity is uncertain, choose the most likely and LOWER the
-  overall confidence.
-- confidence (0-1) reflects identification AND portion certainty for the meal.
-- If the image contains NO food or drink, return items: [].
-- notes: one short sentence naming the scale reference used and your key
-  assumption."""
+3) IDENTIFY EACH ITEM PRECISELY.
+Commit to the most specific identification the image supports: exact food
+("chicken thigh, skin-on" not "chicken"), fat level (full-fat vs low-fat dairy,
+lean vs fatty cut) and cooking method (grilled/fried/boiled/raw/baked) — cooking
+method changes both weight (water loss/absorption) and fat. Split composite
+plates into separate items ("meat with rice" = two items). Distinguish
+look-alikes by visual cues (tangerine vs orange, sweet potato vs potato, salmon
+vs trout, prosciutto vs bacon, white vs brown rice). Name items in lowercase
+singular English. If a packaged item shows a nutrition label, READ IT and scale
+to the visible portion — labels beat estimation.
 
+4) WEIGH EACH ITEM (cooked, as served).
+Estimate each item's real edible weight in grams from its size in the frame and
+its density (leafy greens are light per volume; meat, rice and stews are dense).
+Include food partly hidden or layered behind other food — it still has mass.
+Exclude inedible parts (peel, rind, bones, shells, stones). Do NOT default to
+100 g and do NOT assume a standard serving.
+
+5) COMPUTE MACROS PER ITEM.
+For each item derive protein/carbs/fat for its estimated grams, then calories.
+Sanity-check each: calories should be within ~10% of 4*protein + 4*carbs +
+9*fat; fix the numbers if they disagree. Give PER-ITEM numbers only — do NOT sum
+the meal yourself, the totals are computed automatically.
+
+Rules:
+- Never omit an ingredient because it is hard to quantify — estimate it and let
+  it lower confidence instead of leaving it out.
+- Caloric drinks (juice, soda, milk, beer) are items; water, plain tea and black
+  coffee are ignored.
+- If the image contains no food or drink, return items: [].
+- confidence (0-1) reflects identification AND portion certainty for the whole
+  meal; lower it when references are missing or items are ambiguous.
+- notes: one short sentence — the scale reference you used (or that none was
+  available) and the single assumption most likely to be wrong."""
+
+# `reasoning` is generated FIRST (property ordering) so the model works through
+# scale, hidden fats and portions before committing to numbers — that ordering
+# is what improves accuracy. Meal totals are summed in code (see _meal_from_items),
+# never by the model, to avoid arithmetic errors.
 RESPONSE_SCHEMA = types.Schema(
     type=types.Type.OBJECT,
+    property_ordering=["reasoning", "items", "confidence", "notes"],
     properties={
+        "reasoning": types.Schema(type=types.Type.STRING),
         "items": types.Schema(
             type=types.Type.ARRAY,
             items=types.Schema(
                 type=types.Type.OBJECT,
+                property_ordering=["name", "cooking_method", "portion_g",
+                                   "calories", "protein_g", "carbs_g", "fat_g"],
                 properties={
                     "name": types.Schema(type=types.Type.STRING),
+                    "cooking_method": types.Schema(type=types.Type.STRING),
                     "portion_g": types.Schema(type=types.Type.NUMBER),
                     "calories": types.Schema(type=types.Type.NUMBER),
                     "protein_g": types.Schema(type=types.Type.NUMBER),
@@ -126,7 +162,7 @@ RESPONSE_SCHEMA = types.Schema(
         "confidence": types.Schema(type=types.Type.NUMBER),
         "notes": types.Schema(type=types.Type.STRING),
     },
-    required=["items", "confidence", "notes"],
+    required=["reasoning", "items", "confidence", "notes"],
 )
 
 
@@ -190,14 +226,18 @@ def _normalize_items(raw: Any) -> List[Dict[str, Any]]:
         name = str(entry.get("name", "")).strip()[:120]
         if not name:
             continue
-        items.append({
+        item = {
             "name": name,
             "portion_g": _round_num(entry.get("portion_g")),
             "calories": _round_num(entry.get("calories")),
             "protein_g": _round_num(entry.get("protein_g")),
             "carbs_g": _round_num(entry.get("carbs_g")),
             "fat_g": _round_num(entry.get("fat_g")),
-        })
+        }
+        method = str(entry.get("cooking_method", "")).strip()[:40]
+        if method:
+            item["cooking_method"] = method
+        items.append(item)
     return items
 
 
