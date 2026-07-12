@@ -186,23 +186,61 @@ def test_extract_note_from_form_query_and_json():
         assert ingest._extract_note() == ""  # absent
 
 
-def test_extract_image_ignores_bodyless_form_and_json():
+def test_extract_images_ignores_bodyless_form_and_json():
     # a note-only form/JSON request must NOT have its body read as a fake image
     with ingest.app.test_request_context(
             "/ingest", method="POST", data={"note": "oatmeal"}):
-        assert ingest._extract_image() == (b"", "")
+        assert ingest._extract_images() == []
     with ingest.app.test_request_context(
             "/ingest", method="POST", json={"note": "oatmeal"}):
-        assert ingest._extract_image() == (b"", "")
+        assert ingest._extract_images() == []
 
 
-def test_extract_image_reads_raw_image_body():
+def test_extract_images_reads_raw_image_body():
     with ingest.app.test_request_context(
             "/ingest", method="POST", data=b"\xff\xd8jpegbytes",
             content_type="image/jpeg"):
-        img, mime = ingest._extract_image()
-        assert img == b"\xff\xd8jpegbytes"
-        assert mime == "image/jpeg"
+        assert ingest._extract_images() == [(b"\xff\xd8jpegbytes", "image/jpeg")]
+
+
+def test_extract_images_collects_every_multipart_file_in_order():
+    from io import BytesIO
+    # meal shot + a nutrition-label shot (different field names) + a note
+    with ingest.app.test_request_context("/ingest", method="POST", data={
+        "image": (BytesIO(b"\xff\xd8plate"), "plate.jpg"),
+        "label": (BytesIO(b"\xff\xd8label"), "label.jpg"),
+        "note": "only ate half",
+    }, content_type="multipart/form-data"):
+        images = ingest._extract_images()
+        assert [b for b, _ in images] == [b"\xff\xd8plate", b"\xff\xd8label"]
+        assert ingest._extract_note() == "only ate half"
+
+
+def test_build_prompt_adds_multi_and_note_blocks_only_when_relevant():
+    # one photo, no note => the base rubric verbatim
+    assert ingest._build_prompt(1, "") == ingest.PROMPT
+    # several photos => the multi-image block, carrying the count
+    multi = ingest._build_prompt(3, "")
+    assert "MULTIPLE IMAGES" in multi and "these 3 images" in multi
+    assert "NUTRITION LABEL" in multi  # labels are authoritative
+    # a note always appends its authoritative block
+    assert "only ate half" in ingest._build_prompt(2, "only ate half")
+    assert ingest._build_prompt(1, "no oil").endswith("NOTE: no oil")
+
+
+def test_photo_name_suffixes_only_multi_photo_meals():
+    from datetime import datetime
+    when = datetime(2026, 7, 12, 10, 36, 5)
+    assert ingest._photo_name(when, "image/jpeg", 1, 1) == "meal_20260712_103605.jpg"
+    assert ingest._photo_name(when, "image/png", 2, 3) == "meal_20260712_103605_2.png"
+
+
+def test_multi_image_dedup_hash_is_combined_and_order_sensitive():
+    # the whole set of shots hashes together; re-sending the same set collapses
+    combined = lambda parts: ingest._sha12(b"".join(parts))
+    assert combined([b"a", b"b"]) == combined([b"a", b"b"])
+    assert combined([b"a", b"b"]) != combined([b"a"])          # extra shot => new meal
+    assert combined([b"a", b"b"]) != ingest._sha12(b"a")       # not just the first
 
 
 def test_text_only_dedup_hash_is_stable_and_distinct():

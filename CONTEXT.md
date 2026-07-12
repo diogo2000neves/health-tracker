@@ -54,6 +54,14 @@ Sheet. Photos never touch iCloud or Google Photos (neither is readable by a
 server — the Google Photos API can no longer read a user's library, and iCloud has
 no server API at all).
 
+**Multiple photos per meal** are supported — the multipart form can carry any
+number of image parts (meal shot + a nutrition label + packaging + a missing
+ingredient). Gemini reasons across **all** of them: a nutrition label is
+authoritative for its product and gets scaled to the portion seen on the plate,
+packaging pins the brand, and extra-ingredient shots add items — without
+double-counting a food that appears in more than one photo. All photos are
+archived to Drive and their links space-joined into `meals.photo_url`.
+
 An **optional free-text `note`** can ride along (multipart form field, `?note=`
 query, or JSON). With a photo it's **authoritative** context that overrides the
 visual estimate ("only ate half" → halves portions; "air-fried, no oil" → drops

@@ -1,21 +1,27 @@
 """HTTP ingest service: meal photos + subjective-feel logging.
 
-POST /ingest (X-Auth-Token) — a meal photo, a text description, or both:
-  * multipart form: an optional image file part + an optional `note` text part,
+POST /ingest (X-Auth-Token) — one or more meal photos, a text description, or
+a mix:
+  * multipart form: any number of image file parts + an optional `note` text
+    part (extra images can be a nutrition label, packaging/brand, or an
+    ingredient missing from the first shot),
   * or a raw image body (with an optional `?note=` query param),
   * or a text-only meal: `?note=`, a `note` form field, or JSON {"note": ...}.
   Then:
-  1. de-duplicates (photo -> image hash; text-only -> note hash) so double
-     submissions don't double-log,
-  2. estimates per-ingredient nutrition with Gemini (structured JSON output);
-     a `note` is authoritative context that overrides the visual/text estimate
-     (e.g. "only ate half" halves portions). Text-only meals reuse the same
-     schema but with capped confidence — there is no photo to measure against,
-  3. archives the photo to the user's Google Drive (skipped when text-only),
-  4. appends a row to the `meals` tab (the raw `note` is stored for provenance),
+  1. de-duplicates (photos -> combined image hash; text-only -> note hash) so
+     double submissions don't double-log,
+  2. estimates per-ingredient nutrition with Gemini (structured JSON output),
+     reasoning across ALL images together — a nutrition label is authoritative
+     for its product and is scaled to the portion on the plate. A `note` is
+     authoritative context that overrides the estimate ("only ate half" halves
+     portions). Text-only meals reuse the same schema but with capped confidence
+     — there is no photo to measure against,
+  3. archives every photo to the user's Google Drive (skipped when text-only),
+  4. appends a row to the `meals` tab (the raw `note` is stored for provenance;
+     `photo_url` holds all archived links),
   5. replies with the meal summary plus the day's running totals.
   Non-food inputs are logged as nothing (photos still archived). If every model
-  fails, the photo is archived and a zeroed "analysis failed" row keeps the
+  fails, the photos are archived and a zeroed "analysis failed" row keeps the
   audit trail — a meal is never silently lost.
 
 POST /feel (X-Auth-Token) — {"score": 1-10[, "date": "YYYY-MM-DD"]} merges
@@ -40,7 +46,7 @@ import os
 import re
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import google.auth
@@ -53,7 +59,9 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024  # reject absurd uploads
+# Headroom for a few photos in one meal log while staying under Cloud Run's
+# ~32 MiB request cap.
+app.config["MAX_CONTENT_LENGTH"] = 30 * 1024 * 1024
 
 MEALS_TAB = "meals"
 DAILY_TAB = "daily_summary"
@@ -201,6 +209,27 @@ conflict: e.g. "only ate half" => halve the portions of the affected items;
 your identification; a stated weight/count overrides your size estimate. Fold it
 into your step 1-6 reasoning; do not treat it as a separate item unless it names
 extra food. NOTE: {note}"""
+
+# Appended to PROMPT when the meal log carries more than one image, so the model
+# reasons across all of them instead of analysing only the first. Extra images
+# typically add ground truth (a nutrition label) or components the plate shot
+# missed; the key risks are mis-matching a label to its food and double-counting.
+MULTI_IMAGE_SUFFIX = """
+
+MULTIPLE IMAGES — these {n} images all describe ONE meal; reason across ALL of
+them together before you list items. Classify each image as one of:
+  - the MEAL/PLATE — what is actually being eaten, and in what portion;
+  - a NUTRITION LABEL — authoritative per-100 g / per-serving values for ONE
+    product: read its numbers and SCALE them to the portion of that food shown on
+    the plate. The label overrides your visual macro AND micronutrient estimate
+    for that item;
+  - PACKAGING / BRAND — identifies the exact product; use its known profile;
+  - an EXTRA INGREDIENT not visible on the plate — add it as its own item.
+Match every label/package to the food it belongs to. Do NOT double-count: a food
+photographed both on the plate and via its bag is ONE item — composition from the
+label, portion from the plate. When images disagree, trust the label for what a
+food is made of and the plate for how much of it there is. Note in `reasoning`
+which image you used for each decision."""
 
 # Text-only path: same schema and per-item rigour, but estimating from a written
 # description with NO photo. Confidence is capped low because there is no scale
@@ -475,11 +504,26 @@ def _run_models(contents: List[Any]) -> Dict[str, Any]:
     raise RuntimeError(f"all models failed ({models}); last error: {last_err}")
 
 
-def analyze(img: bytes, mime: str, note: str = "") -> Dict[str, Any]:
-    """Analyse a meal photo. A `note`, if given, is appended as authoritative
-    context that overrides the visual estimate where the two conflict."""
-    prompt = PROMPT + (NOTE_SUFFIX.format(note=note) if note else "")
-    return _run_models([types.Part.from_bytes(data=img, mime_type=mime), prompt])
+def _build_prompt(num_images: int, note: str) -> str:
+    """Assemble the vision prompt: the base rubric, plus a multi-image block when
+    the log has several photos, plus the authoritative note block when given."""
+    prompt = PROMPT
+    if num_images > 1:
+        prompt += MULTI_IMAGE_SUFFIX.format(n=num_images)
+    if note:
+        prompt += NOTE_SUFFIX.format(note=note)
+    return prompt
+
+
+def analyze(images: List[Tuple[bytes, str]], note: str = "") -> Dict[str, Any]:
+    """Analyse one or more photos of a single meal, reasoning across all of them.
+
+    A `note`, if given, is appended as authoritative context that overrides the
+    visual estimate where the two conflict."""
+    parts: List[Any] = [types.Part.from_bytes(data=img, mime_type=mime)
+                        for img, mime in images]
+    parts.append(_build_prompt(len(images), note))
+    return _run_models(parts)
 
 
 def analyze_text(note: str) -> Dict[str, Any]:
@@ -488,20 +532,33 @@ def analyze_text(note: str) -> Dict[str, Any]:
 
 
 # -- Drive ---------------------------------------------------------------------
-def archive_photo(img: bytes, mime: str, when: datetime) -> str:
-    """Upload the photo to the user's Drive folder; return a viewable link."""
-    folder = os.environ.get("MEALS_FOLDER_ID", "")
-    if not folder:
-        return ""
+def _photo_name(when: datetime, mime: str, index: int, total: int) -> str:
+    """Drive filename for one photo of a meal; multi-photo meals get a _N suffix
+    so several shots at the same second don't share a name."""
     ext = "png" if "png" in mime else "jpg"
-    name = f"meal_{when.strftime('%Y%m%d_%H%M%S')}.{ext}"
-    media = MediaIoBaseUpload(io.BytesIO(img), mimetype=mime, resumable=False)
-    created = _drive().files().create(
-        body={"name": name, "parents": [folder]},
-        media_body=media,
-        fields="id,webViewLink",
-    ).execute()
-    return created.get("webViewLink", "")
+    suffix = f"_{index}" if total > 1 else ""
+    return f"meal_{when.strftime('%Y%m%d_%H%M%S')}{suffix}.{ext}"
+
+
+def archive_photos(images: List[Tuple[bytes, str]], when: datetime) -> List[str]:
+    """Upload every photo of a meal to the user's Drive folder; return the
+    viewable links in order (meal shot first)."""
+    folder = os.environ.get("MEALS_FOLDER_ID", "")
+    if not folder or not images:
+        return []
+    urls: List[str] = []
+    for i, (img, mime) in enumerate(images, start=1):
+        media = MediaIoBaseUpload(io.BytesIO(img), mimetype=mime, resumable=False)
+        created = _drive().files().create(
+            body={"name": _photo_name(when, mime, i, len(images)),
+                  "parents": [folder]},
+            media_body=media,
+            fields="id,webViewLink",
+        ).execute()
+        url = created.get("webViewLink", "")
+        if url:
+            urls.append(url)
+    return urls
 
 
 # -- Sheets --------------------------------------------------------------------
@@ -597,25 +654,30 @@ def _write_daily_cell(day: str, header_name: str, value: Any) -> None:
 
 
 # -- HTTP ------------------------------------------------------------------------
-def _extract_image():
-    """Return (bytes, mime) from a multipart file part or a raw image body, or
-    (b"", "") when the request carries no image (the text-only meal path).
+def _extract_images() -> List[Tuple[bytes, str]]:
+    """Every meal image in the request as (bytes, mime): all file parts of a
+    multipart upload (any field names, repeats included), or a single raw image
+    body. Empty when the request carries no image (the text-only meal path).
 
     Only a genuine image body counts: a form/JSON request with no file part is
     treated as image-less so its raw bytes are never mistaken for a photo."""
     if request.files:
-        f = next(iter(request.files.values()))
-        return f.read(), (f.mimetype or "image/jpeg")
+        out: List[Tuple[bytes, str]] = []
+        for _, f in request.files.items(multi=True):
+            data = f.read()
+            if data:
+                out.append((data, f.mimetype or "image/jpeg"))
+        return out
     ctype = (request.content_type or "").lower()
     if (ctype.startswith("multipart/form-data")
             or ctype.startswith("application/x-www-form-urlencoded")
             or ctype.startswith("application/json")):
-        return b"", ""  # form/JSON with no file => no image
+        return []  # form/JSON with no file => no image
     data = request.get_data()
     if not data:
-        return b"", ""
+        return []
     mime = ctype if ctype.startswith("image/") else "image/jpeg"
-    return data, mime
+    return [(data, mime)]
 
 
 def _extract_note() -> str:
@@ -637,17 +699,18 @@ def ingest():
     if not _authorized(request):
         return jsonify({"error": "unauthorized"}), 401
 
-    img, mime = _extract_image()
+    images = _extract_images()
     note = _extract_note()
-    if not img and not note:
+    if not images and not note:
         return jsonify({"error": "no image or description received"}), 400
 
-    text_only = not img
+    text_only = not images
     when = datetime.now(_tz())
     today = when.date().isoformat()
-    # Photo meals de-dupe on the image; text-only meals on the note text, so an
-    # accidental re-send of either doesn't double-log the same day.
-    image_sha = _sha12(img) if img else _sha12(("text:" + note).encode("utf-8"))
+    # Photo meals de-dupe on the combined image bytes (so a re-send of the same
+    # set of shots collapses); text-only meals on the note text.
+    image_sha = (_sha12(b"".join(img for img, _ in images)) if images
+                 else _sha12(("text:" + note).encode("utf-8")))
 
     todays = _todays_meals(today)
     if any(r.get("image_sha") == image_sha for r in todays):
@@ -659,19 +722,19 @@ def ingest():
         }), 200
 
     def _archive() -> str:
-        """Archive the photo if there is one; text-only meals have nothing to store."""
-        if not img:
+        """Archive every photo (space-joined links); text-only meals store none."""
+        if not images:
             return ""
         try:
-            return archive_photo(img, mime, when)
+            return " ".join(archive_photos(images, when))
         except Exception:
             app.logger.exception("drive upload failed")
             return ""
 
     try:
-        nut = analyze_text(note) if text_only else analyze(img, mime, note)
+        nut = analyze_text(note) if text_only else analyze(images, note)
     except Exception as err:
-        # Never lose a meal: archive the photo and leave an auditable stub row.
+        # Never lose a meal: archive the photos and leave an auditable stub row.
         app.logger.exception("analysis failed")
         photo_url = _archive()
         stub = _meal_from_items([], 0, "none")
@@ -681,7 +744,7 @@ def ingest():
             "error": f"analysis failed: {err}",
             "summary": ("Analysis failed — logged for later review."
                         if text_only
-                        else "Analysis failed — photo archived for later review."),
+                        else "Analysis failed — photos archived for later review."),
             "photo_url": photo_url,
         }), 502
 
@@ -692,7 +755,7 @@ def ingest():
         return jsonify({
             "summary": ("No food in the description — nothing logged."
                         if text_only
-                        else "No food detected — nothing logged (photo archived)."),
+                        else "No food detected — nothing logged (photos archived)."),
             "photo_url": photo_url,
             "not_food": True,
         }), 200

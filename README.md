@@ -47,14 +47,18 @@ Health Tracker/
 
 ## Endpoints (Cloud Run service, `X-Auth-Token` gated)
 
-- `POST /ingest` — a meal photo, a text description, or both. Accepts a raw
-  image body, or a multipart form with an optional image file + optional `note`
-  text field (a `?note=` query param / JSON `{"note": …}` also works). The
-  `note` is authoritative context for the AI ("only ate half" halves portions);
-  a note with no image estimates the meal from text alone at capped confidence.
-  De-dupes (image hash, or note hash when text-only), estimates per-ingredient
-  nutrition, archives the photo to Drive (skipped when text-only), appends to
-  `meals`, and replies with the meal + the day's running totals.
+- `POST /ingest` — one or more meal photos, a text description, or a mix.
+  Accepts a raw image body, or a multipart form with any number of image file
+  parts + an optional `note` text field (a `?note=` query param / JSON
+  `{"note": …}` also works). Extra photos can be a nutrition label, packaging,
+  or an ingredient the first shot missed — the AI reasons across all of them
+  (a label is authoritative and scaled to the portion on the plate). The `note`
+  is authoritative context ("only ate half" halves portions); a note with no
+  image estimates the meal from text alone at capped confidence. De-dupes
+  (combined image hash, or note hash when text-only), estimates per-ingredient
+  nutrition, archives every photo to Drive (skipped when text-only), appends to
+  `meals` (`photo_url` holds all links), and replies with the meal + the day's
+  running totals.
 - `POST /feel` — `{"score": 1-10[, "date": "YYYY-MM-DD"]}` → writes
   `subjective_feel` on that day's `daily_summary` row (`{"score": null}` clears).
 
