@@ -243,6 +243,91 @@ def test_multi_image_dedup_hash_is_combined_and_order_sensitive():
     assert combined([b"a", b"b"]) != ingest._sha12(b"a")       # not just the first
 
 
+# -- model loop hardening (the 504 timeout fix) --------------------------------
+_GOOD_BODY = ('{"reasoning":"x","items":[{"name":"rice","portion_g":100,'
+              '"calories":130,"protein_g":2,"carbs_g":28,"fat_g":0}],'
+              '"confidence":0.8}')
+
+
+class _FakeResp:
+    def __init__(self, text):
+        self.text = text
+
+
+class _FakeModels:
+    """Replays a scripted sequence of bodies/exceptions and records model calls."""
+    def __init__(self, behaviors):
+        self.behaviors = list(behaviors)
+        self.calls = []
+
+    def generate_content(self, model, contents, config):
+        self.calls.append(model)
+        b = self.behaviors.pop(0)
+        if isinstance(b, Exception):
+            raise b
+        return _FakeResp(b)
+
+
+def _fake_genai(behaviors, monkeypatch):
+    fm = _FakeModels(behaviors)
+    monkeypatch.setattr(ingest, "_genai",
+                        lambda: type("C", (), {"models": fm})())
+    monkeypatch.setattr(ingest.time, "sleep", lambda *a, **k: None)
+    return fm
+
+
+def test_gen_config_caps_output_and_sets_timeout(monkeypatch):
+    monkeypatch.delenv("GEMINI_MAX_OUTPUT_TOKENS", raising=False)
+    monkeypatch.delenv("GEMINI_TIMEOUT_MS", raising=False)
+    cfg = ingest._gen_config()
+    # without a cap the model can run a number to tens of thousands of digits
+    assert cfg.max_output_tokens == ingest.DEFAULT_MAX_OUTPUT_TOKENS
+    assert cfg.http_options.timeout == ingest.DEFAULT_TIMEOUT_MS
+
+
+def test_unparseable_output_skips_to_next_model_without_retrying(monkeypatch):
+    # model 1 emits junk; we must jump to model 2, NOT retry model 1 three times
+    fm = _fake_genai(["{ truncated json", _GOOD_BODY], monkeypatch)
+    monkeypatch.setenv("GEMINI_MODELS", "m1,m2,m3")
+    monkeypatch.setenv("GEMINI_RETRIES", "3")
+    nut = ingest._run_models(["prompt"])
+    assert nut["foods"] == "rice" and nut["model"] == "m2"
+    assert fm.calls == ["m1", "m2"]
+
+
+def test_runaway_number_never_crashes_coercion():
+    # the 2026-07-12 bug: the model emitted a number with tens of thousands of
+    # digits. It overflows float(); coercion must yield 0 / drop it, never raise.
+    huge = 10 ** 400
+    assert ingest._round_num(huge) == 0.0
+    assert ingest._round_num(huge, 2) == 0.0
+    assert ingest._normalize_nutrients({"iron_mg": huge, "fiber_g": 3.2}) == {
+        "fiber_g": 3.2}  # runaway key dropped, good key kept
+    # and a whole item with a runaway field still normalizes without raising
+    items = ingest._normalize_items([{"name": "rice", "portion_g": huge,
+        "calories": 130, "protein_g": 2, "carbs_g": 28, "fat_g": 0}])
+    assert items[0]["portion_g"] == 0.0 and items[0]["calories"] == 130.0
+
+
+def test_transient_api_error_still_retries_same_model(monkeypatch):
+    fm = _fake_genai([Exception("503 UNAVAILABLE high demand"), _GOOD_BODY],
+                     monkeypatch)
+    monkeypatch.setenv("GEMINI_MODELS", "m1")
+    monkeypatch.setenv("GEMINI_RETRIES", "3")
+    nut = ingest._run_models(["prompt"])
+    assert nut["foods"] == "rice"
+    assert fm.calls == ["m1", "m1"]  # retried, then succeeded
+
+
+def test_deadline_returns_before_request_timeout(monkeypatch):
+    fm = _fake_genai([_GOOD_BODY], monkeypatch)
+    monkeypatch.setenv("GEMINI_MODELS", "m1,m2")
+    monkeypatch.setenv("GEMINI_DEADLINE_S", "-1")  # already past
+    with pytest.raises(RuntimeError, match="deadline"):
+        ingest._run_models(["prompt"])
+    assert fm.calls == []  # never even called the model
+
+
 def test_text_only_dedup_hash_is_stable_and_distinct():
     # text-only meals de-dupe on the note; identical text hashes the same,
     # different text does not, and it never collides with a raw-image hash.

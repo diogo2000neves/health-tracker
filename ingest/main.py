@@ -88,6 +88,16 @@ NON_MEALS = {"not food", "analysis failed"}
 # Each model is retried GEMINI_RETRIES times (transient 503s) before falling back.
 DEFAULT_MODELS = "gemini-3.5-flash,gemini-3-flash-preview,gemini-3.1-flash-lite"
 DEFAULT_RETRIES = 3
+# Hard caps so a single request can't hang until Cloud Run's 180 s timeout:
+#  * MAX_OUTPUT_TOKENS bounds generation — without it the model can occasionally
+#    run one number to tens of thousands of digits, taking minutes and producing
+#    unparseable JSON (the cause of the 504s on 2026-07-12);
+#  * TIMEOUT_MS is a per-call network backstop;
+#  * DEADLINE_S stops us starting another model attempt so late it would cross
+#    the request timeout — we return a fast "analysis failed" stub instead.
+DEFAULT_MAX_OUTPUT_TOKENS = 8192
+DEFAULT_TIMEOUT_MS = 120000
+DEFAULT_DEADLINE_S = 105
 
 # Full per-ingredient micronutrient set, stored in each item's `nutrients` map.
 # Grouped by unit (suffix _g/_mg/_ug) so values map cleanly to a future relational
@@ -366,9 +376,11 @@ def _authorized(req) -> bool:
 
 # -- pure helpers (unit-tested) -------------------------------------------------
 def _round_num(value: Any, digits: int = 1) -> float:
+    # OverflowError guards against a runaway number (hundreds of digits) that
+    # parses as an int but overflows float() — it must never 500 the request.
     try:
         return max(0.0, round(float(value), digits))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0.0
 
 
@@ -381,7 +393,10 @@ def _normalize_nutrients(raw: Any) -> Dict[str, float]:
     for key in NUTRIENT_KEYS:
         value = raw.get(key)
         if isinstance(value, (int, float)) and value > 0:
-            out[key] = round(float(value), 2 if key.endswith("_g") else 1)
+            try:
+                out[key] = round(float(value), 2 if key.endswith("_g") else 1)
+            except OverflowError:  # runaway number -> drop the key, don't crash
+                continue
     return out
 
 
@@ -466,41 +481,69 @@ def _is_permanent(err: Exception) -> bool:
     return any(tok in msg for tok in ("404", "NOT_FOUND", "400", "INVALID_ARGUMENT"))
 
 
+def _gen_config() -> "types.GenerateContentConfig":
+    return types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=RESPONSE_SCHEMA,
+        temperature=0.1,
+        max_output_tokens=int(os.environ.get(
+            "GEMINI_MAX_OUTPUT_TOKENS", str(DEFAULT_MAX_OUTPUT_TOKENS))),
+        http_options=types.HttpOptions(timeout=int(os.environ.get(
+            "GEMINI_TIMEOUT_MS", str(DEFAULT_TIMEOUT_MS)))),
+    )
+
+
 def _run_models(contents: List[Any]) -> Dict[str, Any]:
-    """Send `contents` (a photo+prompt or a text prompt) through the fallback
+    """Send `contents` (photos+prompt or a text prompt) through the fallback
     chain, strongest model first, and assemble the meal from the JSON reply.
 
-    Each model is retried up to GEMINI_RETRIES times on transient failures
-    (503 overloaded, 429, timeouts) with exponential backoff before falling back
-    to the next, weaker model — response time isn't critical, accuracy is.
+    Two failure modes are treated differently:
+      * transient API errors (503 overloaded, 429, timeout) are retried on the
+        SAME model up to GEMINI_RETRIES times with exponential backoff;
+      * an unparseable body (the model runs a number to tens of thousands of
+        digits, or truncates at max_output_tokens) is deterministic at this
+        temperature, so we skip straight to the next model instead of burning
+        the retry budget reproducing the same garbage.
+    A wall-clock deadline guarantees we return before Cloud Run's request
+    timeout rather than letting the caller (the phone) hit a 504.
     """
     models = _models()
     retries = max(1, int(os.environ.get("GEMINI_RETRIES", str(DEFAULT_RETRIES))))
+    deadline = time.monotonic() + float(os.environ.get(
+        "GEMINI_DEADLINE_S", str(DEFAULT_DEADLINE_S)))
     last_err: Optional[Exception] = None
     for model in models:
         for attempt in range(1, retries + 1):
+            if time.monotonic() > deadline:
+                app.logger.warning("analysis deadline reached before %s", model)
+                raise RuntimeError(
+                    f"analysis deadline exceeded; last error: {last_err}")
             try:
                 resp = _genai().models.generate_content(
-                    model=model,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=RESPONSE_SCHEMA,
-                        temperature=0.1,
-                    ),
-                )
-                data = json.loads(resp.text)
-                items = _normalize_items(data.get("items"))
-                return _meal_from_items(items, data.get("confidence"), model)
-            except Exception as err:  # 503 overloaded, 429, parse, not-found, ...
+                    model=model, contents=contents, config=_gen_config())
+            except Exception as err:  # network / API error: 503, 429, timeout, ...
                 last_err = err
                 if _is_permanent(err):
                     app.logger.warning("model %s unusable, skipping: %s", model, err)
                     break
                 app.logger.warning("model %s attempt %d/%d failed: %s",
                                    model, attempt, retries, err)
-                if attempt < retries:
+                if attempt < retries and time.monotonic() < deadline:
                     time.sleep(min(2 ** attempt, 10))
+                continue
+            # Parse in its own guard: a malformed / truncated body raises
+            # JSONDecodeError, and a runaway number raises ValueError (Python's
+            # 4300-digit int-parse limit). Both are deterministic -> next model.
+            try:
+                data = json.loads(resp.text)
+            except (json.JSONDecodeError, ValueError, TypeError) as perr:
+                last_err = perr
+                app.logger.warning(
+                    "model %s produced unparseable output, next model: %s",
+                    model, perr)
+                break
+            items = _normalize_items(data.get("items"))
+            return _meal_from_items(items, data.get("confidence"), model)
     raise RuntimeError(f"all models failed ({models}); last error: {last_err}")
 
 
