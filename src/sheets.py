@@ -30,15 +30,29 @@ MEALS_TAB = "meals"
 DASHBOARD_TAB = "dashboard"
 INSIGHTS_TAB = "insights"
 
+# Tier-1 micronutrients that also roll up into daily_summary as `total_<key>`
+# columns — the high-value, more-reliably-estimated ones. The full nutrient set
+# is stored per-ingredient in the meals `items` JSON (owned by ingest/main.py);
+# these are just the subset that additionally gets daily totals. Keys carry their
+# unit suffix (_g / _mg / _ug) so they map cleanly to a future relational schema.
+TIER1_NUTRIENTS: List[str] = [
+    "fiber_g", "sugar_g", "saturated_fat_g", "sodium_mg", "potassium_mg",
+    "calcium_mg", "iron_mg", "magnesium_mg", "zinc_mg",
+    "vitamin_c_mg", "vitamin_d_ug", "vitamin_b12_ug", "vitamin_a_ug",
+    "folate_ug", "omega3_g",
+]
+
 # Parent schema. Readiness block first (blueprint order), then the nutrition
-# roll-up, then body composition; `updated_at` stays last as bookkeeping.
-# `lean_mass_kg` = weight_kg x (1 - body_fat_pct/100) — stored, not just derived,
-# so the sheet stays self-contained for AI analysis. Schema changes must go
-# through src/maintenance.py so existing rows are realigned, never clobbered.
+# roll-up (macros + Tier-1 micronutrients), then activity and body composition;
+# `updated_at` stays last as bookkeeping. `lean_mass_kg` = weight_kg x
+# (1 - body_fat_pct/100) — stored, not just derived, so the sheet stays
+# self-contained for AI analysis. Schema changes must go through
+# src/maintenance.py so existing rows are realigned in place, never clobbered.
 DAILY_HEADERS: List[str] = [
     "date",
     "sleep_score", "hrv_ms", "spo2_pct", "skin_temp_dev", "subjective_feel",
     "total_cals_in", "total_protein_g", "total_carbs_g", "total_fat_g",
+    *[f"total_{n}" for n in TIER1_NUTRIENTS],
     "total_active_mins", "steps",
     "weight_kg", "body_fat_pct", "lean_mass_kg",
     "updated_at",

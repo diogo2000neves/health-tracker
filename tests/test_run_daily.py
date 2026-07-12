@@ -1,4 +1,5 @@
 """Unit tests for the daily job's pure transforms (no network, no sheet)."""
+import json
 from datetime import date
 
 from src.run_daily import (
@@ -89,6 +90,28 @@ def test_daily_nutrition_window_filter():
     meals = [{"datetime": "2026-07-01T12:00:00+01:00", "foods": "rice",
               "calories": 200, "protein_g": 4, "carbs_g": 44, "fat_g": 0.4}]
     assert daily_nutrition(meals, "2026-07-02") == {}
+
+
+def test_daily_nutrition_rolls_up_tier1_nutrients_from_items():
+    meals = [
+        {"datetime": "2026-07-12T08:00:00+01:00", "foods": "oats",
+         "calories": 300, "protein_g": 10, "carbs_g": 50, "fat_g": 6,
+         "items": json.dumps([{"name": "oats", "calories": 300, "protein_g": 10,
+             "carbs_g": 50, "fat_g": 6,
+             "nutrients": {"fiber_g": 8, "sodium_mg": 5, "iron_mg": 2}}])},
+        {"datetime": "2026-07-12T19:00:00+01:00", "foods": "banana",
+         "calories": 100, "protein_g": 1, "carbs_g": 27, "fat_g": 0,
+         "items": json.dumps([{"name": "banana", "calories": 100, "protein_g": 1,
+             "carbs_g": 27, "fat_g": 0,
+             "nutrients": {"fiber_g": 3, "potassium_mg": 400}}])},
+    ]
+    nut = daily_nutrition(meals, None)["2026-07-12"]
+    assert nut["total_cals_in"] == 400.0
+    assert nut["total_fiber_g"] == 11.0        # 8 + 3
+    assert nut["total_sodium_mg"] == 5.0
+    assert nut["total_iron_mg"] == 2.0
+    assert nut["total_potassium_mg"] == 400.0
+    assert "total_calcium_mg" not in nut       # never present -> omitted, not 0
 
 
 # -- merge + lean mass ----------------------------------------------------------

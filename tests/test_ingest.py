@@ -54,19 +54,48 @@ def test_meal_from_items_totals_and_label():
         {"name": "white rice", "portion_g": 150, "calories": 195,
          "protein_g": 4, "carbs_g": 42, "fat_g": 0.4},
     ])
-    nut = ingest._meal_from_items(items, 0.83, "fork as reference", "m")
+    nut = ingest._meal_from_items(items, 0.83, "gemini-3.5-flash")
     assert nut["foods"] == "chicken, white rice"
     assert nut["calories"] == 393.0
     assert nut["protein_g"] == 41.0
     assert nut["fat_g"] == 4.7
     assert nut["portion_g"] == 270.0
     assert nut["confidence"] == 0.83
+    assert nut["model"] == "gemini-3.5-flash"
+    assert "notes" not in nut
 
 
 def test_meal_from_items_empty_is_not_food():
-    nut = ingest._meal_from_items([], 1, "", "m")
+    nut = ingest._meal_from_items([], 1, "m")
     assert nut["foods"] == "not food"
     assert nut["calories"] == 0.0
+
+
+def test_normalize_nutrients_keeps_known_nonzero_rounded():
+    n = ingest._normalize_nutrients({
+        "fiber_g": 8.234, "sodium_mg": 120.64, "vitamin_b12_ug": 1.28,
+        "bogus_key": 5, "calcium_mg": 0, "iron_mg": -1,
+    })
+    assert n["fiber_g"] == 8.23       # grams -> 2 dp
+    assert n["sodium_mg"] == 120.6    # mg -> 1 dp
+    assert n["vitamin_b12_ug"] == 1.3  # ug -> 1 dp
+    assert "bogus_key" not in n       # unknown key dropped
+    assert "calcium_mg" not in n      # zero dropped
+    assert "iron_mg" not in n         # negative dropped
+
+
+def test_normalize_items_attaches_nutrients():
+    items = ingest._normalize_items([{
+        "name": "spinach", "portion_g": 100, "calories": 23, "protein_g": 3,
+        "carbs_g": 4, "fat_g": 0,
+        "nutrients": {"iron_mg": 2.7, "folate_ug": 194, "calcium_mg": 99},
+    }])
+    assert items[0]["nutrients"]["iron_mg"] == 2.7
+    assert items[0]["nutrients"]["folate_ug"] == 194.0
+    # a plain item with no nutrients object stays lean
+    plain = ingest._normalize_items([{"name": "water ice", "portion_g": 1,
+        "calories": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0}])
+    assert "nutrients" not in plain[0]
 
 
 def test_day_totals_skips_non_meals_and_zero_rows():

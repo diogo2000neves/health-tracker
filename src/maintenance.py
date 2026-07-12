@@ -20,11 +20,21 @@ from typing import Any, Dict, List
 import google.auth
 from googleapiclient.discovery import build
 
-from src.sheets import DAILY_HEADERS, DAILY_TAB, DASHBOARD_TAB, INSIGHTS_TAB, col_letter
+from src.sheets import (
+    DAILY_HEADERS, DAILY_TAB, DASHBOARD_TAB, INSIGHTS_TAB, MEALS_TAB, col_letter,
+)
 
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 
 INSIGHTS_HEADERS = ["week_ending", "insights", "model", "updated_at"]
+
+# Target meals layout (mirror of ingest/main.py MEALS_HEADERS — kept here because
+# maintenance runs in the daily image and can't import the standalone ingest).
+MEALS_HEADERS = [
+    "datetime", "foods", "items", "calories",
+    "protein_g", "carbs_g", "fat_g", "confidence", "model", "photo_url",
+    "portion_g", "image_sha",
+]
 
 DASHBOARD_LABELS = [
     ["HEALTH DASHBOARD"],
@@ -66,6 +76,34 @@ def _sync_daily_columns(svc, sid: str, daily_id: int) -> str:
         valueInputOption="RAW", body={"values": [DAILY_HEADERS]},
     ).execute()
     return f"daily_summary: inserted column(s) {missing}"
+
+
+def _sync_meals_columns(svc, sid: str) -> str:
+    """Realign the meals tab to MEALS_HEADERS in place — dropping removed columns
+    (e.g. `notes`) and adding new ones blank (e.g. `model`) — while preserving
+    every existing row's data by header name. Idempotent (no-op when in sync)."""
+    values = (
+        svc.spreadsheets().values()
+        .get(spreadsheetId=sid, range=f"{MEALS_TAB}!A1:Z",
+             valueRenderOption="UNFORMATTED_VALUE")
+        .execute().get("values", [])
+    )
+    if not values:
+        return "meals: empty — skipping"
+    header = values[0]
+    if header == MEALS_HEADERS:
+        return "meals: header already in sync"
+    rows = [dict(zip(header, r)) for r in values[1:]]
+    body = [MEALS_HEADERS] + [
+        [("" if r.get(h) is None else r.get(h, "")) for h in MEALS_HEADERS]
+        for r in rows
+    ]
+    svc.spreadsheets().values().clear(
+        spreadsheetId=sid, range=f"{MEALS_TAB}!A1:Z").execute()
+    svc.spreadsheets().values().update(
+        spreadsheetId=sid, range=f"{MEALS_TAB}!A1",
+        valueInputOption="RAW", body={"values": body}).execute()
+    return f"meals: realigned {len(rows)} row(s) to {len(MEALS_HEADERS)} columns"
 
 
 def _chart_requests(dashboard_id: int, daily_id: int) -> List[Dict[str, Any]]:
@@ -129,6 +167,10 @@ def main() -> None:
 
     # 1. daily_summary column alignment.
     print(_sync_daily_columns(svc, sid, sheets[DAILY_TAB]["properties"]["sheetId"]))
+
+    # 1b. meals column alignment (drop notes, add model, ...).
+    if MEALS_TAB in sheets:
+        print(_sync_meals_columns(svc, sid))
 
     # 2. dashboard tab + labels + charts.
     if DASHBOARD_TAB not in sheets:

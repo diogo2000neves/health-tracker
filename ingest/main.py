@@ -50,14 +50,15 @@ app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024  # reject absurd uploads
 MEALS_TAB = "meals"
 DAILY_TAB = "daily_summary"
 
-# One row per meal. `items` is a JSON array breaking the plate into ingredients
-# (each with its own portion + macros); the flat columns are the row totals the
-# daily job rolls up. `image_sha` powers de-duplication. New columns are only
-# ever appended at the end so previously written rows stay aligned.
+# One row per meal. `items` is a JSON array breaking the plate into ingredients,
+# each with its own portion, macros and a `nutrients` map; the flat columns are
+# the row totals the daily job rolls up. `model` records which AI analysed the
+# photo (audit); `image_sha` powers de-duplication. Schema changes (add/remove a
+# column) must be mirrored in src/maintenance.py so existing rows are realigned.
 MEALS_HEADERS = [
     "datetime", "foods", "items", "calories",
-    "protein_g", "carbs_g", "fat_g", "confidence", "photo_url",
-    "portion_g", "notes", "image_sha",
+    "protein_g", "carbs_g", "fat_g", "confidence", "model", "photo_url",
+    "portion_g", "image_sha",
 ]
 LAST_COL = chr(ord("A") + len(MEALS_HEADERS) - 1)  # "L"
 
@@ -72,14 +73,36 @@ NON_MEALS = {"not food", "analysis failed"}
 DEFAULT_MODELS = "gemini-3.5-flash,gemini-3-flash-preview,gemini-3.1-flash-lite"
 DEFAULT_RETRIES = 3
 
+# Full per-ingredient micronutrient set, stored in each item's `nutrients` map.
+# Grouped by unit (suffix _g/_mg/_ug) so values map cleanly to a future relational
+# nutrients table. The Tier-1 subset (src/sheets.py TIER1_NUTRIENTS) also rolls up
+# into daily_summary. Keep this in sync with the key list in the prompt below.
+NUTRIENTS_G = [
+    "fiber_g", "sugar_g", "added_sugar_g", "saturated_fat_g",
+    "monounsaturated_fat_g", "polyunsaturated_fat_g", "trans_fat_g",
+    "omega3_g", "omega6_g",
+]
+NUTRIENTS_MG = [
+    "sodium_mg", "potassium_mg", "calcium_mg", "iron_mg", "magnesium_mg",
+    "zinc_mg", "phosphorus_mg", "copper_mg", "manganese_mg", "chloride_mg",
+    "cholesterol_mg", "choline_mg", "vitamin_c_mg", "vitamin_e_mg",
+    "vitamin_b1_mg", "vitamin_b2_mg", "vitamin_b3_mg", "vitamin_b5_mg",
+    "vitamin_b6_mg",
+]
+NUTRIENTS_UG = [
+    "vitamin_a_ug", "vitamin_d_ug", "vitamin_k_ug", "vitamin_b12_ug",
+    "folate_ug", "biotin_ug", "selenium_ug", "iodine_ug",
+]
+NUTRIENT_KEYS = NUTRIENTS_G + NUTRIENTS_MG + NUTRIENTS_UG
+
 PROMPT = """You are an expert nutritionist and food scientist doing computer-
 vision meal analysis. Estimate every ingredient in the photo, its cooked weight
 in grams, and its macros as accurately as possible. Being honest about
 uncertainty matters more than giving confident round numbers.
 
-Work through steps 1-5 IN ORDER inside the `reasoning` field FIRST, then fill in
-`items`, `confidence` and `notes`. Do not skip the reasoning — thinking through
-scale and hidden fats before committing to numbers is what makes them accurate.
+Work through steps 1-6 IN ORDER inside the `reasoning` field FIRST, then fill in
+`items` and `confidence`. Do not skip the reasoning — thinking through scale and
+hidden fats before committing to numbers is what makes them accurate.
 
 1) CALIBRATE SCALE from whatever is actually in the photo.
 Use any object that reveals real-world size — a plate/bowl, cutlery, a hand, a
@@ -124,6 +147,22 @@ Sanity-check each: calories should be within ~10% of 4*protein + 4*carbs +
 9*fat; fix the numbers if they disagree. Give PER-ITEM numbers only — do NOT sum
 the meal yourself, the totals are computed automatically.
 
+6) MICRONUTRIENTS PER ITEM (fill each item's `nutrients`).
+From the identified food and the grams you estimated, estimate its micronutrients
+from that food's known nutritional profile, scaled to the portion. Use EXACTLY
+these keys and units:
+  grams (g):  fiber_g, sugar_g, added_sugar_g, saturated_fat_g,
+    monounsaturated_fat_g, polyunsaturated_fat_g, trans_fat_g, omega3_g, omega6_g
+  milligrams (mg):  sodium_mg, potassium_mg, calcium_mg, iron_mg, magnesium_mg,
+    zinc_mg, phosphorus_mg, copper_mg, manganese_mg, chloride_mg, cholesterol_mg,
+    choline_mg, vitamin_c_mg, vitamin_e_mg, vitamin_b1_mg, vitamin_b2_mg,
+    vitamin_b3_mg, vitamin_b5_mg, vitamin_b6_mg
+  micrograms (ug):  vitamin_a_ug, vitamin_d_ug, vitamin_k_ug, vitamin_b12_ug,
+    folate_ug, biotin_ug, selenium_ug, iodine_ug
+Include every nutrient the food contains in a non-negligible amount; OMIT keys
+that are essentially zero or trace for that food (do not pad the object with
+zeros). Base values on the cooked weight and method from steps 3-4.
+
 CONFIDENCE — use this EXACT scale (0-1) so the score means the same thing no
 matter which model produces it. Report ONE value for the whole meal, set by your
 least-certain major item:
@@ -139,17 +178,17 @@ Rules:
   it lower confidence instead of leaving it out.
 - Caloric drinks (juice, soda, milk, beer) are items; water, plain tea and black
   coffee are ignored.
-- If the image contains no food or drink, return items: [].
-- notes: one short sentence — the scale reference you used (or that none was
-  available) and the single assumption most likely to be wrong."""
+- If the image contains no food or drink, return items: []."""
 
 # `reasoning` is generated FIRST (property ordering) so the model works through
 # scale, hidden fats and portions before committing to numbers — that ordering
 # is what improves accuracy. Meal totals are summed in code (see _meal_from_items),
 # never by the model, to avoid arithmetic errors.
+_NUTRIENT_PROPS = {k: types.Schema(type=types.Type.NUMBER) for k in NUTRIENT_KEYS}
+
 RESPONSE_SCHEMA = types.Schema(
     type=types.Type.OBJECT,
-    property_ordering=["reasoning", "items", "confidence", "notes"],
+    property_ordering=["reasoning", "items", "confidence"],
     properties={
         "reasoning": types.Schema(type=types.Type.STRING),
         "items": types.Schema(
@@ -157,7 +196,8 @@ RESPONSE_SCHEMA = types.Schema(
             items=types.Schema(
                 type=types.Type.OBJECT,
                 property_ordering=["name", "cooking_method", "portion_g",
-                                   "calories", "protein_g", "carbs_g", "fat_g"],
+                                   "calories", "protein_g", "carbs_g", "fat_g",
+                                   "nutrients"],
                 properties={
                     "name": types.Schema(type=types.Type.STRING),
                     "cooking_method": types.Schema(type=types.Type.STRING),
@@ -166,15 +206,16 @@ RESPONSE_SCHEMA = types.Schema(
                     "protein_g": types.Schema(type=types.Type.NUMBER),
                     "carbs_g": types.Schema(type=types.Type.NUMBER),
                     "fat_g": types.Schema(type=types.Type.NUMBER),
+                    "nutrients": types.Schema(
+                        type=types.Type.OBJECT, properties=_NUTRIENT_PROPS),
                 },
                 required=["name", "portion_g", "calories",
                           "protein_g", "carbs_g", "fat_g"],
             ),
         ),
         "confidence": types.Schema(type=types.Type.NUMBER),
-        "notes": types.Schema(type=types.Type.STRING),
     },
-    required=["reasoning", "items", "confidence", "notes"],
+    required=["reasoning", "items", "confidence"],
 )
 
 
@@ -229,8 +270,22 @@ def _round_num(value: Any, digits: int = 1) -> float:
         return 0.0
 
 
+def _normalize_nutrients(raw: Any) -> Dict[str, float]:
+    """Keep known, non-negligible nutrient keys, rounded to a sane precision
+    (grams to 2 dp, mg/ug to 1 dp). Unknown keys and zeros/traces are dropped."""
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, float] = {}
+    for key in NUTRIENT_KEYS:
+        value = raw.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            out[key] = round(float(value), 2 if key.endswith("_g") else 1)
+    return out
+
+
 def _normalize_items(raw: Any) -> List[Dict[str, Any]]:
-    """Coerce the model's item list into clean {name, portion_g, +macros} dicts."""
+    """Coerce the model's item list into clean {name, portion_g, macros,
+    cooking_method?, nutrients?} dicts."""
     items: List[Dict[str, Any]] = []
     for entry in raw or []:
         if not isinstance(entry, dict):
@@ -238,7 +293,7 @@ def _normalize_items(raw: Any) -> List[Dict[str, Any]]:
         name = str(entry.get("name", "")).strip()[:120]
         if not name:
             continue
-        item = {
+        item: Dict[str, Any] = {
             "name": name,
             "portion_g": _round_num(entry.get("portion_g")),
             "calories": _round_num(entry.get("calories")),
@@ -249,12 +304,15 @@ def _normalize_items(raw: Any) -> List[Dict[str, Any]]:
         method = str(entry.get("cooking_method", "")).strip()[:40]
         if method:
             item["cooking_method"] = method
+        nutrients = _normalize_nutrients(entry.get("nutrients"))
+        if nutrients:
+            item["nutrients"] = nutrients
         items.append(item)
     return items
 
 
 def _meal_from_items(items: List[Dict[str, Any]], confidence: Any,
-                     notes: Any, model: str) -> Dict[str, Any]:
+                     model: str) -> Dict[str, Any]:
     """Assemble the meal record (row totals = sum over items)."""
     def total(key: str) -> float:
         return round(sum(i[key] for i in items), 1)
@@ -268,7 +326,6 @@ def _meal_from_items(items: List[Dict[str, Any]], confidence: Any,
         "carbs_g": total("carbs_g"),
         "fat_g": total("fat_g"),
         "confidence": _round_num(confidence, 2),
-        "notes": str(notes or "")[:300],
         "model": model,
     }
 
@@ -331,8 +388,7 @@ def analyze(img: bytes, mime: str) -> Dict[str, Any]:
                 )
                 data = json.loads(resp.text)
                 items = _normalize_items(data.get("items"))
-                return _meal_from_items(items, data.get("confidence"),
-                                        data.get("notes"), model)
+                return _meal_from_items(items, data.get("confidence"), model)
             except Exception as err:  # 503 overloaded, 429, parse, not-found, ...
                 last_err = err
                 if _is_permanent(err):
@@ -415,7 +471,7 @@ def append_meal(nut: Dict[str, Any], photo_url: str, when: datetime,
         nut["foods"],
         json.dumps(nut["items"], ensure_ascii=False),
         nut["calories"], nut["protein_g"], nut["carbs_g"], nut["fat_g"],
-        nut["confidence"], photo_url, nut["portion_g"], nut["notes"],
+        nut["confidence"], nut["model"], photo_url, nut["portion_g"],
         image_sha,
     ]
     _ensure_meals_tab()
@@ -502,7 +558,7 @@ def ingest():
         except Exception:
             app.logger.exception("drive upload failed")
             photo_url = ""
-        stub = _meal_from_items([], 0, f"analysis failed: {err}", "none")
+        stub = _meal_from_items([], 0, "none")
         stub["foods"] = "analysis failed"
         append_meal(stub, photo_url, when, image_sha)
         return jsonify({

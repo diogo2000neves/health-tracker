@@ -111,9 +111,15 @@ Service account: `health-tracker-job@health-tracker-501322.iam.gserviceaccount.c
 | Code (master copy) | `/Users/dneves/Health Tracker/` — `src/` (job), `ingest/` (service) |
 
 ### Sheet schema
-- **`daily_summary`**: `date | sleep_score | hrv_ms | spo2_pct | skin_temp_dev |
-  subjective_feel | total_cals_in | total_protein_g | total_carbs_g | total_fat_g |
-  total_active_mins | steps | weight_kg | body_fat_pct | lean_mass_kg | updated_at`
+- **`daily_summary`**: `date` | readiness (`sleep_score, hrv_ms, spo2_pct,
+  skin_temp_dev, subjective_feel`) | macros (`total_cals_in, total_protein_g,
+  total_carbs_g, total_fat_g`) | **15 Tier-1 micronutrient totals**
+  (`total_fiber_g, total_sugar_g, total_saturated_fat_g, total_sodium_mg,
+  total_potassium_mg, total_calcium_mg, total_iron_mg, total_magnesium_mg,
+  total_zinc_mg, total_vitamin_c_mg, total_vitamin_d_ug, total_vitamin_b12_ug,
+  total_vitamin_a_ug, total_folate_ug, total_omega3_g`) | activity
+  (`total_active_mins, steps`) | body (`weight_kg, body_fat_pct, lean_mass_kg`) |
+  `updated_at`. Column order lives in `src.sheets.DAILY_HEADERS`.
   - **Merge-upsert keyed on `date`** — each source fills only its own columns
     (scale → physique, meals roll-up → nutrition, /feel → subjective_feel;
     Fitbit biometrics will fill the readiness block). Never overwrites a column
@@ -123,9 +129,13 @@ Service account: `health-tracker-job@health-tracker-501322.iam.gserviceaccount.c
   - The daily job re-rolls a trailing `HEALTH_RECONCILE_DAYS` (7) window; set 0
     + `HEALTH_START_DATE=2000-01-01` for a full backfill run.
 - **`meals`**: `datetime | foods | items | calories | protein_g | carbs_g | fat_g |
-  confidence | photo_url | portion_g | notes | image_sha`
-  - `items` = JSON array, one object per ingredient with its own portion+macros;
-    the flat columns are the row totals. `image_sha` de-duplicates double-taps.
+  confidence | model | photo_url | portion_g | image_sha`
+  - `items` = JSON array, one object per ingredient with its portion, macros,
+    `cooking_method` and a `nutrients` map (~36 possible nutrients, only the
+    non-negligible ones stored). The flat columns are the row totals; the daily
+    job sums the Tier-1 nutrients from `items` into `daily_summary`.
+  - `confidence` uses a fixed 0.1–1.0 rubric (model-independent); `model` records
+    which AI analysed the photo (audit); `image_sha` de-duplicates double-taps.
   - Rows with foods `not food` / `analysis failed` (or all-zero macros) are
     excluded from every roll-up.
 - **Schema changes**: add the column to `DAILY_HEADERS` and run

@@ -38,7 +38,7 @@ from google.oauth2.credentials import Credentials
 
 from src.google_health import BODY_FAT, WEIGHT, GoogleHealthClient
 from src.sheets import (
-    DAILY_HEADERS, DAILY_TAB, DASHBOARD_TAB, MEALS_TAB, SheetClient,
+    DAILY_HEADERS, DAILY_TAB, DASHBOARD_TAB, MEALS_TAB, SheetClient, TIER1_NUTRIENTS,
 )
 
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
@@ -157,27 +157,59 @@ def daily_body(
     }
 
 
+def _parse_items(raw: Any) -> List[Dict[str, Any]]:
+    """The meals `items` cell holds a JSON array of per-ingredient objects."""
+    if isinstance(raw, list):
+        return raw
+    try:
+        parsed = json.loads(raw) if raw else []
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
 def daily_nutrition(meals: List[Dict[str, Any]], start: Optional[str]) -> Dict[str, Dict[str, Any]]:
-    """Sum meal macros per local day, ignoring non-food and zero-content rows."""
-    fields = {
+    """Per local day: sum macros (flat meal columns) and Tier-1 micronutrients
+    (from each meal's per-ingredient `items` JSON). Non-food and zero-content
+    rows are ignored. Nutrient totals are emitted only when non-zero, so days
+    before nutrient tracking stay blank rather than showing misleading zeros."""
+    macro_fields = {
         "total_cals_in": "calories",
         "total_protein_g": "protein_g",
         "total_carbs_g": "carbs_g",
         "total_fat_g": "fat_g",
     }
-    totals: Dict[str, Dict[str, float]] = defaultdict(lambda: {k: 0.0 for k in fields})
+
+    def _blank() -> Dict[str, float]:
+        vals = {k: 0.0 for k in macro_fields}
+        vals.update({f"total_{n}": 0.0 for n in TIER1_NUTRIENTS})
+        return vals
+
+    totals: Dict[str, Dict[str, float]] = defaultdict(_blank)
     for meal in meals:
         day = str(meal.get("datetime") or "")[:10]
         if not day or not _in_window(day, start):
             continue
         if str(meal.get("foods") or "").strip().lower() in NON_MEALS:
             continue
-        macros = {k: _num(meal.get(mk)) for k, mk in fields.items()}
+        macros = {k: _num(meal.get(mk)) for k, mk in macro_fields.items()}
         if max(macros.values()) <= 0:
             continue  # zero-content rows carry no signal
         for k, v in macros.items():
             totals[day][k] += v
-    return {day: {k: round(v, 1) for k, v in vals.items()} for day, vals in totals.items()}
+        for item in _parse_items(meal.get("items")):
+            nutrients = item.get("nutrients") or {}
+            for n in TIER1_NUTRIENTS:
+                totals[day][f"total_{n}"] += _num(nutrients.get(n))
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for day, vals in totals.items():
+        out[day] = {
+            k: round(v, 2)
+            for k, v in vals.items()
+            if k in macro_fields or v > 0  # macros always; nutrients only if present
+        }
+    return out
 
 
 def build_daily_rows(
