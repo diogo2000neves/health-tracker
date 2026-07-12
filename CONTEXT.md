@@ -54,6 +54,13 @@ Sheet. Photos never touch iCloud or Google Photos (neither is readable by a
 server — the Google Photos API can no longer read a user's library, and iCloud has
 no server API at all).
 
+An **optional free-text `note`** can ride along (multipart form field, `?note=`
+query, or JSON). With a photo it's **authoritative** context that overrides the
+visual estimate ("only ate half" → halves portions; "air-fried, no oil" → drops
+the hidden-fat guess). A note with **no photo** is a **text-only meal** — Gemini
+estimates from the description alone at **capped confidence (≤0.50)**, nothing is
+archived to Drive, and the raw note is stored in `meals.note` for provenance.
+
 ## 3. Architecture
 
 ```
@@ -129,7 +136,9 @@ Service account: `health-tracker-job@health-tracker-501322.iam.gserviceaccount.c
   - The daily job re-rolls a trailing `HEALTH_RECONCILE_DAYS` (7) window; set 0
     + `HEALTH_START_DATE=2000-01-01` for a full backfill run.
 - **`meals`**: `datetime | foods | items | calories | protein_g | carbs_g | fat_g |
-  confidence | model | photo_url | portion_g | image_sha`
+  confidence | model | photo_url | portion_g | image_sha | note`
+  - `note` = the user's optional free-text description (empty for most rows);
+    stored for provenance, especially for text-only meals (empty `photo_url`).
   - `items` = JSON array, one object per ingredient with its portion, macros,
     `cooking_method` and a `nutrients` map (~36 possible nutrients, only the
     non-negligible ones stored). The flat columns are the row totals; the daily

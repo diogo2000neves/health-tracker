@@ -1,14 +1,22 @@
 """HTTP ingest service: meal photos + subjective-feel logging.
 
-POST /ingest (X-Auth-Token) — meal photo in the body (raw or multipart):
-  1. de-duplicates by image hash (double-taps don't double-log),
-  2. estimates per-ingredient nutrition with Gemini (structured JSON output),
-  3. archives the photo to the user's Google Drive,
-  4. appends a row to the `meals` tab,
+POST /ingest (X-Auth-Token) — a meal photo, a text description, or both:
+  * multipart form: an optional image file part + an optional `note` text part,
+  * or a raw image body (with an optional `?note=` query param),
+  * or a text-only meal: `?note=`, a `note` form field, or JSON {"note": ...}.
+  Then:
+  1. de-duplicates (photo -> image hash; text-only -> note hash) so double
+     submissions don't double-log,
+  2. estimates per-ingredient nutrition with Gemini (structured JSON output);
+     a `note` is authoritative context that overrides the visual/text estimate
+     (e.g. "only ate half" halves portions). Text-only meals reuse the same
+     schema but with capped confidence — there is no photo to measure against,
+  3. archives the photo to the user's Google Drive (skipped when text-only),
+  4. appends a row to the `meals` tab (the raw `note` is stored for provenance),
   5. replies with the meal summary plus the day's running totals.
-  Non-food photos are archived but never logged as rows. If every model fails,
-  the photo is archived and a zeroed "analysis failed" row keeps the audit
-  trail — a meal is never silently lost.
+  Non-food inputs are logged as nothing (photos still archived). If every model
+  fails, the photo is archived and a zeroed "analysis failed" row keeps the
+  audit trail — a meal is never silently lost.
 
 POST /feel (X-Auth-Token) — {"score": 1-10[, "date": "YYYY-MM-DD"]} merges
   into daily_summary.subjective_feel ({"score": null} clears a mislog).
@@ -58,9 +66,9 @@ DAILY_TAB = "daily_summary"
 MEALS_HEADERS = [
     "datetime", "foods", "items", "calories",
     "protein_g", "carbs_g", "fat_g", "confidence", "model", "photo_url",
-    "portion_g", "image_sha",
+    "portion_g", "image_sha", "note",
 ]
-LAST_COL = chr(ord("A") + len(MEALS_HEADERS) - 1)  # "L"
+LAST_COL = chr(ord("A") + len(MEALS_HEADERS) - 1)  # "M"
 
 # Rows excluded from all totals (kept in sync with src/run_daily.py NON_MEALS).
 NON_MEALS = {"not food", "analysis failed"}
@@ -179,6 +187,71 @@ Rules:
 - Caloric drinks (juice, soda, milk, beer) are items; water, plain tea and black
   coffee are ignored.
 - If the image contains no food or drink, return items: []."""
+
+# Appended to PROMPT when the user attaches a note. The note is AUTHORITATIVE:
+# it reflects facts about the meal the photo cannot show (what will actually be
+# eaten, how it was cooked, a brand/food the model can't see), so it overrides
+# the visual estimate wherever the two conflict.
+NOTE_SUFFIX = """
+
+USER NOTE — AUTHORITATIVE. The user added the note below about this meal. Treat
+it as ground truth and let it override your visual estimate wherever they
+conflict: e.g. "only ate half" => halve the portions of the affected items;
+"no oil, air-fried" => drop the absorbed-oil fat; a named food or brand overrides
+your identification; a stated weight/count overrides your size estimate. Fold it
+into your step 1-6 reasoning; do not treat it as a separate item unless it names
+extra food. NOTE: {note}"""
+
+# Text-only path: same schema and per-item rigour, but estimating from a written
+# description with NO photo. Confidence is capped low because there is no scale
+# reference to measure against — the numbers are informed guesses, not readings.
+TEXT_PROMPT = """You are an expert nutritionist estimating a meal from a WRITTEN
+DESCRIPTION ALONE — there is no photo. Work through the reasoning FIRST inside
+`reasoning`, then fill `items` and `confidence`.
+
+1) PARSE what was eaten from the description: each distinct food/drink, any stated
+quantities (weights, counts, "a bowl of", "half a", "a handful"), brands, and
+cooking method. Honour every number the user gives — a stated amount overrides
+any assumption.
+
+2) FILL THE GAPS with typical values. Where the description omits a portion, use a
+realistic single serving for that food and SAY you assumed it (that lowers
+confidence). Account for what is usually present but unstated — cooking oil,
+butter, dressings, added sugar — exactly as you would for a photo; these are the
+largest calorie-error source.
+
+3) IDENTIFY EACH ITEM PRECISELY and split composite meals into separate items
+("chicken with rice" = two items). Name items in lowercase singular English.
+
+4) WEIGH EACH ITEM (cooked, as eaten) in grams from the stated or typical serving
+and the food's density.
+
+5) COMPUTE MACROS PER ITEM (protein/carbs/fat, then calories); sanity-check each
+against ~4*protein + 4*carbs + 9*fat. PER-ITEM numbers only — totals are summed
+automatically.
+
+6) MICRONUTRIENTS PER ITEM — fill each item's `nutrients` from the food's known
+profile scaled to the grams, using EXACTLY these keys and units:
+  grams (g):  fiber_g, sugar_g, added_sugar_g, saturated_fat_g,
+    monounsaturated_fat_g, polyunsaturated_fat_g, trans_fat_g, omega3_g, omega6_g
+  milligrams (mg):  sodium_mg, potassium_mg, calcium_mg, iron_mg, magnesium_mg,
+    zinc_mg, phosphorus_mg, copper_mg, manganese_mg, chloride_mg, cholesterol_mg,
+    choline_mg, vitamin_c_mg, vitamin_e_mg, vitamin_b1_mg, vitamin_b2_mg,
+    vitamin_b3_mg, vitamin_b5_mg, vitamin_b6_mg
+  micrograms (ug):  vitamin_a_ug, vitamin_d_ug, vitamin_k_ug, vitamin_b12_ug,
+    folate_ug, biotin_ug, selenium_ug, iodine_ug
+Omit keys that are essentially zero/trace for that food.
+
+CONFIDENCE — CAP AT 0.50 (there is no photo). Use this scale:
+  0.35-0.50  the description is specific about foods AND amounts.
+  0.20-0.34  foods clear but portions had to be assumed.
+  0.10-0.19  vague description with heavy guesswork on identity or amount.
+
+Rules:
+- Caloric drinks are items; water, plain tea and black coffee are ignored.
+- If the text names no food or drink, return items: [].
+
+MEAL DESCRIPTION: {note}"""
 
 # `reasoning` is generated FIRST (property ordering) so the model works through
 # scale, hidden fats and portions before committing to numbers — that ordering
@@ -364,8 +437,9 @@ def _is_permanent(err: Exception) -> bool:
     return any(tok in msg for tok in ("404", "NOT_FOUND", "400", "INVALID_ARGUMENT"))
 
 
-def analyze(img: bytes, mime: str) -> Dict[str, Any]:
-    """Analyse a meal photo, strongest model first.
+def _run_models(contents: List[Any]) -> Dict[str, Any]:
+    """Send `contents` (a photo+prompt or a text prompt) through the fallback
+    chain, strongest model first, and assemble the meal from the JSON reply.
 
     Each model is retried up to GEMINI_RETRIES times on transient failures
     (503 overloaded, 429, timeouts) with exponential backoff before falling back
@@ -379,7 +453,7 @@ def analyze(img: bytes, mime: str) -> Dict[str, Any]:
             try:
                 resp = _genai().models.generate_content(
                     model=model,
-                    contents=[types.Part.from_bytes(data=img, mime_type=mime), PROMPT],
+                    contents=contents,
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         response_schema=RESPONSE_SCHEMA,
@@ -399,6 +473,18 @@ def analyze(img: bytes, mime: str) -> Dict[str, Any]:
                 if attempt < retries:
                     time.sleep(min(2 ** attempt, 10))
     raise RuntimeError(f"all models failed ({models}); last error: {last_err}")
+
+
+def analyze(img: bytes, mime: str, note: str = "") -> Dict[str, Any]:
+    """Analyse a meal photo. A `note`, if given, is appended as authoritative
+    context that overrides the visual estimate where the two conflict."""
+    prompt = PROMPT + (NOTE_SUFFIX.format(note=note) if note else "")
+    return _run_models([types.Part.from_bytes(data=img, mime_type=mime), prompt])
+
+
+def analyze_text(note: str) -> Dict[str, Any]:
+    """Estimate a meal from a written description alone (no photo)."""
+    return _run_models([TEXT_PROMPT.format(note=note)])
 
 
 # -- Drive ---------------------------------------------------------------------
@@ -465,14 +551,14 @@ def _ensure_meals_tab() -> None:
 
 
 def append_meal(nut: Dict[str, Any], photo_url: str, when: datetime,
-                image_sha: str) -> None:
+                image_sha: str, note: str = "") -> None:
     row = [
         when.isoformat(timespec="seconds"),
         nut["foods"],
         json.dumps(nut["items"], ensure_ascii=False),
         nut["calories"], nut["protein_g"], nut["carbs_g"], nut["fat_g"],
         nut["confidence"], nut["model"], photo_url, nut["portion_g"],
-        image_sha,
+        image_sha, note,
     ]
     _ensure_meals_tab()
     _sheets().spreadsheets().values().append(
@@ -512,15 +598,33 @@ def _write_daily_cell(day: str, header_name: str, value: Any) -> None:
 
 # -- HTTP ------------------------------------------------------------------------
 def _extract_image():
-    """Return (bytes, mime) from either a multipart file or the raw body."""
+    """Return (bytes, mime) from a multipart file part or a raw image body, or
+    (b"", "") when the request carries no image (the text-only meal path).
+
+    Only a genuine image body counts: a form/JSON request with no file part is
+    treated as image-less so its raw bytes are never mistaken for a photo."""
     if request.files:
         f = next(iter(request.files.values()))
         return f.read(), (f.mimetype or "image/jpeg")
+    ctype = (request.content_type or "").lower()
+    if (ctype.startswith("multipart/form-data")
+            or ctype.startswith("application/x-www-form-urlencoded")
+            or ctype.startswith("application/json")):
+        return b"", ""  # form/JSON with no file => no image
     data = request.get_data()
-    mime = request.content_type or "image/jpeg"
-    if not mime.startswith("image/"):
-        mime = "image/jpeg"
+    if not data:
+        return b"", ""
+    mime = ctype if ctype.startswith("image/") else "image/jpeg"
     return data, mime
+
+
+def _extract_note() -> str:
+    """Optional free-text description, from a `note` form field, a `?note=` query
+    param, or a JSON {"note": ...} body (in that order). Empty when absent."""
+    note = request.form.get("note") or request.args.get("note") or ""
+    if not note and request.is_json:
+        note = (request.get_json(silent=True) or {}).get("note", "") or ""
+    return str(note).strip()[:2000]
 
 
 @app.get("/")
@@ -534,60 +638,73 @@ def ingest():
         return jsonify({"error": "unauthorized"}), 401
 
     img, mime = _extract_image()
-    if not img:
-        return jsonify({"error": "no image received"}), 400
+    note = _extract_note()
+    if not img and not note:
+        return jsonify({"error": "no image or description received"}), 400
 
+    text_only = not img
     when = datetime.now(_tz())
     today = when.date().isoformat()
-    image_sha = _sha12(img)
+    # Photo meals de-dupe on the image; text-only meals on the note text, so an
+    # accidental re-send of either doesn't double-log the same day.
+    image_sha = _sha12(img) if img else _sha12(("text:" + note).encode("utf-8"))
 
     todays = _todays_meals(today)
     if any(r.get("image_sha") == image_sha for r in todays):
         return jsonify({
-            "summary": "Duplicate photo — this meal is already logged today.",
+            "summary": ("Duplicate description — already logged today."
+                        if text_only
+                        else "Duplicate photo — this meal is already logged today."),
             "duplicate": True,
         }), 200
 
+    def _archive() -> str:
+        """Archive the photo if there is one; text-only meals have nothing to store."""
+        if not img:
+            return ""
+        try:
+            return archive_photo(img, mime, when)
+        except Exception:
+            app.logger.exception("drive upload failed")
+            return ""
+
     try:
-        nut = analyze(img, mime)
+        nut = analyze_text(note) if text_only else analyze(img, mime, note)
     except Exception as err:
         # Never lose a meal: archive the photo and leave an auditable stub row.
         app.logger.exception("analysis failed")
-        try:
-            photo_url = archive_photo(img, mime, when)
-        except Exception:
-            app.logger.exception("drive upload failed")
-            photo_url = ""
+        photo_url = _archive()
         stub = _meal_from_items([], 0, "none")
         stub["foods"] = "analysis failed"
-        append_meal(stub, photo_url, when, image_sha)
+        append_meal(stub, photo_url, when, image_sha, note)
         return jsonify({
             "error": f"analysis failed: {err}",
-            "summary": "Analysis failed — photo archived for later review.",
+            "summary": ("Analysis failed — logged for later review."
+                        if text_only
+                        else "Analysis failed — photo archived for later review."),
             "photo_url": photo_url,
         }), 502
 
     # Archiving must never lose the nutrition data, so failures are non-fatal.
-    try:
-        photo_url = archive_photo(img, mime, when)
-    except Exception:
-        app.logger.exception("drive upload failed")
-        photo_url = ""
+    photo_url = _archive()
 
     if not nut["items"]:
         return jsonify({
-            "summary": "No food detected — nothing logged (photo archived).",
+            "summary": ("No food in the description — nothing logged."
+                        if text_only
+                        else "No food detected — nothing logged (photo archived)."),
             "photo_url": photo_url,
             "not_food": True,
         }), 200
 
-    append_meal(nut, photo_url, when, image_sha)
+    append_meal(nut, photo_url, when, image_sha, note)
 
     running = _day_totals(todays)
     for key in running:
         running[key] = round(running[key] + nut[key], 1)
+    prefix = "Logged (from description): " if text_only else "Logged: "
     summary = (
-        f"Logged: {nut['foods']} (~{int(nut['portion_g'])} g) — "
+        f"{prefix}{nut['foods']} (~{int(nut['portion_g'])} g) — "
         f"~{int(nut['calories'])} kcal "
         f"({int(nut['protein_g'])}P/{int(nut['carbs_g'])}C/{int(nut['fat_g'])}F) · "
         f"Today: {int(running['calories'])} kcal "

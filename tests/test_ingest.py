@@ -151,3 +151,64 @@ def test_sha12_stable():
     assert ingest._sha12(b"abc") == ingest._sha12(b"abc")
     assert len(ingest._sha12(b"abc")) == 12
     assert ingest._sha12(b"abc") != ingest._sha12(b"abd")
+
+
+def test_meals_headers_have_note_and_mirror_maintenance():
+    # `note` stores the user's free-text description for provenance; the two
+    # copies (ingest + maintenance) must stay identical or the sync corrupts rows.
+    from src import maintenance
+    assert ingest.MEALS_HEADERS[-1] == "note"
+    assert ingest.MEALS_HEADERS == maintenance.MEALS_HEADERS
+    assert ingest.LAST_COL == "M"
+
+
+def test_note_suffix_and_text_prompt_are_authoritative():
+    # a photo note overrides the visual estimate; the text path caps confidence
+    filled = ingest.NOTE_SUFFIX.format(note="only ate half")
+    assert "only ate half" in filled
+    assert "AUTHORITATIVE" in ingest.NOTE_SUFFIX
+    assert "0.50" in ingest.TEXT_PROMPT  # confidence cap for text-only meals
+    assert "MEAL DESCRIPTION: half an avocado" in \
+        ingest.TEXT_PROMPT.format(note="half an avocado")
+
+
+def test_extract_note_from_form_query_and_json():
+    with ingest.app.test_request_context(
+            "/ingest?note=from-query", method="POST"):
+        assert ingest._extract_note() == "from-query"
+    with ingest.app.test_request_context(
+            "/ingest", method="POST", data={"note": "  from-form  "}):
+        assert ingest._extract_note() == "from-form"  # trimmed
+    with ingest.app.test_request_context(
+            "/ingest", method="POST", json={"note": "from-json"}):
+        assert ingest._extract_note() == "from-json"
+    with ingest.app.test_request_context("/ingest", method="POST"):
+        assert ingest._extract_note() == ""  # absent
+
+
+def test_extract_image_ignores_bodyless_form_and_json():
+    # a note-only form/JSON request must NOT have its body read as a fake image
+    with ingest.app.test_request_context(
+            "/ingest", method="POST", data={"note": "oatmeal"}):
+        assert ingest._extract_image() == (b"", "")
+    with ingest.app.test_request_context(
+            "/ingest", method="POST", json={"note": "oatmeal"}):
+        assert ingest._extract_image() == (b"", "")
+
+
+def test_extract_image_reads_raw_image_body():
+    with ingest.app.test_request_context(
+            "/ingest", method="POST", data=b"\xff\xd8jpegbytes",
+            content_type="image/jpeg"):
+        img, mime = ingest._extract_image()
+        assert img == b"\xff\xd8jpegbytes"
+        assert mime == "image/jpeg"
+
+
+def test_text_only_dedup_hash_is_stable_and_distinct():
+    # text-only meals de-dupe on the note; identical text hashes the same,
+    # different text does not, and it never collides with a raw-image hash.
+    h = lambda note: ingest._sha12(("text:" + note).encode("utf-8"))
+    assert h("oatmeal") == h("oatmeal")
+    assert h("oatmeal") != h("toast")
+    assert h("oatmeal") != ingest._sha12(b"oatmeal")
