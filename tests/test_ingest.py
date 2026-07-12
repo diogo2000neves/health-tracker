@@ -169,7 +169,7 @@ def test_note_suffix_and_text_prompt_are_authoritative():
     assert "AUTHORITATIVE" in ingest.NOTE_SUFFIX
     assert "0.50" in ingest.TEXT_PROMPT  # confidence cap for text-only meals
     assert "MEAL DESCRIPTION: half an avocado" in \
-        ingest.TEXT_PROMPT.format(note="half an avocado")
+        ingest.TEXT_PROMPT.format(note="half an avocado", now_hhmm="14:30")
 
 
 def test_extract_note_from_form_query_and_json():
@@ -355,6 +355,38 @@ def test_execute_gives_up_after_three_connection_errors(monkeypatch):
     with pytest.raises(ConnectionError):
         ingest._execute(lambda: req)
     assert req.calls == 3  # three attempts, then propagates
+
+
+# -- note-inferred meal time (text-only retro logging) -------------------------
+def test_meal_time_is_an_optional_schema_field():
+    assert "meal_time" in ingest.RESPONSE_SCHEMA.properties
+    assert "meal_time" in ingest.RESPONSE_SCHEMA.property_ordering
+    assert "meal_time" not in ingest.RESPONSE_SCHEMA.required  # optional
+
+
+def test_resolve_meal_time_maps_hhmm_onto_today():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    now = datetime(2026, 7, 12, 14, 30, tzinfo=ZoneInfo("Europe/Lisbon"))
+    # a valid earlier time => today at that time
+    got = ingest._resolve_meal_time("08:00", now)
+    assert (got.hour, got.minute, got.date()) == (8, 0, now.date())
+    # a future time can't be a logged meal => clamp to now
+    assert ingest._resolve_meal_time("20:00", now) == now
+    # blank / malformed => fall back to now
+    assert ingest._resolve_meal_time("", now) == now
+    assert ingest._resolve_meal_time("breakfast", now) == now
+    assert ingest._resolve_meal_time("25:99", now) == now
+
+
+def test_run_models_surfaces_inferred_meal_time(monkeypatch):
+    body = ('{"reasoning":"had oats","meal_time":"08:15","items":[{"name":"oats",'
+            '"portion_g":250,"calories":300,"protein_g":10,"carbs_g":50,"fat_g":5}],'
+            '"confidence":0.4}')
+    _fake_genai([body], monkeypatch)
+    monkeypatch.setenv("GEMINI_MODELS", "m1")
+    nut = ingest._run_models(["prompt"])
+    assert nut["meal_time"] == "08:15" and nut["foods"] == "oats"
 
 
 def test_text_only_dedup_hash_is_stable_and_distinct():

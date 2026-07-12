@@ -288,6 +288,14 @@ CONFIDENCE — CAP AT 0.50 (there is no photo). Use this scale:
   0.20-0.34  foods clear but portions had to be assumed.
   0.10-0.19  vague description with heavy guesswork on identity or amount.
 
+MEAL TIME — set `meal_time` to the local 24h "HH:MM" the meal was eaten TODAY,
+inferred from the note. Use an explicit time if the note gives one; otherwise map
+the meal name to a typical local hour: breakfast ~08:00, brunch ~10:30, lunch
+~13:00, afternoon snack ~16:30, dinner ~20:00, late/supper ~22:00. The current
+local time is {now_hhmm} — NEVER return a time later than that (you cannot log a
+meal in the future). If the note gives no usable time or meal name, leave
+`meal_time` empty and it will default to now.
+
 Rules:
 - Caloric drinks are items; water, plain tea and black coffee are ignored.
 - If the text names no food or drink, return items: [].
@@ -302,9 +310,12 @@ _NUTRIENT_PROPS = {k: types.Schema(type=types.Type.NUMBER) for k in NUTRIENT_KEY
 
 RESPONSE_SCHEMA = types.Schema(
     type=types.Type.OBJECT,
-    property_ordering=["reasoning", "items", "confidence"],
+    property_ordering=["reasoning", "meal_time", "items", "confidence"],
     properties={
         "reasoning": types.Schema(type=types.Type.STRING),
+        # Optional "HH:MM" (24h local) inferred from a text note ("breakfast",
+        # "lunch", or an explicit time). Empty when unknown / for photo meals.
+        "meal_time": types.Schema(type=types.Type.STRING),
         "items": types.Schema(
             type=types.Type.ARRAY,
             items=types.Schema(
@@ -570,7 +581,9 @@ def _run_models(contents: List[Any]) -> Dict[str, Any]:
                     model, perr)
                 break
             items = _normalize_items(data.get("items"))
-            return _meal_from_items(items, data.get("confidence"), model)
+            meal = _meal_from_items(items, data.get("confidence"), model)
+            meal["meal_time"] = str(data.get("meal_time") or "").strip()
+            return meal
     raise RuntimeError(f"all models failed ({models}); last error: {last_err}")
 
 
@@ -596,9 +609,23 @@ def analyze(images: List[Tuple[bytes, str]], note: str = "") -> Dict[str, Any]:
     return _run_models(parts)
 
 
-def analyze_text(note: str) -> Dict[str, Any]:
-    """Estimate a meal from a written description alone (no photo)."""
-    return _run_models([TEXT_PROMPT.format(note=note)])
+def analyze_text(note: str, now: datetime) -> Dict[str, Any]:
+    """Estimate a meal from a written description alone (no photo). `now` is the
+    current local time, injected so the model can infer the meal's hour and never
+    place it in the future."""
+    return _run_models([TEXT_PROMPT.format(note=note, now_hhmm=now.strftime("%H:%M"))])
+
+
+def _resolve_meal_time(hhmm: Any, now: datetime) -> datetime:
+    """Map an inferred "HH:MM" onto today's date in the local tz. Falls back to
+    `now` when absent/invalid, and never returns a time in the future (you can't
+    log a meal you haven't eaten yet)."""
+    m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", str(hhmm or "").strip())
+    if not m:
+        return now
+    candidate = now.replace(hour=int(m.group(1)), minute=int(m.group(2)),
+                            second=0, microsecond=0)
+    return candidate if candidate <= now else now
 
 
 # -- Drive ---------------------------------------------------------------------
@@ -654,13 +681,18 @@ def _todays_meals(today: str) -> List[Dict[str, Any]]:
     return [r for r in rows if str(r.get("datetime", "")).startswith(today)]
 
 
-def _ensure_meals_tab() -> None:
+def _ensure_meals_tab() -> Optional[int]:
+    """Make sure the meals tab exists with the right header; return its sheetId
+    (needed to sort the tab), or None if it couldn't be determined."""
     meta = _execute(lambda: _sheets().spreadsheets().get(spreadsheetId=_sid()))
-    titles = {s["properties"]["title"] for s in meta.get("sheets", [])}
-    if MEALS_TAB not in titles:
-        _execute(lambda: _sheets().spreadsheets().batchUpdate(
+    sheets = {s["properties"]["title"]: s["properties"]["sheetId"]
+              for s in meta.get("sheets", [])}
+    meals_id = sheets.get(MEALS_TAB)
+    if meals_id is None:
+        reply = _execute(lambda: _sheets().spreadsheets().batchUpdate(
             spreadsheetId=_sid(),
             body={"requests": [{"addSheet": {"properties": {"title": MEALS_TAB}}}]}))
+        meals_id = reply["replies"][0]["addSheet"]["properties"]["sheetId"]
     rng = f"{MEALS_TAB}!A1:{LAST_COL}1"
     current = _execute(lambda: _sheets().spreadsheets().values().get(
         spreadsheetId=_sid(), range=rng)).get("values", [[]])
@@ -669,6 +701,20 @@ def _ensure_meals_tab() -> None:
         _execute(lambda: _sheets().spreadsheets().values().update(
             spreadsheetId=_sid(), range=f"{MEALS_TAB}!A1",
             valueInputOption="RAW", body={"values": [MEALS_HEADERS]}))
+    return meals_id
+
+
+def _sort_meals_by_datetime(meals_id: int) -> None:
+    """Keep the meals tab in chronological order so a back-dated meal (a note
+    logged after later meals) slots into place. Cosmetic — every roll-up sums by
+    date — so failures here are swallowed by the caller. ISO datetimes sort
+    lexicographically, which is chronological."""
+    _execute(lambda: _sheets().spreadsheets().batchUpdate(
+        spreadsheetId=_sid(), body={"requests": [{"sortRange": {
+            "range": {"sheetId": meals_id, "startRowIndex": 1,
+                      "startColumnIndex": 0, "endColumnIndex": len(MEALS_HEADERS)},
+            "sortSpecs": [{"dimensionIndex": 0, "sortOrder": "ASCENDING"}],
+        }}]}))
 
 
 def append_meal(nut: Dict[str, Any], photo_url: str, when: datetime,
@@ -681,11 +727,16 @@ def append_meal(nut: Dict[str, Any], photo_url: str, when: datetime,
         nut["confidence"], nut["model"], photo_url, nut["portion_g"],
         image_sha, note,
     ]
-    _ensure_meals_tab()
+    meals_id = _ensure_meals_tab()
     _execute(lambda: _sheets().spreadsheets().values().append(
         spreadsheetId=_sid(), range=f"{MEALS_TAB}!A1",
         valueInputOption="RAW", insertDataOption="INSERT_ROWS",
         body={"values": [row]}))
+    if meals_id is not None:
+        try:  # the meal is already saved; ordering must never fail the request
+            _sort_meals_by_datetime(meals_id)
+        except Exception:
+            app.logger.warning("meals sort failed (non-fatal)", exc_info=True)
 
 
 def _write_daily_cell(day: str, header_name: str, value: Any) -> None:
@@ -793,7 +844,7 @@ def ingest():
             return ""
 
     try:
-        nut = analyze_text(note) if text_only else analyze(images, note)
+        nut = analyze_text(note, when) if text_only else analyze(images, note)
     except Exception as err:
         # Never lose a meal: archive the photos and leave an auditable stub row.
         app.logger.exception("analysis failed")
@@ -821,12 +872,19 @@ def ingest():
             "not_food": True,
         }), 200
 
+    # A text-only meal carries the hour inferred from the note (e.g. "breakfast"),
+    # so the row lands at the right time today and sorts into place. Photo meals
+    # keep the capture time (now). Same date either way.
+    if text_only:
+        when = _resolve_meal_time(nut.get("meal_time"), when)
+
     append_meal(nut, photo_url, when, image_sha, note)
 
     running = _day_totals(todays)
     for key in running:
         running[key] = round(running[key] + nut[key], 1)
-    prefix = "Logged (from description): " if text_only else "Logged: "
+    prefix = (f"Logged for {when.strftime('%H:%M')} (from description): "
+              if text_only else "Logged: ")
     summary = (
         f"{prefix}{nut['foods']} (~{int(nut['portion_g'])} g) — "
         f"~{int(nut['calories'])} kcal "
