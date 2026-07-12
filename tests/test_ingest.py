@@ -328,6 +328,35 @@ def test_deadline_returns_before_request_timeout(monkeypatch):
     assert fm.calls == []  # never even called the model
 
 
+# -- stale-connection resilience (the BrokenPipe 500 fix) ----------------------
+class _FlakyReq:
+    """Raises on the first N executes (simulating a stale keep-alive socket)."""
+    def __init__(self, fails, exc):
+        self.fails, self.exc, self.calls = fails, exc, 0
+
+    def execute(self):
+        self.calls += 1
+        if self.calls <= self.fails:
+            raise self.exc
+        return {"ok": True}
+
+
+def test_execute_reconnects_after_broken_pipe(monkeypatch):
+    monkeypatch.setattr(ingest.time, "sleep", lambda *a, **k: None)
+    # BrokenPipeError is a ConnectionError subclass -> should be caught & retried
+    req = _FlakyReq(1, BrokenPipeError(32, "Broken pipe"))
+    assert ingest._execute(lambda: req) == {"ok": True}
+    assert req.calls == 2  # failed once, reconnected, succeeded
+
+
+def test_execute_gives_up_after_three_connection_errors(monkeypatch):
+    monkeypatch.setattr(ingest.time, "sleep", lambda *a, **k: None)
+    req = _FlakyReq(99, ConnectionResetError(104, "reset"))
+    with pytest.raises(ConnectionError):
+        ingest._execute(lambda: req)
+    assert req.calls == 3  # three attempts, then propagates
+
+
 def test_text_only_dedup_hash_is_stable_and_distinct():
     # text-only meals de-dupe on the note; identical text hashes the same,
     # different text does not, and it never collides with a raw-image hash.

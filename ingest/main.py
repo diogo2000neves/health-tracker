@@ -44,6 +44,8 @@ import io
 import json
 import os
 import re
+import socket
+import ssl
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -374,6 +376,31 @@ def _authorized(req) -> bool:
     return bool(expected) and hmac.compare_digest(given, expected)
 
 
+# The Sheets/Drive clients are lru-cached, so their httplib2 keep-alive sockets
+# outlive a request. On a scale-to-zero instance the peer closes those sockets
+# while it sits idle, and the first Google API call after the gap dies with
+# BrokenPipe/ConnectionReset (BrokenPipeError is a ConnectionError subclass).
+# _execute rebuilds the cached client and retries so an idle instance self-heals.
+_CONN_ERRORS = (ConnectionError, socket.timeout, ssl.SSLError)
+
+
+def _execute(build):
+    """Run `build().execute()` resiliently. `build` must return a *fresh* API
+    request each call so a retry picks up a rebuilt client (with a live socket)
+    after a stale-connection error."""
+    for attempt in range(3):
+        try:
+            return build().execute()
+        except _CONN_ERRORS as err:
+            if attempt == 2:
+                raise
+            app.logger.warning("stale API connection, reconnecting (%d): %s",
+                               attempt + 1, err)
+            _sheets.cache_clear()
+            _drive.cache_clear()
+            time.sleep(min(2 ** attempt, 4))
+
+
 # -- pure helpers (unit-tested) -------------------------------------------------
 def _round_num(value: Any, digits: int = 1) -> float:
     # OverflowError guards against a runaway number (hundreds of digits) that
@@ -591,13 +618,15 @@ def archive_photos(images: List[Tuple[bytes, str]], when: datetime) -> List[str]
         return []
     urls: List[str] = []
     for i, (img, mime) in enumerate(images, start=1):
-        media = MediaIoBaseUpload(io.BytesIO(img), mimetype=mime, resumable=False)
-        created = _drive().files().create(
-            body={"name": _photo_name(when, mime, i, len(images)),
-                  "parents": [folder]},
-            media_body=media,
+        name = _photo_name(when, mime, i, len(images))
+        # rebuild the media on each retry: an upload stream can't be replayed once
+        # partially consumed by a broken connection.
+        created = _execute(lambda name=name, img=img, mime=mime: _drive().files().create(
+            body={"name": name, "parents": [folder]},
+            media_body=MediaIoBaseUpload(io.BytesIO(img), mimetype=mime,
+                                         resumable=False),
             fields="id,webViewLink",
-        ).execute()
+        ))
         url = created.get("webViewLink", "")
         if url:
             urls.append(url)
@@ -606,12 +635,9 @@ def archive_photos(images: List[Tuple[bytes, str]], when: datetime) -> List[str]
 
 # -- Sheets --------------------------------------------------------------------
 def _read_tab(tab: str) -> List[List[Any]]:
-    return (
-        _sheets().spreadsheets().values()
-        .get(spreadsheetId=_sid(), range=f"{tab}!A1:Z",
-             valueRenderOption="UNFORMATTED_VALUE")
-        .execute().get("values", [])
-    )
+    return _execute(lambda: _sheets().spreadsheets().values().get(
+        spreadsheetId=_sid(), range=f"{tab}!A1:Z",
+        valueRenderOption="UNFORMATTED_VALUE")).get("values", [])
 
 
 def _rows_as_dicts(values: List[List[Any]]) -> List[Dict[str, Any]]:
@@ -629,25 +655,20 @@ def _todays_meals(today: str) -> List[Dict[str, Any]]:
 
 
 def _ensure_meals_tab() -> None:
-    meta = _sheets().spreadsheets().get(spreadsheetId=_sid()).execute()
+    meta = _execute(lambda: _sheets().spreadsheets().get(spreadsheetId=_sid()))
     titles = {s["properties"]["title"] for s in meta.get("sheets", [])}
     if MEALS_TAB not in titles:
-        _sheets().spreadsheets().batchUpdate(
+        _execute(lambda: _sheets().spreadsheets().batchUpdate(
             spreadsheetId=_sid(),
-            body={"requests": [{"addSheet": {"properties": {"title": MEALS_TAB}}}]},
-        ).execute()
+            body={"requests": [{"addSheet": {"properties": {"title": MEALS_TAB}}}]}))
     rng = f"{MEALS_TAB}!A1:{LAST_COL}1"
-    current = (
-        _sheets().spreadsheets().values()
-        .get(spreadsheetId=_sid(), range=rng)
-        .execute().get("values", [[]])
-    )
+    current = _execute(lambda: _sheets().spreadsheets().values().get(
+        spreadsheetId=_sid(), range=rng)).get("values", [[]])
     # Self-healing: (re)write the header whenever it doesn't match.
     if not current or current[0] != MEALS_HEADERS:
-        _sheets().spreadsheets().values().update(
+        _execute(lambda: _sheets().spreadsheets().values().update(
             spreadsheetId=_sid(), range=f"{MEALS_TAB}!A1",
-            valueInputOption="RAW", body={"values": [MEALS_HEADERS]},
-        ).execute()
+            valueInputOption="RAW", body={"values": [MEALS_HEADERS]}))
 
 
 def append_meal(nut: Dict[str, Any], photo_url: str, when: datetime,
@@ -661,11 +682,10 @@ def append_meal(nut: Dict[str, Any], photo_url: str, when: datetime,
         image_sha, note,
     ]
     _ensure_meals_tab()
-    _sheets().spreadsheets().values().append(
+    _execute(lambda: _sheets().spreadsheets().values().append(
         spreadsheetId=_sid(), range=f"{MEALS_TAB}!A1",
         valueInputOption="RAW", insertDataOption="INSERT_ROWS",
-        body={"values": [row]},
-    ).execute()
+        body={"values": [row]}))
 
 
 def _write_daily_cell(day: str, header_name: str, value: Any) -> None:
@@ -682,18 +702,16 @@ def _write_daily_cell(day: str, header_name: str, value: Any) -> None:
         letters = chr(ord("A") + rem) + letters
     for i, row in enumerate(values[1:], start=2):
         if row and str(row[0]) == day:
-            _sheets().spreadsheets().values().update(
+            _execute(lambda i=i: _sheets().spreadsheets().values().update(
                 spreadsheetId=_sid(), range=f"{DAILY_TAB}!{letters}{i}",
-                valueInputOption="RAW", body={"values": [[value]]},
-            ).execute()
+                valueInputOption="RAW", body={"values": [[value]]}))
             return
     new_row: List[Any] = [""] * len(header)
     new_row[0], new_row[idx] = day, value
-    _sheets().spreadsheets().values().append(
+    _execute(lambda: _sheets().spreadsheets().values().append(
         spreadsheetId=_sid(), range=f"{DAILY_TAB}!A1",
         valueInputOption="RAW", insertDataOption="INSERT_ROWS",
-        body={"values": [new_row]},
-    ).execute()
+        body={"values": [new_row]}))
 
 
 # -- HTTP ------------------------------------------------------------------------
