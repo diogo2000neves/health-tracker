@@ -882,13 +882,21 @@ def _extract_images() -> List[Tuple[bytes, str]]:
     body. Empty when the request carries no image (the text-only meal path).
 
     Only a genuine image body counts: a form/JSON request with no file part is
-    treated as image-less so its raw bytes are never mistaken for a photo."""
+    treated as image-less so its raw bytes are never mistaken for a photo.
+
+    iOS Shortcuts packs several photos into ONE multipart part with the JPEGs
+    concatenated (not separate parts), so each part's bytes are split back into
+    individual images — otherwise only the first photo of a multi-shot meal is
+    ever seen (see 2026-07-13 dinner)."""
+    def expand(data: bytes, mime: str) -> List[Tuple[bytes, str]]:
+        return [(seg, mime) for seg in _split_jpegs(data)]
+
     if request.files:
         out: List[Tuple[bytes, str]] = []
         for _, f in request.files.items(multi=True):
             data = f.read()
             if data:
-                out.append((data, f.mimetype or "image/jpeg"))
+                out.extend(expand(data, f.mimetype or "image/jpeg"))
         return out
     ctype = (request.content_type or "").lower()
     if (ctype.startswith("multipart/form-data")
@@ -899,7 +907,54 @@ def _extract_images() -> List[Tuple[bytes, str]]:
     if not data:
         return []
     mime = ctype if ctype.startswith("image/") else "image/jpeg"
-    return [(data, mime)]
+    return expand(data, mime)
+
+
+def _jpeg_end(data: bytes, start: int) -> int:
+    """Index just past the EOI (FF D9) of the JPEG that begins at `start`. Walks
+    the marker structure, skipping length-delimited segments — so a nested EXIF
+    *thumbnail* JPEG (its own FF D8/FF D9 living inside an APPn segment) can't be
+    mistaken for an image boundary. Falls back to end-of-data if malformed."""
+    n = len(data)
+    i = start + 2  # past the SOI (FF D8)
+    while i + 1 < n:
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        if marker == 0xFF:
+            i += 1                          # fill byte
+        elif marker == 0x00 or 0xD0 <= marker <= 0xD7:
+            i += 2                          # stuffed FF, or restart marker (in scan)
+        elif marker in (0x01,):
+            i += 2                          # standalone marker, no payload
+        elif marker == 0xD9:
+            return i + 2                    # EOI — end of this image
+        elif marker == 0xD8:
+            i += 2                          # stray SOI, keep scanning
+        elif i + 3 < n:                     # APPn/DQT/DHT/SOF/SOS/... length-delimited
+            i += 2 + ((data[i + 2] << 8) | data[i + 3])
+        else:
+            break
+    return n
+
+
+def _split_jpegs(data: bytes) -> List[bytes]:
+    """Split a buffer of one-or-more concatenated JPEGs into individual images.
+    A single JPEG (even with an embedded thumbnail) returns unchanged; non-JPEG
+    data (e.g. HEIC/PNG) is returned as-is."""
+    if not data.startswith(b"\xff\xd8"):
+        return [data]
+    parts: List[bytes] = []
+    i, n = 0, len(data)
+    while i < n and data[i:i + 2] == b"\xff\xd8":
+        end = _jpeg_end(data, i)
+        parts.append(data[i:end])
+        nxt = data.find(b"\xff\xd8", end)
+        if nxt == -1:
+            break
+        i = nxt
+    return parts if len(parts) > 1 else [data]
 
 
 def _extract_note() -> str:

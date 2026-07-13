@@ -220,6 +220,32 @@ def test_extract_images_reads_raw_image_body():
         assert ingest._extract_images() == [(b"\xff\xd8jpegbytes", "image/jpeg")]
 
 
+def _jpeg(scan=b"\x11\x22", extra_segments=b""):
+    # minimal parser-valid JPEG: SOI, optional extra length-delimited segments,
+    # SOS (len 3, one header byte), entropy `scan`, EOI
+    return b"\xff\xd8" + extra_segments + b"\xff\xda\x00\x03\x00" + scan + b"\xff\xd9"
+
+
+def test_split_jpegs_separates_concatenated_photos():
+    a, b, c = _jpeg(b"\xaa\xaa"), _jpeg(b"\xbb\xbb"), _jpeg(b"\xcc\xcc")
+    assert ingest._split_jpegs(a + b + c) == [a, b, c]
+
+
+def test_split_jpegs_keeps_a_single_photo_with_embedded_thumbnail_intact():
+    # a real iPhone JPEG has an EXIF thumbnail (its own FF D8/FF D9) inside APP1;
+    # that inner boundary must NOT be treated as a second image
+    thumb = b"\xff\xd8\xaa\xbb\xff\xd9"                 # nested thumbnail JPEG
+    app1 = b"\xff\xe1" + (2 + len(thumb)).to_bytes(2, "big") + thumb
+    one_photo = _jpeg(b"\x11\x22", extra_segments=app1)
+    assert one_photo.count(b"\xff\xd8") == 2            # two SOI markers present…
+    assert ingest._split_jpegs(one_photo) == [one_photo]  # …but it's ONE image
+
+
+def test_split_jpegs_passes_through_non_jpeg():
+    png = b"\x89PNG\r\n\x1a\n" + b"whatever"
+    assert ingest._split_jpegs(png) == [png]
+
+
 def test_extract_images_collects_every_multipart_file_in_order():
     from io import BytesIO
     # meal shot + a nutrition-label shot (different field names) + a note
