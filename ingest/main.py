@@ -551,16 +551,39 @@ def _day_totals(meal_rows: List[Dict[str, Any]]) -> Dict[str, float]:
     return {k: round(v, 1) for k, v in totals.items()}
 
 
-def _already_logged(image_sha: str, todays: List[Dict[str, Any]]) -> bool:
-    """True only if a SUCCESSFUL meal with this hash is already logged today.
+def _is_stub(row: Dict[str, Any]) -> bool:
+    return str(row.get("foods") or "").strip().lower() in NON_MEALS
 
-    A failed "analysis failed" / "not food" stub carries the same hash (the note
-    or photo is identical on re-send), so counting it would let one failure
-    permanently block every retry — the meal could never be logged. Skip stubs so
-    a retry re-analyses instead of being silently de-duped away."""
-    return any(r.get("image_sha") == image_sha
-               and str(r.get("foods") or "").strip().lower() not in NON_MEALS
-               for r in todays)
+
+def _exact_duplicate(image_sha: str, note: str,
+                     todays: List[Dict[str, Any]]) -> bool:
+    """True only if THIS exact photo/text AND note is already logged today — a
+    genuine double-send. Two cases it deliberately does NOT treat as duplicates:
+      * a failed "analysis failed"/"not food" stub (same hash) — so a retry can
+        still succeed instead of being blocked by its own earlier failure;
+      * the SAME photo re-sent with a CHANGED note — that's a correction to get a
+        better estimate; it must re-analyse and replace the row (photo de-dup
+        keys on the image, which doesn't include the note). See append_meal."""
+    note = str(note or "")
+    return any(r.get("image_sha") == image_sha and not _is_stub(r)
+               and str(r.get("note") or "") == note for r in todays)
+
+
+def _meal_row_index(values: List[List[Any]], image_sha: str) -> Optional[int]:
+    """1-based sheet row of the existing non-stub meal with this image hash (a
+    prior version of the same photo, for upsert/correction), else None."""
+    if not values:
+        return None
+    header = values[0]
+    try:
+        sha_i, foods_i = header.index("image_sha"), header.index("foods")
+    except ValueError:
+        return None
+    for n, r in enumerate(values[1:], start=2):
+        foods = str(r[foods_i] if len(r) > foods_i else "").strip().lower()
+        if len(r) > sha_i and str(r[sha_i]) == image_sha and foods not in NON_MEALS:
+            return n
+    return None
 
 
 def _parse_score(raw: Any) -> float:
@@ -840,10 +863,18 @@ def append_meal(nut: Dict[str, Any], photo_url: str, when: datetime,
         image_sha, note,
     ]
     meals_id = _ensure_meals_tab()
-    _execute(lambda: _sheets().spreadsheets().values().append(
-        spreadsheetId=_sid(), range=f"{MEALS_TAB}!A1",
-        valueInputOption="RAW", insertDataOption="INSERT_ROWS",
-        body={"values": [row]}))
+    # Upsert: a photo re-sent with a corrected note replaces its own row rather
+    # than duplicating (image_sha is the photo's identity and excludes the note).
+    idx = _meal_row_index(_read_tab(MEALS_TAB), image_sha)
+    if idx is not None:
+        _execute(lambda: _sheets().spreadsheets().values().update(
+            spreadsheetId=_sid(), range=f"{MEALS_TAB}!A{idx}:{LAST_COL}{idx}",
+            valueInputOption="RAW", body={"values": [row]}))
+    else:
+        _execute(lambda: _sheets().spreadsheets().values().append(
+            spreadsheetId=_sid(), range=f"{MEALS_TAB}!A1",
+            valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+            body={"values": [row]}))
     if meals_id is not None:
         try:  # the meal is already saved; ordering must never fail the request
             _sort_meals_by_datetime(meals_id)
@@ -1084,11 +1115,12 @@ def ingest():
                  else _sha12(("text:" + note).encode("utf-8")))
 
     todays = _todays_meals(today)
-    if _already_logged(image_sha, todays):
+    if _exact_duplicate(image_sha, note, todays):
         return jsonify({
             "summary": ("Duplicate description — already logged today."
                         if text_only
-                        else "Duplicate photo — this meal is already logged today."),
+                        else "Duplicate — same photo and note already logged today "
+                             "(change the note to re-estimate)."),
             "duplicate": True,
         }), 200
 
@@ -1159,7 +1191,7 @@ def process():
         when = datetime.now(_tz())
 
     todays = _todays_meals(today)
-    if _already_logged(image_sha, todays):  # idempotent: a retry after success
+    if _exact_duplicate(image_sha, note, todays):  # idempotent: retry after success
         return jsonify({"status": "already-logged"}), 200
 
     try:

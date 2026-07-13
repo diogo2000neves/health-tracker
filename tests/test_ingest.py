@@ -459,16 +459,31 @@ def test_resolve_meal_time_maps_hhmm_onto_today():
     assert ingest._resolve_meal_time("25:99", now) == now
 
 
-def test_already_logged_ignores_failed_stubs():
+def test_exact_duplicate_matches_same_photo_and_note_only():
     sha = "abc123def456"
-    # a successful meal with this hash blocks a re-send
-    good = [{"image_sha": sha, "foods": "chicken sandwich"}]
-    assert ingest._already_logged(sha, good)
-    # but a prior "analysis failed" / "not food" stub must NOT block the retry
-    for stub in ("analysis failed", "not food", "NOT FOOD"):
-        assert not ingest._already_logged(sha, [{"image_sha": sha, "foods": stub}])
-    # different hash never matches
-    assert not ingest._already_logged("other", good)
+    rows = [{"image_sha": sha, "foods": "ice cream", "note": "15 spoons"}]
+    # same photo AND same note => genuine double-send
+    assert ingest._exact_duplicate(sha, "15 spoons", rows)
+    # SAME photo, CHANGED note => a correction, NOT a duplicate (must re-analyse)
+    assert not ingest._exact_duplicate(sha, "actually 20 spoons", rows)
+    # a failed stub with the same hash must never block a retry
+    for stub in ("analysis failed", "not food"):
+        assert not ingest._exact_duplicate(
+            sha, "x", [{"image_sha": sha, "foods": stub, "note": "x"}])
+    # different photo never matches
+    assert not ingest._exact_duplicate("other", "15 spoons", rows)
+
+
+def test_meal_row_index_finds_the_prior_row_for_upsert():
+    values = [
+        ["datetime", "foods", "image_sha", "note"],
+        ["t1", "apple", "shaA", "n1"],
+        ["t2", "analysis failed", "shaB", "n2"],   # stub — skipped
+        ["t3", "yogurt", "shaB", "n3"],            # real meal with shaB
+    ]
+    assert ingest._meal_row_index(values, "shaA") == 2      # 1-based sheet row
+    assert ingest._meal_row_index(values, "shaB") == 4      # skips the stub row
+    assert ingest._meal_row_index(values, "missing") is None
 
 
 def test_run_models_surfaces_inferred_meal_time(monkeypatch):
