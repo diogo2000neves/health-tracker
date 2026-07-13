@@ -499,6 +499,18 @@ def _day_totals(meal_rows: List[Dict[str, Any]]) -> Dict[str, float]:
     return {k: round(v, 1) for k, v in totals.items()}
 
 
+def _already_logged(image_sha: str, todays: List[Dict[str, Any]]) -> bool:
+    """True only if a SUCCESSFUL meal with this hash is already logged today.
+
+    A failed "analysis failed" / "not food" stub carries the same hash (the note
+    or photo is identical on re-send), so counting it would let one failure
+    permanently block every retry — the meal could never be logged. Skip stubs so
+    a retry re-analyses instead of being silently de-duped away."""
+    return any(r.get("image_sha") == image_sha
+               and str(r.get("foods") or "").strip().lower() not in NON_MEALS
+               for r in todays)
+
+
 def _parse_score(raw: Any) -> float:
     """Validate a subjective-feel score (1-10, halves allowed)."""
     score = round(float(raw), 1)
@@ -825,7 +837,7 @@ def ingest():
                  else _sha12(("text:" + note).encode("utf-8")))
 
     todays = _todays_meals(today)
-    if any(r.get("image_sha") == image_sha for r in todays):
+    if _already_logged(image_sha, todays):
         return jsonify({
             "summary": ("Duplicate description — already logged today."
                         if text_only
