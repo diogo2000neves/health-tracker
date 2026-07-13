@@ -37,6 +37,8 @@ in tests without credentials.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import functools
 import hashlib
 import hmac
@@ -891,6 +893,10 @@ def _extract_images() -> List[Tuple[bytes, str]]:
     def expand(data: bytes, mime: str) -> List[Tuple[bytes, str]]:
         return [(seg, mime) for seg in _split_jpegs(data)]
 
+    json_images = _images_from_json()
+    if json_images:
+        return json_images
+
     if request.files:
         out: List[Tuple[bytes, str]] = []
         for _, f in request.files.items(multi=True):
@@ -955,6 +961,40 @@ def _split_jpegs(data: bytes) -> List[bytes]:
             break
         i = nxt
     return parts if len(parts) > 1 else [data]
+
+
+def _sniff_mime(data: bytes) -> str:
+    """Best-effort image mime from magic bytes; defaults to jpeg."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data[4:12] in (b"ftypheic", b"ftypheix", b"ftypmif1", b"ftypmsf1"):
+        return "image/heic"
+    return "image/jpeg"
+
+
+def _images_from_json() -> List[Tuple[bytes, str]]:
+    """Decode a JSON `images` array of base64 strings (the reliable multi-photo
+    path — Shortcuts' multipart file-list only sends the first item). Empty when
+    the body isn't JSON or carries no images."""
+    if not request.is_json:
+        return []
+    raw = (request.get_json(silent=True) or {}).get("images")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    out: List[Tuple[bytes, str]] = []
+    for entry in raw:
+        if not isinstance(entry, str) or not entry:
+            continue
+        try:
+            data = base64.b64decode(entry, validate=False)
+        except (binascii.Error, ValueError):
+            continue
+        for seg in _split_jpegs(data):
+            if seg:
+                out.append((seg, _sniff_mime(seg)))
+    return out
 
 
 def _extract_note() -> str:

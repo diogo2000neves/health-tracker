@@ -246,6 +246,31 @@ def test_split_jpegs_passes_through_non_jpeg():
     assert ingest._split_jpegs(png) == [png]
 
 
+def test_images_from_json_decodes_a_base64_array():
+    import base64
+    a, b = _jpeg(b"\xaa\xaa"), _jpeg(b"\xbb\xbb")
+    payload = {"images": [base64.b64encode(a).decode(),
+                          "!!not-base64!!",                  # skipped
+                          base64.b64encode(b).decode()],
+               "note": "yogurt with lunch"}
+    with ingest.app.test_request_context("/ingest", method="POST", json=payload):
+        imgs = ingest._extract_images()
+        assert [x for x, _ in imgs] == [a, b]        # both photos, junk skipped
+        assert imgs[0][1] == "image/jpeg"            # sniffed mime
+        assert ingest._extract_note() == "yogurt with lunch"
+
+
+def test_json_with_no_images_is_still_text_only():
+    with ingest.app.test_request_context(
+            "/ingest", method="POST", json={"note": "just oatmeal"}):
+        assert ingest._extract_images() == []        # text-only path preserved
+
+
+def test_sniff_mime_by_magic_bytes():
+    assert ingest._sniff_mime(b"\xff\xd8\xff\xe0rest") == "image/jpeg"
+    assert ingest._sniff_mime(b"\x89PNG\r\n\x1a\nrest") == "image/png"
+
+
 def test_extract_images_collects_every_multipart_file_in_order():
     from io import BytesIO
     # meal shot + a nutrition-label shot (different field names) + a note
