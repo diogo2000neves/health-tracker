@@ -55,10 +55,15 @@ Health Tracker/
   (a label is authoritative and scaled to the portion on the plate). The `note`
   is authoritative context ("only ate half" halves portions); a note with no
   image estimates the meal from text alone at capped confidence. De-dupes
-  (combined image hash, or note hash when text-only), estimates per-ingredient
-  nutrition, archives every photo to Drive (skipped when text-only), appends to
-  `meals` (`photo_url` holds all links), and replies with the meal + the day's
-  running totals.
+  (combined image hash, or note hash when text-only) ignoring failed stubs.
+  **Hybrid reliability:** a quick single-model pass gives the phone instant
+  macros when Gemini is fast; if it's slow, the photos are archived and the meal
+  is handed to a **Cloud Tasks** queue (`202 Queued`) that retries the analysis
+  in the background until the row lands — so a transient Gemini outage can't lose
+  a meal. Replies with the meal + running totals, or a queued ack.
+- `POST /process` — internal Cloud Tasks worker: the thorough analysis + row
+  insert. Returns 5xx to trigger a retry; writes an "analysis failed" stub only
+  on the final attempt. Same `X-Auth-Token` gate; not called by the phone.
 - `POST /feel` — `{"score": 1-10[, "date": "YYYY-MM-DD"]}` → writes
   `subjective_feel` on that day's `daily_summary` row (`{"score": null}` clears).
 

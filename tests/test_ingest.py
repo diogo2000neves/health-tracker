@@ -139,12 +139,29 @@ def test_is_permanent_error_classification():
     assert not ingest._is_permanent(Exception("429 RESOURCE_EXHAUSTED"))
 
 
-def test_default_chain_is_strongest_first_and_free_tier():
-    # strongest free model first; no Pro model (paid-only) in the default chain
+def test_default_chain_is_flash_lite_first_and_free_tier():
+    # flash-lite leads (the reliable/fast one; see 2026-07-12/13 incidents); the
+    # stronger flash models follow for the worker's thorough pass. No Pro (paid).
     chain = ingest.DEFAULT_MODELS.split(",")
-    assert chain[0] == "gemini-3.5-flash"
-    assert chain[-1] == "gemini-3.1-flash-lite"
+    assert chain[0] == "gemini-3.1-flash-lite"
+    assert "gemini-3.5-flash" in chain
     assert not any("pro" in m for m in chain)
+
+
+def test_quick_kwargs_is_a_single_fast_pass(monkeypatch):
+    monkeypatch.setenv("GEMINI_MODELS", "fast-lite,strong-a,strong-b")
+    kw = ingest._quick_kwargs()
+    assert kw["models"] == ["fast-lite"]   # only the first (fastest) model
+    assert kw["retries"] == 1              # one shot, no waiting on retries
+    assert kw["timeout_ms"] <= 45000 and kw["deadline_s"] <= 60  # tight budget
+
+
+def test_run_models_respects_model_override(monkeypatch):
+    # the quick pass must call ONLY the model it's given, not the whole chain
+    fm = _fake_genai([_GOOD_BODY], monkeypatch)
+    monkeypatch.setenv("GEMINI_MODELS", "a,b,c")
+    ingest._run_models(["prompt"], models=["only-this"], retries=1)
+    assert fm.calls == ["only-this"]
 
 
 def test_sha12_stable():

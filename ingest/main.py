@@ -88,18 +88,31 @@ NON_MEALS = {"not food", "analysis failed"}
 # a paid plan (429 on the free key), so they're intentionally not here. If you
 # enable billing, prepend "gemini-3.1-pro-preview" via the GEMINI_MODELS env.
 # Each model is retried GEMINI_RETRIES times (transient 503s) before falling back.
-DEFAULT_MODELS = "gemini-3.5-flash,gemini-3-flash-preview,gemini-3.1-flash-lite"
+# flash-lite leads: it's the only lite model and, across the 2026-07-12/13
+# incidents, the steady one — the bigger flash models are the ones that ran
+# numbers to tens of thousands of digits or hung ~120 s and 504'd. The
+# background worker still falls through to the stronger models for accuracy.
+DEFAULT_MODELS = "gemini-3.1-flash-lite,gemini-3.5-flash,gemini-3-flash-preview"
 DEFAULT_RETRIES = 3
-# Hard caps so a single request can't hang until Cloud Run's 180 s timeout:
+# Hard caps so a single request can't hang until Cloud Run's request timeout:
 #  * MAX_OUTPUT_TOKENS bounds generation — without it the model can occasionally
 #    run one number to tens of thousands of digits, taking minutes and producing
 #    unparseable JSON (the cause of the 504s on 2026-07-12);
-#  * TIMEOUT_MS is a per-call network backstop;
+#  * TIMEOUT_MS is a per-call network backstop (a hung call is the 2026-07-13
+#    504 — 120 s was too long, so 60 s);
 #  * DEADLINE_S stops us starting another model attempt so late it would cross
-#    the request timeout — we return a fast "analysis failed" stub instead.
+#    the request timeout.
 DEFAULT_MAX_OUTPUT_TOKENS = 8192
-DEFAULT_TIMEOUT_MS = 120000
+DEFAULT_TIMEOUT_MS = 60000
 DEFAULT_DEADLINE_S = 105
+# The phone-facing sync attempt is deliberately short: one fast model, then hand
+# off to the background queue rather than make the phone wait / risk a 504.
+DEFAULT_SYNC_TIMEOUT_MS = 35000
+DEFAULT_SYNC_DEADLINE_S = 40
+# Keep in sync with the Cloud Tasks queue's max-attempts; on the final attempt the
+# worker writes an "analysis failed" stub so a meal is never lost even if Gemini
+# is unreachable for the whole retry window.
+DEFAULT_TASKS_MAX_ATTEMPTS = 8
 
 # Full per-ingredient micronutrient set, stored in each item's `nutrients` map.
 # Grouped by unit (suffix _g/_mg/_ug) so values map cleanly to a future relational
@@ -387,6 +400,30 @@ def _authorized(req) -> bool:
     return bool(expected) and hmac.compare_digest(given, expected)
 
 
+def _enqueue_process(payload: Dict[str, Any]) -> None:
+    """Hand a meal to the background worker via Cloud Tasks. The queue retries the
+    /process call with backoff for its whole window, so a transient Gemini outage
+    can't lose the meal. Raises if the queue isn't configured/reachable, so the
+    caller can fall back to a stub (never worse than the old synchronous path).
+
+    Images can't ride in the task (Cloud Tasks bodies are ~small), so the payload
+    carries their Drive ids and the worker fetches the bytes back."""
+    from google.cloud import tasks_v2  # lazy: keeps tests importable without the lib
+    client = tasks_v2.CloudTasksClient()
+    parent = client.queue_path(
+        os.environ["GCP_PROJECT"],
+        os.environ.get("TASKS_LOCATION", "europe-west1"),
+        os.environ["TASKS_QUEUE"],
+    )
+    client.create_task(parent=parent, task={"http_request": {
+        "http_method": tasks_v2.HttpMethod.POST,
+        "url": os.environ["PROCESS_URL"],
+        "headers": {"Content-Type": "application/json",
+                    "X-Auth-Token": os.environ.get("INGEST_TOKEN", "")},
+        "body": json.dumps(payload).encode("utf-8"),
+    }})
+
+
 # The Sheets/Drive clients are lru-cached, so their httplib2 keep-alive sockets
 # outlive a request. On a scale-to-zero instance the peer closes those sockets
 # while it sits idle, and the first Google API call after the gap dies with
@@ -531,21 +568,28 @@ def _is_permanent(err: Exception) -> bool:
     return any(tok in msg for tok in ("404", "NOT_FOUND", "400", "INVALID_ARGUMENT"))
 
 
-def _gen_config() -> "types.GenerateContentConfig":
+def _gen_config(timeout_ms: Optional[int] = None) -> "types.GenerateContentConfig":
+    if timeout_ms is None:
+        timeout_ms = int(os.environ.get("GEMINI_TIMEOUT_MS", str(DEFAULT_TIMEOUT_MS)))
     return types.GenerateContentConfig(
         response_mime_type="application/json",
         response_schema=RESPONSE_SCHEMA,
         temperature=0.1,
         max_output_tokens=int(os.environ.get(
             "GEMINI_MAX_OUTPUT_TOKENS", str(DEFAULT_MAX_OUTPUT_TOKENS))),
-        http_options=types.HttpOptions(timeout=int(os.environ.get(
-            "GEMINI_TIMEOUT_MS", str(DEFAULT_TIMEOUT_MS)))),
+        http_options=types.HttpOptions(timeout=timeout_ms),
     )
 
 
-def _run_models(contents: List[Any]) -> Dict[str, Any]:
+def _run_models(contents: List[Any], *, models: Optional[List[str]] = None,
+                retries: Optional[int] = None, timeout_ms: Optional[int] = None,
+                deadline_s: Optional[float] = None) -> Dict[str, Any]:
     """Send `contents` (photos+prompt or a text prompt) through the fallback
     chain, strongest model first, and assemble the meal from the JSON reply.
+
+    The `quick` sync path and the background worker share this by overriding the
+    chain / retries / per-call timeout / wall-clock deadline: the phone gets a
+    fast single-model pass, the worker a thorough one.
 
     Two failure modes are treated differently:
       * transient API errors (503 overloaded, 429, timeout) are retried on the
@@ -557,10 +601,13 @@ def _run_models(contents: List[Any]) -> Dict[str, Any]:
     A wall-clock deadline guarantees we return before Cloud Run's request
     timeout rather than letting the caller (the phone) hit a 504.
     """
-    models = _models()
-    retries = max(1, int(os.environ.get("GEMINI_RETRIES", str(DEFAULT_RETRIES))))
-    deadline = time.monotonic() + float(os.environ.get(
-        "GEMINI_DEADLINE_S", str(DEFAULT_DEADLINE_S)))
+    models = models or _models()
+    if retries is None:
+        retries = int(os.environ.get("GEMINI_RETRIES", str(DEFAULT_RETRIES)))
+    retries = max(1, retries)
+    if deadline_s is None:
+        deadline_s = float(os.environ.get("GEMINI_DEADLINE_S", str(DEFAULT_DEADLINE_S)))
+    deadline = time.monotonic() + deadline_s
     last_err: Optional[Exception] = None
     for model in models:
         for attempt in range(1, retries + 1):
@@ -570,7 +617,8 @@ def _run_models(contents: List[Any]) -> Dict[str, Any]:
                     f"analysis deadline exceeded; last error: {last_err}")
             try:
                 resp = _genai().models.generate_content(
-                    model=model, contents=contents, config=_gen_config())
+                    model=model, contents=contents,
+                    config=_gen_config(timeout_ms))
             except Exception as err:  # network / API error: 503, 429, timeout, ...
                 last_err = err
                 if _is_permanent(err):
@@ -610,22 +658,37 @@ def _build_prompt(num_images: int, note: str) -> str:
     return prompt
 
 
-def analyze(images: List[Tuple[bytes, str]], note: str = "") -> Dict[str, Any]:
+def analyze(images: List[Tuple[bytes, str]], note: str = "", **kw) -> Dict[str, Any]:
     """Analyse one or more photos of a single meal, reasoning across all of them.
 
     A `note`, if given, is appended as authoritative context that overrides the
-    visual estimate where the two conflict."""
+    visual estimate where the two conflict. `kw` overrides (models/retries/
+    timeout_ms/deadline_s) let the sync path run a quick single-model pass."""
     parts: List[Any] = [types.Part.from_bytes(data=img, mime_type=mime)
                         for img, mime in images]
     parts.append(_build_prompt(len(images), note))
-    return _run_models(parts)
+    return _run_models(parts, **kw)
 
 
-def analyze_text(note: str, now: datetime) -> Dict[str, Any]:
+def analyze_text(note: str, now: datetime, **kw) -> Dict[str, Any]:
     """Estimate a meal from a written description alone (no photo). `now` is the
     current local time, injected so the model can infer the meal's hour and never
     place it in the future."""
-    return _run_models([TEXT_PROMPT.format(note=note, now_hhmm=now.strftime("%H:%M"))])
+    return _run_models(
+        [TEXT_PROMPT.format(note=note, now_hhmm=now.strftime("%H:%M"))], **kw)
+
+
+def _quick_kwargs() -> Dict[str, Any]:
+    """Overrides for the phone-facing sync attempt: just the fastest model, one
+    shot, a tight per-call timeout and deadline. If it can't produce macros in
+    that window the meal is handed to the background worker instead of the phone
+    waiting (or hitting a 504)."""
+    return {
+        "models": _models()[:1],
+        "retries": 1,
+        "timeout_ms": int(os.environ.get("SYNC_TIMEOUT_MS", str(DEFAULT_SYNC_TIMEOUT_MS))),
+        "deadline_s": float(os.environ.get("SYNC_DEADLINE_S", str(DEFAULT_SYNC_DEADLINE_S))),
+    }
 
 
 def _resolve_meal_time(hhmm: Any, now: datetime) -> datetime:
@@ -649,13 +712,15 @@ def _photo_name(when: datetime, mime: str, index: int, total: int) -> str:
     return f"meal_{when.strftime('%Y%m%d_%H%M%S')}{suffix}.{ext}"
 
 
-def archive_photos(images: List[Tuple[bytes, str]], when: datetime) -> List[str]:
-    """Upload every photo of a meal to the user's Drive folder; return the
-    viewable links in order (meal shot first)."""
+def archive_photos(images: List[Tuple[bytes, str]],
+                   when: datetime) -> List[Dict[str, str]]:
+    """Upload every photo of a meal to the user's Drive folder; return, in order
+    (meal shot first), a dict per photo: {"id", "url", "mime"}. The `id` lets the
+    background worker fetch the bytes back for analysis; `url` goes in the sheet."""
     folder = os.environ.get("MEALS_FOLDER_ID", "")
     if not folder or not images:
         return []
-    urls: List[str] = []
+    out: List[Dict[str, str]] = []
     for i, (img, mime) in enumerate(images, start=1):
         name = _photo_name(when, mime, i, len(images))
         # rebuild the media on each retry: an upload stream can't be replayed once
@@ -666,10 +731,23 @@ def archive_photos(images: List[Tuple[bytes, str]], when: datetime) -> List[str]
                                          resumable=False),
             fields="id,webViewLink",
         ))
-        url = created.get("webViewLink", "")
-        if url:
-            urls.append(url)
-    return urls
+        out.append({"id": created.get("id", ""),
+                    "url": created.get("webViewLink", ""), "mime": mime})
+    return out
+
+
+def download_photos(refs: List[Dict[str, str]]) -> List[Tuple[bytes, str]]:
+    """Fetch archived photos back from Drive by id (used by the background worker,
+    since Cloud Tasks payloads are too small to carry the images themselves)."""
+    images: List[Tuple[bytes, str]] = []
+    for ref in refs:
+        fid = ref.get("id")
+        if not fid:
+            continue
+        data = _execute(lambda fid=fid: _drive().files().get_media(fileId=fid))
+        if data:
+            images.append((data, ref.get("mime") or "image/jpeg"))
+    return images
 
 
 # -- Sheets --------------------------------------------------------------------
@@ -818,6 +896,54 @@ def health():
     return "ok", 200
 
 
+def _finalize(nut: Dict[str, Any], photo_url: str, when: datetime,
+              image_sha: str, note: str, text_only: bool,
+              todays: List[Dict[str, Any]]):
+    """Shared tail for a successful analysis (sync path AND background worker):
+    stamp the inferred time, log the row (unless it's not food), and build the
+    phone-facing summary + running day totals."""
+    # A text-only meal carries the hour inferred from the note (e.g. "breakfast"),
+    # so the row lands at the right time today and sorts into place. Photo meals
+    # keep the capture time (now). Same date either way.
+    if text_only:
+        when = _resolve_meal_time(nut.get("meal_time"), when)
+
+    if not nut["items"]:
+        return jsonify({
+            "summary": ("No food in the description — nothing logged."
+                        if text_only
+                        else "No food detected — nothing logged (photos archived)."),
+            "photo_url": photo_url,
+            "not_food": True,
+        }), 200
+
+    append_meal(nut, photo_url, when, image_sha, note)
+
+    running = _day_totals(todays)
+    for key in running:
+        running[key] = round(running[key] + nut[key], 1)
+    prefix = (f"Logged for {when.strftime('%H:%M')} (from description): "
+              if text_only else "Logged: ")
+    summary = (
+        f"{prefix}{nut['foods']} (~{int(nut['portion_g'])} g) — "
+        f"~{int(nut['calories'])} kcal "
+        f"({int(nut['protein_g'])}P/{int(nut['carbs_g'])}C/{int(nut['fat_g'])}F) · "
+        f"Today: {int(running['calories'])} kcal "
+        f"({int(running['protein_g'])}P/{int(running['carbs_g'])}C/"
+        f"{int(running['fat_g'])}F)"
+    )
+    return jsonify({"summary": summary, "photo_url": photo_url,
+                    "today": running, **nut}), 200
+
+
+def _log_failure_stub(photo_url: str, when: datetime, image_sha: str,
+                      note: str) -> None:
+    """Auditable placeholder so a meal is never silently lost."""
+    stub = _meal_from_items([], 0, "none")
+    stub["foods"] = "analysis failed"
+    append_meal(stub, photo_url, when, image_sha, note)
+
+
 @app.post("/ingest")
 def ingest():
     if not _authorized(request):
@@ -845,68 +971,92 @@ def ingest():
             "duplicate": True,
         }), 200
 
-    def _archive() -> str:
-        """Archive every photo (space-joined links); text-only meals store none."""
-        if not images:
-            return ""
+    # Quick, best-effort pass for instant macros on the phone. If Gemini isn't
+    # fast enough, we don't make the phone wait (or risk a 504) — we archive and
+    # hand the meal to the background worker, which retries until it lands.
+    try:
+        nut = (analyze_text(note, when, **_quick_kwargs()) if text_only
+               else analyze(images, note, **_quick_kwargs()))
+        quick_ok = True
+    except Exception as err:
+        app.logger.info("quick analysis missed, deferring to worker: %s", err)
+        nut, quick_ok = None, False
+
+    # Archive now — the sheet needs the links and the worker needs the bytes.
+    archived: List[Dict[str, str]] = []
+    if images:
         try:
-            return " ".join(archive_photos(images, when))
+            archived = archive_photos(images, when)
         except Exception:
             app.logger.exception("drive upload failed")
-            return ""
+    photo_url = " ".join(a["url"] for a in archived if a.get("url"))
 
+    if quick_ok:
+        return _finalize(nut, photo_url, when, image_sha, note, text_only, todays)
+
+    # Hand off to the background queue (guaranteed-insert path).
     try:
-        nut = analyze_text(note, when) if text_only else analyze(images, note)
-    except Exception as err:
-        # Never lose a meal: archive the photos and leave an auditable stub row.
-        app.logger.exception("analysis failed")
-        photo_url = _archive()
-        stub = _meal_from_items([], 0, "none")
-        stub["foods"] = "analysis failed"
-        append_meal(stub, photo_url, when, image_sha, note)
+        _enqueue_process({
+            "text_only": text_only, "note": note,
+            "when_iso": when.isoformat(timespec="seconds"),
+            "image_sha": image_sha, "today": today,
+            "photo_url": photo_url, "refs": archived,
+        })
         return jsonify({
-            "error": f"analysis failed: {err}",
-            "summary": ("Analysis failed — logged for later review."
-                        if text_only
-                        else "Analysis failed — photos archived for later review."),
+            "summary": ("Queued — your meal is being analysed and will appear "
+                        "shortly."),
+            "queued": True, "photo_url": photo_url,
+        }), 202
+    except Exception:
+        # Queue unreachable — fall back to the old behaviour (never lose a meal).
+        app.logger.exception("enqueue failed; writing stub")
+        _log_failure_stub(photo_url, when, image_sha, note)
+        return jsonify({
+            "summary": "Couldn't analyse now — logged for later review.",
             "photo_url": photo_url,
         }), 502
 
-    # Archiving must never lose the nutrition data, so failures are non-fatal.
-    photo_url = _archive()
 
-    if not nut["items"]:
-        return jsonify({
-            "summary": ("No food in the description — nothing logged."
-                        if text_only
-                        else "No food detected — nothing logged (photos archived)."),
-            "photo_url": photo_url,
-            "not_food": True,
-        }), 200
+@app.post("/process")
+def process():
+    """Background worker invoked by Cloud Tasks: the thorough analysis + row
+    insert. Returns 5xx to make Cloud Tasks retry later (that's the guarantee);
+    on the final attempt it writes a stub so the meal is never lost."""
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
 
-    # A text-only meal carries the hour inferred from the note (e.g. "breakfast"),
-    # so the row lands at the right time today and sorts into place. Photo meals
-    # keep the capture time (now). Same date either way.
-    if text_only:
-        when = _resolve_meal_time(nut.get("meal_time"), when)
+    body = request.get_json(silent=True) or {}
+    text_only = bool(body.get("text_only"))
+    note = str(body.get("note") or "")
+    image_sha = str(body.get("image_sha") or "")
+    today = str(body.get("today") or "")
+    photo_url = str(body.get("photo_url") or "")
+    refs = body.get("refs") or []
+    try:
+        when = datetime.fromisoformat(body["when_iso"])
+    except (KeyError, ValueError):
+        when = datetime.now(_tz())
 
-    append_meal(nut, photo_url, when, image_sha, note)
+    todays = _todays_meals(today)
+    if _already_logged(image_sha, todays):  # idempotent: a retry after success
+        return jsonify({"status": "already-logged"}), 200
 
-    running = _day_totals(todays)
-    for key in running:
-        running[key] = round(running[key] + nut[key], 1)
-    prefix = (f"Logged for {when.strftime('%H:%M')} (from description): "
-              if text_only else "Logged: ")
-    summary = (
-        f"{prefix}{nut['foods']} (~{int(nut['portion_g'])} g) — "
-        f"~{int(nut['calories'])} kcal "
-        f"({int(nut['protein_g'])}P/{int(nut['carbs_g'])}C/{int(nut['fat_g'])}F) · "
-        f"Today: {int(running['calories'])} kcal "
-        f"({int(running['protein_g'])}P/{int(running['carbs_g'])}C/"
-        f"{int(running['fat_g'])}F)"
-    )
-    return jsonify({"summary": summary, "photo_url": photo_url,
-                    "today": running, **nut}), 200
+    try:
+        images = download_photos(refs) if not text_only else []
+        nut = (analyze_text(note, when) if text_only
+               else analyze(images, note))
+    except Exception as err:
+        attempt = int(request.headers.get("X-CloudTasks-TaskRetryCount", "0"))
+        max_attempts = int(os.environ.get(
+            "TASKS_MAX_ATTEMPTS", str(DEFAULT_TASKS_MAX_ATTEMPTS)))
+        if attempt + 1 >= max_attempts:  # give up: leave an auditable stub
+            app.logger.exception("worker exhausted after %d attempts; stub", attempt + 1)
+            _log_failure_stub(photo_url, when, image_sha, note)
+            return jsonify({"status": "failed-stub"}), 200  # 200 => stop retrying
+        app.logger.warning("worker attempt %d failed, will retry: %s", attempt + 1, err)
+        return jsonify({"error": str(err)}), 500  # 5xx => Cloud Tasks retries
+
+    return _finalize(nut, photo_url, when, image_sha, note, text_only, todays)
 
 
 @app.post("/feel")

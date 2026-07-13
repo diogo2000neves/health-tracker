@@ -98,6 +98,15 @@ parsed yet. Photo meals keep the capture time.
 
 - **Job vs Service:** Jobs are *pulls* on a timer (scale data; weekly analysis).
   The Service is a *push* endpoint that waits for the phone. All scale to zero.
+- **Meal ingestion is hybrid (reliability):** `/ingest` does a quick single-model
+  pass for **instant macros** when Gemini is fast; if it's slow/unavailable, it
+  archives the photos and enqueues a **Cloud Tasks** job (queue `meal-ingest`,
+  europe-west1) that retries `/process` with backoff for ~15 min until the row
+  lands (`202 Queued` to the phone meanwhile). This is what makes insertion
+  ~99.9% — a transient Gemini 504 no longer loses or blocks a meal. On the final
+  retry the worker writes an "analysis failed" stub so nothing is ever lost.
+  Model chain is **flash-lite first** (fast/reliable), stronger flash models
+  follow for the worker's thorough pass.
 - **CI/CD:** pushing to `main` on GitHub runs `cloudbuild.yaml` — unit tests
   gate the build, then all three targets are rebuilt and redeployed (images
   tagged with the commit SHA; env vars/secrets preserved). Trigger:
@@ -128,6 +137,7 @@ Service account: `health-tracker-job@health-tracker-501322.iam.gserviceaccount.c
 | Cloud Run Job | `health-tracker-daily` (europe-west1) |
 | Cloud Run Service | `health-tracker-ingest` (europe-west1, public URL, gated by `X-Auth-Token` header) |
 | Scheduler | `health-tracker-daily-trigger` — `0 7 * * *` Europe/Lisbon |
+| Cloud Tasks queue | `meal-ingest` (europe-west1) — background meal analysis, 8 attempts / ~15 min backoff; SA has `cloudtasks.enqueuer` |
 | Sheet ID | `1JQWYkSgzU3F4mqR7BRE8wfoBif0xLU7uBM0iwHwxNAk` |
 | Drive photo folder | `1i0wYuIzcD7ifs_wVQVdsUpI26vGmJdfP` ("Health Tracker Meals", owned by user) |
 | Secrets (Secret Manager) | `health-oauth-token`, `ingest-token`, `gemini-api-key` |
