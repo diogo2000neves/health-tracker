@@ -69,13 +69,13 @@ the hidden-fat guess). A note with **no photo** is a **text-only meal** — Gemi
 estimates from the description alone at **capped confidence (≤0.50)**, nothing is
 archived to Drive, and the raw note is stored in `meals.note` for provenance.
 
-For a **text-only meal**, Gemini also infers the **hour** from the note
-("today at breakfast…" → ~08:00; or an explicit time) into a `meal_time` field;
-the server stamps the row with **today's date at that hour** (never a future
-time) so a forgotten breakfast logged after lunch lands at the right time. The
-`meals` tab is **sorted by `datetime` after every append**, so back-dated rows
-slot into chronological order. Scope is **today only** — other dates aren't
-parsed yet. Photo meals keep the capture time.
+Whenever a **note says when the meal was eaten** — text-only *or* a photo logged
+after the fact ("this yogurt with my lunch") — Gemini infers the **hour** into a
+`meal_time` field; the server stamps the row with **today's date at that hour**
+(never a future time). The `meals` tab is **sorted by `datetime` after every
+append**, so back-dated rows slot into chronological order. Scope is **today
+only** — other dates aren't parsed yet. A photo with **no timing note** keeps its
+capture time (the model leaves `meal_time` empty).
 
 ## 3. Architecture
 

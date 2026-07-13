@@ -245,6 +245,18 @@ def test_build_prompt_adds_multi_and_note_blocks_only_when_relevant():
     assert ingest._build_prompt(1, "no oil").endswith("NOTE: no oil")
 
 
+def test_build_prompt_adds_meal_time_block_for_a_photo_with_note_and_now():
+    from datetime import datetime
+    now = datetime(2026, 7, 13, 15, 0)
+    # photo + note + now => the model is asked to infer the hour, capped at now
+    p = ingest._build_prompt(1, "this yogurt with my lunch", now)
+    assert "MEAL TIME" in p and "15:00" in p and "lunch ~13:00" in p
+    # no note => no meal-time block even if now is given (plain photo keeps capture time)
+    assert "MEAL TIME" not in ingest._build_prompt(1, "", now)
+    # note but no now (e.g. tests) => note block only, no meal-time block
+    assert "MEAL TIME" not in ingest._build_prompt(1, "only ate half")
+
+
 def test_photo_name_suffixes_only_multi_photo_meals():
     from datetime import datetime
     when = datetime(2026, 7, 12, 10, 36, 5)

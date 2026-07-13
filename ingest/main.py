@@ -256,6 +256,19 @@ label, portion from the plate. When images disagree, trust the label for what a
 food is made of and the plate for how much of it there is. Note in `reasoning`
 which image you used for each decision."""
 
+# Appended to the photo prompt when a note is present, so a photo logged after the
+# fact ("this yogurt with my lunch") lands at the right hour instead of the capture
+# time. Only fires from the note — a plain photo keeps `meal_time` empty and its
+# capture time is used. Mirrors the text-only path's time logic.
+MEAL_TIME_SUFFIX = """
+
+MEAL TIME — if the NOTE says WHEN this was eaten (a meal name, or an explicit
+time), set `meal_time` to the local 24h "HH:MM" it was eaten: breakfast ~08:00,
+brunch ~10:30, lunch ~13:00, afternoon snack ~16:30, dinner ~20:00, late/supper
+~22:00, or the explicit time given. The current local time is {now_hhmm} — NEVER
+return a later time. If the note says nothing about timing, leave `meal_time`
+empty (the photo's capture time is used)."""
+
 # Text-only path: same schema and per-item rigour, but estimating from a written
 # description with NO photo. Confidence is capped low because there is no scale
 # reference to measure against — the numbers are informed guesses, not readings.
@@ -647,26 +660,33 @@ def _run_models(contents: List[Any], *, models: Optional[List[str]] = None,
     raise RuntimeError(f"all models failed ({models}); last error: {last_err}")
 
 
-def _build_prompt(num_images: int, note: str) -> str:
+def _build_prompt(num_images: int, note: str,
+                  now: Optional[datetime] = None) -> str:
     """Assemble the vision prompt: the base rubric, plus a multi-image block when
-    the log has several photos, plus the authoritative note block when given."""
+    the log has several photos, the authoritative note block when given, and —
+    when a note AND the current time are supplied — a meal-time block so a photo
+    logged after the fact ("this yogurt with my lunch") is stamped at that hour."""
     prompt = PROMPT
     if num_images > 1:
         prompt += MULTI_IMAGE_SUFFIX.format(n=num_images)
     if note:
         prompt += NOTE_SUFFIX.format(note=note)
+        if now is not None:
+            prompt += MEAL_TIME_SUFFIX.format(now_hhmm=now.strftime("%H:%M"))
     return prompt
 
 
-def analyze(images: List[Tuple[bytes, str]], note: str = "", **kw) -> Dict[str, Any]:
+def analyze(images: List[Tuple[bytes, str]], note: str = "",
+            now: Optional[datetime] = None, **kw) -> Dict[str, Any]:
     """Analyse one or more photos of a single meal, reasoning across all of them.
 
     A `note`, if given, is appended as authoritative context that overrides the
-    visual estimate where the two conflict. `kw` overrides (models/retries/
-    timeout_ms/deadline_s) let the sync path run a quick single-model pass."""
+    visual estimate where the two conflict; with `now` it can also infer the
+    meal's hour from the note. `kw` overrides (models/retries/timeout_ms/
+    deadline_s) let the sync path run a quick single-model pass."""
     parts: List[Any] = [types.Part.from_bytes(data=img, mime_type=mime)
                         for img, mime in images]
-    parts.append(_build_prompt(len(images), note))
+    parts.append(_build_prompt(len(images), note, now))
     return _run_models(parts, **kw)
 
 
@@ -902,11 +922,13 @@ def _finalize(nut: Dict[str, Any], photo_url: str, when: datetime,
     """Shared tail for a successful analysis (sync path AND background worker):
     stamp the inferred time, log the row (unless it's not food), and build the
     phone-facing summary + running day totals."""
-    # A text-only meal carries the hour inferred from the note (e.g. "breakfast"),
-    # so the row lands at the right time today and sorts into place. Photo meals
-    # keep the capture time (now). Same date either way.
-    if text_only:
-        when = _resolve_meal_time(nut.get("meal_time"), when)
+    # If the note said when the meal was eaten (text-only OR a photo logged after
+    # the fact, e.g. "this yogurt with my lunch"), the model returns meal_time and
+    # the row lands at that hour today, sorting into place. With no timing note
+    # meal_time is empty, so _resolve_meal_time keeps the capture time.
+    resolved = _resolve_meal_time(nut.get("meal_time"), when)
+    time_inferred = resolved != when
+    when = resolved
 
     if not nut["items"]:
         return jsonify({
@@ -922,8 +944,12 @@ def _finalize(nut: Dict[str, Any], photo_url: str, when: datetime,
     running = _day_totals(todays)
     for key in running:
         running[key] = round(running[key] + nut[key], 1)
-    prefix = (f"Logged for {when.strftime('%H:%M')} (from description): "
-              if text_only else "Logged: ")
+    if text_only:
+        prefix = f"Logged for {when.strftime('%H:%M')} (from description): "
+    elif time_inferred:
+        prefix = f"Logged for {when.strftime('%H:%M')}: "
+    else:
+        prefix = "Logged: "
     summary = (
         f"{prefix}{nut['foods']} (~{int(nut['portion_g'])} g) — "
         f"~{int(nut['calories'])} kcal "
@@ -976,7 +1002,7 @@ def ingest():
     # hand the meal to the background worker, which retries until it lands.
     try:
         nut = (analyze_text(note, when, **_quick_kwargs()) if text_only
-               else analyze(images, note, **_quick_kwargs()))
+               else analyze(images, note, now=when, **_quick_kwargs()))
         quick_ok = True
     except Exception as err:
         app.logger.info("quick analysis missed, deferring to worker: %s", err)
@@ -1044,7 +1070,7 @@ def process():
     try:
         images = download_photos(refs) if not text_only else []
         nut = (analyze_text(note, when) if text_only
-               else analyze(images, note))
+               else analyze(images, note, now=when))
     except Exception as err:
         attempt = int(request.headers.get("X-CloudTasks-TaskRetryCount", "0"))
         max_attempts = int(os.environ.get(
