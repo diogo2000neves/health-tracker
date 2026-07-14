@@ -3,7 +3,8 @@ import json
 from datetime import date
 
 from src.run_daily import (
-    _local_date, build_daily_rows, daily_body, daily_nutrition, window_start,
+    _local_date, build_daily_rows, daily_body, daily_nutrition, nutrition_day,
+    window_start,
 )
 
 
@@ -90,6 +91,40 @@ def test_daily_nutrition_window_filter():
     meals = [{"datetime": "2026-07-01T12:00:00+01:00", "foods": "rice",
               "calories": 200, "protein_g": 4, "carbs_g": 44, "fat_g": 0.4}]
     assert daily_nutrition(meals, "2026-07-02") == {}
+
+
+# -- waking-day (05:00 cutoff) attribution ------------------------------------
+def test_nutrition_day_shifts_pre_cutoff_times_to_previous_day():
+    assert nutrition_day("2026-07-14T00:17:00+01:00") == "2026-07-13"  # pre-bed dessert
+    assert nutrition_day("2026-07-14T04:59:00+01:00") == "2026-07-13"  # still "night"
+    assert nutrition_day("2026-07-14T05:00:00+01:00") == "2026-07-14"  # cutoff = new day
+    assert nutrition_day("2026-07-14T13:00:00+01:00") == "2026-07-14"  # daytime
+    assert nutrition_day("2026-07-14") == "2026-07-14"                 # date-only unshifted
+    assert nutrition_day("") == ""
+
+
+def test_daily_nutrition_counts_post_midnight_meal_on_previous_day():
+    # the exact bug: a dessert at 00:17 must join yesterday's total, not start a
+    # new day. Both meals land on 2026-07-13.
+    meals = [
+        {"datetime": "2026-07-13T20:00:00+01:00", "foods": "dinner",
+         "calories": 600, "protein_g": 40, "carbs_g": 50, "fat_g": 20},
+        {"datetime": "2026-07-14T00:17:00+01:00", "foods": "ice cream",
+         "calories": 300, "protein_g": 10, "carbs_g": 30, "fat_g": 15},
+    ]
+    nut = daily_nutrition(meals, None, 5, in_progress_day="2026-07-20")
+    assert set(nut) == {"2026-07-13"}
+    assert nut["2026-07-13"]["total_cals_in"] == 900.0
+    assert nut["2026-07-13"]["total_protein_g"] == 50.0
+
+
+def test_daily_nutrition_excludes_the_in_progress_day():
+    meals = [{"datetime": "2026-07-14T13:00:00+01:00", "foods": "lunch",
+              "calories": 500, "protein_g": 30, "carbs_g": 40, "fat_g": 15}]
+    # today (still under way) is not totalled…
+    assert daily_nutrition(meals, None, 5, in_progress_day="2026-07-14") == {}
+    # …but once the day is over it is
+    assert "2026-07-14" in daily_nutrition(meals, None, 5, in_progress_day="2026-07-15")
 
 
 def test_daily_nutrition_rolls_up_tier1_nutrients_from_items():

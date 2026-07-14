@@ -112,7 +112,10 @@ capture time (the model leaves `meal_time` empty).
   tagged with the commit SHA; env vars/secrets preserved). Trigger:
   `health-tracker-deploy` (europe-west1).
 - **Day grain:** every `date` is the **local civil day** (Europe/Lisbon / the
-  device's own utcOffset) — never the UTC day.
+  device's own utcOffset) — never the UTC day. **Nutrition** uses a **waking-day**
+  grain instead (`NUTRITION_DAY_CUTOFF_HOUR`, 05:00): a meal before the cutoff
+  counts toward the previous day (a 00:17 pre-bed dessert → yesterday), and the
+  still-in-progress day is **not** totalled until it ends (no partial-day sums).
 - Everything lives in GCP project **`health-tracker-501322`**, region
   **`europe-west1`**. Log-based alert policies email on any job error, ingest
   error, or failed build.
@@ -157,6 +160,9 @@ Service account: `health-tracker-job@health-tracker-501322.iam.gserviceaccount.c
     (scale → physique, meals roll-up → nutrition, /feel → subjective_feel;
     Fitbit biometrics will fill the readiness block). Never overwrites a column
     it doesn't own.
+  - Nutrition columns are keyed on the **waking day** (05:00 cutoff) and only
+    written once that day is **over**, so a late-night snack joins the right day
+    and today's row shows no nutrition total until tomorrow morning's run.
   - Multiple weigh-ins/day → the **first of the local day** wins;
     `lean_mass_kg = weight_kg × (1 − body_fat_pct/100)` is derived by the job.
   - The daily job re-rolls a trailing `HEALTH_RECONCILE_DAYS` (7) window; set 0

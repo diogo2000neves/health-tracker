@@ -13,6 +13,13 @@ Day grain — the one rule that keeps every join honest: a reading belongs to th
 **local civil day** it happened on (from the API's ``civilTime``/``utcOffset``),
 matching the local-time day already used by ``meals``. Never the UTC day.
 
+Nutrition uses a **waking-day** grain instead: a meal counts toward the day that
+started at ``NUTRITION_DAY_CUTOFF_HOUR`` (05:00 local by default), so a dessert
+eaten at 00:17 — before bed — rolls into *yesterday*, not the new calendar day.
+The current, still-in-progress nutrition day is **not** totalled at all: a day's
+intake is only summed once it is over (after 05:00 the next morning), so the
+sheet never shows a misleading partial total for a day still under way.
+
 Only the trailing ``HEALTH_RECONCILE_DAYS`` days are re-rolled, so *yesterday*
 is finalised once its data has fully landed while *today* keeps updating. Set
 it to 0 for a one-off full backfill/reconstruction from source.
@@ -30,6 +37,7 @@ import os
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import google.auth
 import requests
@@ -45,6 +53,26 @@ SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 
 # Meal rows excluded from nutrition totals (kept in sync with ingest/main.py).
 NON_MEALS = {"not food", "analysis failed"}
+
+# The "nutrition day" starts at this local hour: a meal before it counts toward
+# the previous day (a 00:17 pre-bed dessert belongs to yesterday, not the new
+# calendar day). 05:00 is a safe waking cutoff — earlier than any breakfast, past
+# any late-night snack. Tune via NUTRITION_DAY_CUTOFF_HOUR.
+DAY_CUTOFF_HOUR = int(os.environ.get("NUTRITION_DAY_CUTOFF_HOUR", "5"))
+
+
+def nutrition_day(dt_str: Any, cutoff_hour: int = DAY_CUTOFF_HOUR) -> str:
+    """The waking-day (YYYY-MM-DD) a meal's local datetime belongs to: the local
+    calendar day shifted back by `cutoff_hour`, so times before the cutoff fall on
+    the previous day. Date-only/empty/unparseable inputs pass through unshifted."""
+    s = str(dt_str or "")
+    if "T" not in s:              # date-only or empty — nothing to shift
+        return s[:10]
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return s[:10]
+    return (dt - timedelta(hours=cutoff_hour)).date().isoformat()
 
 
 def load_user_credentials() -> Credentials:
@@ -168,11 +196,18 @@ def _parse_items(raw: Any) -> List[Dict[str, Any]]:
     return parsed if isinstance(parsed, list) else []
 
 
-def daily_nutrition(meals: List[Dict[str, Any]], start: Optional[str]) -> Dict[str, Dict[str, Any]]:
-    """Per local day: sum macros (flat meal columns) and Tier-1 micronutrients
-    (from each meal's per-ingredient `items` JSON). Non-food and zero-content
-    rows are ignored. Nutrient totals are emitted only when non-zero, so days
-    before nutrient tracking stay blank rather than showing misleading zeros."""
+def daily_nutrition(meals: List[Dict[str, Any]], start: Optional[str],
+                    cutoff_hour: int = DAY_CUTOFF_HOUR,
+                    in_progress_day: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """Per **waking day** (05:00-anchored, see `nutrition_day`): sum macros (flat
+    meal columns) and Tier-1 micronutrients (from each meal's per-ingredient
+    `items` JSON). Non-food and zero-content rows are ignored. Nutrient totals are
+    emitted only when non-zero, so days before nutrient tracking stay blank rather
+    than showing misleading zeros.
+
+    `in_progress_day`, when given, is the current (still-running) nutrition day;
+    it and anything after are excluded, so a day's intake is only totalled once it
+    is over — the sheet never shows a half-finished day's running sum."""
     macro_fields = {
         "total_cals_in": "calories",
         "total_protein_g": "protein_g",
@@ -187,9 +222,11 @@ def daily_nutrition(meals: List[Dict[str, Any]], start: Optional[str]) -> Dict[s
 
     totals: Dict[str, Dict[str, float]] = defaultdict(_blank)
     for meal in meals:
-        day = str(meal.get("datetime") or "")[:10]
+        day = nutrition_day(meal.get("datetime"), cutoff_hour)
         if not day or not _in_window(day, start):
             continue
+        if in_progress_day is not None and day >= in_progress_day:
+            continue  # this nutrition day isn't over yet — don't total it
         if str(meal.get("foods") or "").strip().lower() in NON_MEALS:
             continue
         macros = {k: _num(meal.get(mk)) for k, mk in macro_fields.items()}
@@ -296,7 +333,11 @@ def main() -> None:
 
     body = daily_body(weight_points, fat_points, start)
     meals = sheet.read_rows(MEALS_TAB)
-    nutrition = daily_nutrition(meals, start)
+    # The nutrition day still under way (local now shifted back by the cutoff) is
+    # excluded, so only completed days are totalled.
+    tz = ZoneInfo(os.environ.get("HEALTH_TZ", "Europe/Lisbon"))
+    in_progress = (datetime.now(tz) - timedelta(hours=DAY_CUTOFF_HOUR)).date().isoformat()
+    nutrition = daily_nutrition(meals, start, DAY_CUTOFF_HOUR, in_progress)
     daily_result = sheet.upsert_daily(build_daily_rows(body, nutrition))
 
     dashboard_note = "refreshed"
