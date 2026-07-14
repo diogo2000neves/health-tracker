@@ -301,10 +301,17 @@ If what you see IS one of these dishes, set `template` to its name copied VERBAT
 and explain the match in `reasoning`. The stored measured values are then used
 instead of your estimate, so a repeat meal always gets identical numbers. (Still
 fill `items` with your own estimate as a fallback — it is discarded on a match.)
-Match ONLY when you are confident it is the same dish with the same components.
-If anything material differs — a different bread or protein, an extra or missing
-ingredient, a clearly different size — leave `template` EMPTY and estimate
-normally. A wrong match replaces measured data with a guess; when in doubt, don't.
+THE NOTE OVERRULES YOUR EYES. If the note says this meal IS one of the templates
+(names it, or says "the usual X", "we have a template for this"), that is
+AUTHORITATIVE — match it even if the photo is ambiguous or looks a little
+different. The user knows what they ate. Only refuse when the NOTE ITSELF says it
+differs (an extra/missing ingredient, a different size, "not my usual").
+
+Otherwise, judging from the photo alone, match ONLY when you are confident it is
+the same dish with the same components. If anything material differs — a
+different bread or protein, an extra or missing ingredient, a clearly different
+size — leave `template` EMPTY and estimate normally. A wrong match replaces
+measured data with a guess; when in doubt, don't.
 If the user ate only part of it, still match and set `template_scale` to the
 fraction eaten (e.g. 0.5 for half). Otherwise leave `template_scale` at 1."""
 
@@ -971,6 +978,28 @@ def _template_catalogue(templates: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _forced_template(note: str,
+                     templates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """A note that says "template" AND spells out a known template's name is an
+    explicit instruction, not a hint — honour it deterministically instead of
+    leaving recognition to the model's eyes. This is the user's 100%-reliable
+    lever when they don't want a repeat meal re-estimated.
+
+    (Save-requests are resolved before this, so "save as template X" can't be
+    mistaken for "use template X". The longest matching name wins, so a template
+    called "Sandes mista" can't shadow "Sandes mista com ovo".)"""
+    text = " ".join(str(note or "").lower().split())
+    if "template" not in text:
+        return None
+    best: Optional[Dict[str, Any]] = None
+    for tpl in templates:
+        name = " ".join(tpl["name"].lower().split())
+        if name and name in text:
+            if best is None or len(name) > len(" ".join(best["name"].lower().split())):
+                best = tpl
+    return best
+
+
 def _find_template(templates: List[Dict[str, Any]],
                    name: str) -> Optional[Dict[str, Any]]:
     """Look a template up by name, case/space-insensitively. Returns None for a
@@ -1293,12 +1322,28 @@ def _resolve_templates(nut: Dict[str, Any], note: str, when: datetime,
 
     Saving and matching are mutually exclusive: a note asking to SAVE is defining
     a template (its items are the weights the user stated), so it must not also be
-    overwritten by a match. Otherwise, if the model recognised a saved dish, its
-    measured values replace the estimate."""
+    overwritten by a match. Otherwise, if the note explicitly names a template we
+    honour that outright (deterministic — no reliance on the model recognising the
+    photo); failing that, we use the model's own match. Either way the measured
+    values then replace the estimate."""
     saved = maybe_save_template(nut, note, when)
     if saved:
         nut["template"] = saved  # this meal *is* that dish — record it
         return nut
+
+    forced = _forced_template(note, templates)
+    if forced:
+        if forced["name"] != nut.get("template"):
+            app.logger.info("note names template %r — forcing it (model said %r)",
+                            forced["name"], nut.get("template") or "nothing")
+        nut["template"] = forced["name"]
+    elif "template" in note.lower() and not nut.get("template"):
+        # The user mentioned a template but nothing matched — surface it rather
+        # than silently falling back to an estimate.
+        app.logger.warning(
+            "note mentions a template but none matched; estimating instead. "
+            "note=%r known=%s", note[:120], [t["name"] for t in templates])
+
     return apply_template(nut, templates)
 
 

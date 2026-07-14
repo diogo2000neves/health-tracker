@@ -225,6 +225,40 @@ def test_apply_template_is_a_noop_without_a_match():
     assert ingest.apply_template(est, _TPL) is est
 
 
+def test_forced_template_honours_a_note_that_names_one():
+    # naming a template in the note is an instruction, not a hint — deterministic
+    assert ingest._forced_template(
+        "usa o template Sandes mista PA", _TPL)["name"] == "Sandes mista PA"
+    assert ingest._forced_template(
+        "this is my template  sandes   MISTA pa", _TPL)["name"] == "Sandes mista PA"
+    # the word "template" alone isn't enough — a name must be present
+    assert ingest._forced_template("we have a template for this", _TPL) is None
+    # and the name alone, without the word "template", doesn't force it
+    assert ingest._forced_template("sandes mista pa", _TPL) is None
+    assert ingest._forced_template("", _TPL) is None
+
+
+def test_forced_template_prefers_the_longest_matching_name():
+    tpls = _TPL + [{"name": "Sandes mista PA com ovo", "description": "",
+                    "items": _TPL[0]["items"]}]
+    got = ingest._forced_template("template Sandes mista PA com ovo hoje", tpls)
+    assert got["name"] == "Sandes mista PA com ovo"   # not shadowed by the shorter
+
+
+def test_resolve_templates_forces_the_named_one_over_the_models_guess(monkeypatch):
+    from datetime import datetime
+    est = ingest._meal_from_items(ingest._normalize_items(
+        [{"name": "sandwich", "portion_g": 150, "calories": 400,
+          "protein_g": 20, "carbs_g": 45, "fat_g": 12}]), 0.6, "m1")
+    est["template"] = ""            # the model FAILED to recognise it
+    est["save_template_name"] = ""
+    out = ingest._resolve_templates(
+        est, "usa o template Sandes mista PA", datetime.now(), _TPL)
+    assert out["template"] == "Sandes mista PA"
+    assert out["calories"] == 260.0                  # measured values won anyway
+    assert out["confidence"] == ingest.TEMPLATE_CONFIDENCE
+
+
 def test_template_catalogue_lists_measured_ingredients():
     cat = ingest._template_catalogue(_TPL)
     assert '"Sandes mista PA"' in cat and "baguette 80g" in cat and "ham 40g" in cat
