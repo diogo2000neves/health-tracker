@@ -156,6 +156,34 @@ class SheetClient:
                 valueInputOption="RAW", body={"values": [list(headers)]},
             ).execute()
 
+    def sheet_id(self, tab: str) -> Optional[int]:
+        """The tab's numeric sheetId (needed to sort it), or None if absent."""
+        meta = self.svc.spreadsheets().get(spreadsheetId=self.sid).execute()
+        for sheet in meta.get("sheets", []):
+            if sheet["properties"]["title"] == tab:
+                return sheet["properties"]["sheetId"]
+        return None
+
+    def sort_by_date(self, tab: str) -> None:
+        """Order a tab by its first column (the date/datetime key).
+
+        Rows are appended in arrival order, not date order — and a backfilled scale
+        screenshot arrives *after* the days that follow it. Left unsorted, the
+        dashboard's line chart plots that day out of sequence and the trend is a
+        lie. ISO dates sort lexicographically, so a plain ascending sort is
+        chronological."""
+        tab_id = self.sheet_id(tab)
+        if tab_id is None:
+            return
+        self.svc.spreadsheets().batchUpdate(
+            spreadsheetId=self.sid,
+            body={"requests": [{"sortRange": {
+                "range": {"sheetId": tab_id, "startRowIndex": 1,
+                          "startColumnIndex": 0},
+                "sortSpecs": [{"dimensionIndex": 0, "sortOrder": "ASCENDING"}],
+            }}]},
+        ).execute()
+
     def header(self, tab: str) -> List[str]:
         """The tab's header row as written in the sheet ([] if the tab is absent)."""
         if tab not in self.tab_titles():
@@ -257,4 +285,5 @@ class SheetClient:
                 valueInputOption="RAW", insertDataOption="INSERT_ROWS",
                 body={"values": appends},
             ).execute()
+            self.sort_by_date(DAILY_TAB)  # new days land at the bottom; re-order
         return {"updated": len(updates), "appended": len(appends)}

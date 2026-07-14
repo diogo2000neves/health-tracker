@@ -1184,6 +1184,33 @@ def _sort_meals_by_datetime(meals_id: int) -> None:
         }}]}))
 
 
+def _tab_id(tab: str) -> Optional[int]:
+    """The tab's numeric sheetId (needed to sort it), or None if absent."""
+    meta = _execute(lambda: _sheets().spreadsheets().get(spreadsheetId=_sid()))
+    for sheet in meta.get("sheets", []):
+        if sheet["properties"]["title"] == tab:
+            return sheet["properties"]["sheetId"]
+    return None
+
+
+def _sort_daily_by_date() -> None:
+    """Order daily_summary by date after a new day is appended.
+
+    A screenshot of an *older* reading (the backfill path — scrolling the scale
+    app's history) appends a day that belongs above the rows already there. Left
+    unsorted it plots out of sequence on the dashboard's trend chart, which is
+    worse than useless. Cosmetic only — every roll-up keys on the date column, not
+    row order — so the caller swallows failures."""
+    tab_id = _tab_id(DAILY_TAB)
+    if tab_id is None:
+        return
+    _execute(lambda: _sheets().spreadsheets().batchUpdate(
+        spreadsheetId=_sid(), body={"requests": [{"sortRange": {
+            "range": {"sheetId": tab_id, "startRowIndex": 1, "startColumnIndex": 0},
+            "sortSpecs": [{"dimensionIndex": 0, "sortOrder": "ASCENDING"}],
+        }}]}))
+
+
 # -- templates (measured, reusable meals) --------------------------------------
 def _parse_items_cell(raw: Any) -> List[Dict[str, Any]]:
     """The `items` cell holds a JSON array of per-ingredient objects."""
@@ -1450,6 +1477,10 @@ def write_daily(day: str, values: Dict[str, Any]) -> None:
         spreadsheetId=_sid(), range=f"{DAILY_TAB}!A1",
         valueInputOption="RAW", insertDataOption="INSERT_ROWS",
         body={"values": [new_row]}))
+    try:  # the row is already saved; ordering must never fail the request
+        _sort_daily_by_date()
+    except Exception:
+        app.logger.warning("daily_summary sort failed (non-fatal)", exc_info=True)
 
 
 # -- HTTP ------------------------------------------------------------------------
