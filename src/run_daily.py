@@ -235,6 +235,15 @@ def main() -> None:
     nutrition = daily_nutrition(meals, start, DAY_CUTOFF_HOUR, in_progress)
     daily_result = sheet.upsert_daily(build_daily_rows(nutrition))
 
+    # Unconditional, so the tab self-heals: rows arrive in submission order, and a
+    # backfilled scale screenshot appends a day that belongs above the ones already
+    # there. Cheap (one call/day) and idempotent when already sorted.
+    sort_note = "sorted"
+    try:
+        sheet.sort_by_date(DAILY_TAB)
+    except Exception as err:  # ordering is cosmetic — never fail the data run
+        sort_note = f"sort skipped ({err})"
+
     dashboard_note = "refreshed"
     try:
         refresh_dashboard(sheet)
@@ -244,8 +253,8 @@ def main() -> None:
     print(
         f"window>={start or 'ALL'}: read {len(meals)} meal rows -> "
         f"{len(nutrition)} nutrition day(s); daily_summary updated "
-        f"{daily_result['updated']}, appended {daily_result['appended']}; "
-        f"dashboard {dashboard_note} "
+        f"{daily_result['updated']}, appended {daily_result['appended']}, "
+        f"{sort_note}; dashboard {dashboard_note} "
         f"(spreadsheet {spreadsheet_id}, project {project})."
     )
 

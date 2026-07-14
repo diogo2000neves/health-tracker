@@ -285,5 +285,4 @@ class SheetClient:
                 valueInputOption="RAW", insertDataOption="INSERT_ROWS",
                 body={"values": appends},
             ).execute()
-            self.sort_by_date(DAILY_TAB)  # new days land at the bottom; re-order
         return {"updated": len(updates), "appended": len(appends)}
