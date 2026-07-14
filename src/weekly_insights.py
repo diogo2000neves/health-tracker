@@ -23,11 +23,18 @@ INSIGHTS_HEADERS = ["week_ending", "insights", "model", "updated_at"]
 DEFAULT_MODELS = "gemini-3.5-flash,gemini-3-flash-preview,gemini-3.1-flash-lite"
 WINDOW_DAYS = 35
 
-# Only columns with signal today; blank cells are expected and fine.
+# Only columns with signal today; blank cells are expected and fine (body columns
+# are filled only on days the user weighed in, readiness columns not at all yet).
+# The full body-composition block is here because it's the whole point of the
+# analysis: muscle vs fat vs water is what says whether the intake is working.
 CSV_COLUMNS = [
-    "date", "total_cals_in", "total_protein_g", "total_carbs_g", "total_fat_g",
-    "weight_kg", "body_fat_pct", "lean_mass_kg", "subjective_feel",
-    "sleep_score", "steps",
+    "date",
+    "total_cals_in", "total_protein_g", "total_carbs_g", "total_fat_g",
+    "total_fiber_g", "total_sugar_g", "total_saturated_fat_g", "total_sodium_mg",
+    "weight_kg", "bmi", "body_fat_pct", "subcutaneous_fat_pct", "visceral_fat",
+    "body_water_pct", "muscle_mass_kg", "bone_mass_kg", "lean_mass_kg",
+    "bmr_kcal", "metabolic_age",
+    "subjective_feel", "sleep_score", "steps",
 ]
 
 PROMPT_TEMPLATE = """You are a precise, no-nonsense personal health-data analyst.
@@ -37,7 +44,9 @@ are blank — metrics not yet collected; treat blanks as missing, not zero).
 {csv}
 
 Write your analysis as 4-6 short markdown bullets, in this spirit:
-- Weight / lean-mass trend vs calorie & protein intake — cite actual numbers.
+- Body-composition trend vs intake — cite actual numbers. Weight alone is noise;
+  read muscle mass, lean mass and body fat % together against calories and
+  protein, and say whether the change is muscle, fat or water.
 - Any notable pattern, correlation or anomaly worth my attention.
 - Data gaps that most limit the analysis (be specific: which metric, how often).
 - End with ONE concrete, specific action for next week.

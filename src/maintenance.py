@@ -21,7 +21,8 @@ import google.auth
 from googleapiclient.discovery import build
 
 from src.sheets import (
-    DAILY_HEADERS, DAILY_TAB, DASHBOARD_TAB, INSIGHTS_TAB, MEALS_TAB, col_letter,
+    DAILY_HEADERS, DAILY_TAB, DASHBOARD_FIRST_ROW, DASHBOARD_STATS, DASHBOARD_TAB,
+    INSIGHTS_TAB, MEALS_TAB, col_letter,
 )
 
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
@@ -43,19 +44,14 @@ TEMPLATES_HEADERS = [
     "calories", "protein_g", "carbs_g", "fat_g", "created_at", "updated_at",
 ]
 
-DASHBOARD_LABELS = [
-    ["HEALTH DASHBOARD"],
-    [""],
-    ["Latest weight (kg)"],
-    ["Latest body fat (%)"],
-    ["Latest lean mass (kg)"],
-    ["Avg kcal (last 7 logged days)"],
-    ["Avg protein g (7d)"],
-    ["Avg carbs g (7d)"],
-    ["Avg fat g (7d)"],
-    ["Nutrition days in window"],
-    ["Stats updated (UTC)"],
+# Column A: the title, a spacer, then one label per stat. run_daily.refresh_dashboard
+# writes the values beside them in column B from the SAME list, so labels and
+# numbers can't drift apart when a metric is added. (DASHBOARD_FIRST_ROW == 3 is
+# the two header rows below.)
+DASHBOARD_LABELS = [["HEALTH DASHBOARD"], [""]] + [
+    [label] for label, _col, _kind in DASHBOARD_STATS
 ]
+assert len(DASHBOARD_LABELS) == DASHBOARD_FIRST_ROW - 1 + len(DASHBOARD_STATS)
 
 
 def _sync_daily_columns(svc, sid: str, daily_id: int) -> str:

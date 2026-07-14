@@ -1,6 +1,13 @@
-"""One-time login. Run once to authorise and store a refreshable token.
+"""One-time login. Authorises Drive access and stores a refreshable token.
 
     python -m src.authenticate
+
+Then push it to Secret Manager, which is where the ingest service reads it from:
+
+    gcloud secrets versions add drive-oauth-token --data-file=credentials/token.json
+
+Only needed if the token is ever revoked — the refresh token does not expire while
+the OAuth app is "In production".
 """
 from __future__ import annotations
 

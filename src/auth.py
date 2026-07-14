@@ -1,8 +1,13 @@
-"""OAuth 2.0 handling for the Google Health API (Desktop / installed-app flow).
+"""OAuth 2.0 handling for the user's Google Drive (Desktop / installed-app flow).
 
-First run opens a browser for consent and stores a refreshable token in
-credentials/token.json. Subsequent runs are non-interactive: the stored
-refresh token is used automatically.
+This mints the ONE user token the system needs: the ingest service uploads meal
+photos to the user's own Drive with it. Nothing else runs as the user — the Sheet
+is written by the service account, and body composition now comes from a
+screenshot of the scale app rather than any Google API.
+
+Run `python -m src.authenticate` once; it opens a browser for consent and stores a
+refreshable token in credentials/token.json, which is then uploaded to Secret
+Manager as `drive-oauth-token`. Only needed again if the token is ever revoked.
 """
 from __future__ import annotations
 
@@ -19,13 +24,10 @@ CREDENTIALS_DIR = BASE_DIR / "credentials"
 CLIENT_SECRETS_FILE = CREDENTIALS_DIR / "oauth_client.json"
 TOKEN_FILE = CREDENTIALS_DIR / "token.json"
 
-# Read-only access to body metrics & measurements (weight, body-fat, ...), plus
-# drive.file so meal photos can be uploaded into the user's own Drive storage.
-# (A service account has no Drive quota, so photo uploads must run as the user.)
-SCOPES = [
-    "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly",
-    "https://www.googleapis.com/auth/drive.file",
-]
+# drive.file only: it lets us upload meal photos into the user's own Drive storage
+# and touch nothing else there. A service account has no Drive quota of its own, so
+# the upload has to run as the user — this is the sole reason a user token exists.
+SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 
 def get_credentials(interactive: bool = True) -> Credentials:

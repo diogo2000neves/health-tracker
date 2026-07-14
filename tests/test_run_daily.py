@@ -1,69 +1,14 @@
-"""Unit tests for the daily job's pure transforms (no network, no sheet)."""
+"""Unit tests for the daily job's pure transforms (no network, no sheet).
+
+The job is nutrition-only now: body composition arrives through the ingest
+service (see tests/test_ingest.py), not through a scheduled pull.
+"""
 import json
 from datetime import date
 
 from src.run_daily import (
-    _local_date, build_daily_rows, daily_body, daily_nutrition, nutrition_day,
-    window_start,
+    build_daily_rows, daily_nutrition, nutrition_day, window_start,
 )
-
-
-def _metric(physical, offset="0s", civil=None, **values):
-    sample = {"physicalTime": physical, "utcOffset": offset}
-    if civil:
-        sample["civilTime"] = {"date": civil}
-    return {"sampleTime": sample, **values}
-
-
-def _weight_point(physical, grams, offset="0s", civil=None):
-    return {"weight": _metric(physical, offset, civil, weightGrams=grams)}
-
-
-def _fat_point(physical, pct, offset="0s", civil=None):
-    return {"bodyFat": _metric(physical, offset, civil, percentage=pct)}
-
-
-# -- local civil-day attribution ----------------------------------------------
-def test_local_date_prefers_civil_time():
-    metric = _metric("2026-07-03T23:30:00Z", "3600s",
-                     civil={"year": 2026, "month": 7, "day": 4})
-    assert _local_date(metric) == "2026-07-04"
-
-
-def test_local_date_offset_rolls_past_midnight():
-    # 23:30 UTC + 1h offset = 00:30 next local day (the bug the fix targets).
-    metric = _metric("2026-07-03T23:30:00Z", "3600s")
-    assert _local_date(metric) == "2026-07-04"
-
-
-def test_local_date_zero_offset_stays_on_utc_day():
-    assert _local_date(_metric("2025-12-27T11:24:13Z", "0s")) == "2025-12-27"
-
-
-def test_local_date_fractional_seconds():
-    assert _local_date(_metric("2026-07-03T21:45:02.905829Z", "3600s")) == "2026-07-03"
-
-
-# -- body rollup ----------------------------------------------------------------
-def test_daily_body_picks_earliest_reading_of_local_day():
-    points = [
-        _weight_point("2026-07-03T21:54:20Z", 69550, "3600s"),
-        _weight_point("2026-07-03T18:00:46Z", 69250, "3600s"),  # earliest
-        _weight_point("2026-07-03T21:53:16Z", 69550, "3600s"),
-    ]
-    body = daily_body(points, [], None)
-    assert body == {"2026-07-03": {"weight_kg": 69.25, "body_fat_pct": None}}
-
-
-def test_daily_body_respects_window():
-    points = [
-        _weight_point("2026-07-03T18:00:46Z", 69250, "3600s"),
-        _weight_point("2025-12-27T11:24:13Z", 70000, "0s"),
-    ]
-    body = daily_body(points, [_fat_point("2026-07-03T18:00:46Z", 20.2, "3600s")],
-                      "2026-01-01")
-    assert list(body) == ["2026-07-03"]
-    assert body["2026-07-03"] == {"weight_kg": 69.25, "body_fat_pct": 20.2}
 
 
 # -- nutrition rollup -------------------------------------------------------------
@@ -149,21 +94,21 @@ def test_daily_nutrition_rolls_up_tier1_nutrients_from_items():
     assert "total_calcium_mg" not in nut       # never present -> omitted, not 0
 
 
-# -- merge + lean mass ----------------------------------------------------------
-def test_build_daily_rows_derives_lean_mass():
-    rows = build_daily_rows(
-        {"2026-07-10": {"weight_kg": 70.0, "body_fat_pct": 20.0}},
-        {"2026-07-10": {"total_cals_in": 500.0}},
-    )
-    assert rows == [{
-        "date": "2026-07-10", "weight_kg": 70.0, "body_fat_pct": 20.0,
-        "total_cals_in": 500.0, "lean_mass_kg": 56.0,
-    }]
-
-
-def test_build_daily_rows_no_lean_without_fat():
-    rows = build_daily_rows({"2026-07-10": {"weight_kg": 70.0, "body_fat_pct": None}}, {})
-    assert "lean_mass_kg" not in rows[0]
+# -- merge rows -------------------------------------------------------------------
+def test_build_daily_rows_carries_nutrition_only():
+    # The job owns the nutrition columns and nothing else. It must never emit a
+    # body column, or `upsert_daily` would overwrite the scale reading the ingest
+    # service wrote when the user stepped on the scale.
+    rows = build_daily_rows({
+        "2026-07-11": {"total_cals_in": 1800.0, "total_protein_g": 120.0},
+        "2026-07-10": {"total_cals_in": 500.0},
+    })
+    assert rows == [                       # sorted by day
+        {"date": "2026-07-10", "total_cals_in": 500.0},
+        {"date": "2026-07-11", "total_cals_in": 1800.0, "total_protein_g": 120.0},
+    ]
+    assert not any(k.startswith("weight") or k.startswith("body") or "mass" in k
+                   for row in rows for k in row)
 
 
 # -- window -----------------------------------------------------------------------

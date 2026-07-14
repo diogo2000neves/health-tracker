@@ -1,24 +1,30 @@
 # Health Tracker
 
-A zero-friction personal health pipeline. **Step 1** pulls your **weight and
-body-fat** from the **Google Health API** (where your Goodvibes scale data lands
-via Google Health) and stores it to disk. Later steps add Fitbit-Air biometrics
-and AI-analysed food photos, aggregating one row per day into a Google Sheet.
-
-## Architecture (the plan we're building toward)
+A zero-friction personal health pipeline. Everything enters through **one button
+on the phone**: photograph a meal, or screenshot your smart scale. Gemini works out
+which of the two it's looking at, extracts the numbers, and files them into a
+Google Sheet you own — one row per day, nutrition against physique.
 
 ```
-Goodvibes scale ─► Google Health ─┐
-Fitbit Air ───────► Google Health ─┼─► Google Health API ─► Python ─► data/bronze/*.json
-Food photos ──────► (Step 3, AI)  ─┘        (this repo)         │
-                                                                └─► daily aggregate ─► Google Sheet
+                      iPhone Shortcut (one button)
+                                 │
+                photo of a meal ─┴─ screenshot of the scale app
+                                 │
+                                 ▼
+                    health-tracker-ingest (Cloud Run)
+                      "is this food, or a scale?"
+                          │                │
+              per-ingredient          all 10 body
+              nutrition (AI)        metrics (AI OCR)
+                          │                │
+                          ▼                ▼
+                   Google Sheet ── daily_summary (one row/day)
+                          ▲
+             nightly roll-up + weekly AI trend summary
 ```
 
-- **Bronze** = raw dated JSON in `data/bronze/` (immutable, re-runnable).
-- **Silver** = a daily Python job that normalises + builds one row per day.
-- **Gold** = the Google Sheet (written only by that job, upsert on date).
-
-Step 1 in this repo covers the bronze pull for weight.
+There is no scheduled *sync* of anything. Data lands the moment you send it; the
+two Cloud Run **Jobs** only derive from what's already in the Sheet.
 
 ## Layout
 
@@ -28,18 +34,15 @@ Health Tracker/
 ├── Dockerfile              # image for the daily + weekly jobs
 ├── requirements.txt
 ├── credentials/            # OAuth client + token — git-ignored
-├── data/bronze/            # raw API responses (local runs) — git-ignored
 ├── ingest/
 │   ├── Dockerfile
-│   ├── main.py             # Cloud Run service: POST /ingest (photo), POST /feel
+│   ├── main.py             # Cloud Run service: POST /ingest, /process, /feel
 │   └── requirements.txt
 ├── src/
-│   ├── auth.py             # OAuth flow + token refresh (local)
+│   ├── auth.py             # Drive OAuth flow + token refresh (local, one-off)
 │   ├── authenticate.py     # one-time login: python -m src.authenticate
-│   ├── fetch_weight.py     # local debug pull: python -m src.fetch_weight
-│   ├── google_health.py    # Google Health API v4 client (with retries)
 │   ├── sheets.py           # schema + merge-upsert Sheet client
-│   ├── run_daily.py        # daily job: physique + nutrition roll-up + dashboard
+│   ├── run_daily.py        # daily job: nutrition roll-up + dashboard
 │   ├── weekly_insights.py  # weekly job: Gemini trend summary → `insights` tab
 │   └── maintenance.py      # idempotent schema/dashboard sync (run after schema changes)
 └── tests/                  # unit tests — the CI deploy gate
@@ -47,25 +50,47 @@ Health Tracker/
 
 ## Endpoints (Cloud Run service, `X-Auth-Token` gated)
 
-- `POST /ingest` — one or more meal photos, a text description, or a mix.
-  Accepts a raw image body, or a multipart form with any number of image file
-  parts + an optional `note` text field (a `?note=` query param / JSON
-  `{"note": …}` also works). Extra photos can be a nutrition label, packaging,
-  or an ingredient the first shot missed — the AI reasons across all of them
-  (a label is authoritative and scaled to the portion on the plate). The `note`
-  is authoritative context ("only ate half" halves portions); a note with no
-  image estimates the meal from text alone at capped confidence. De-dupes
-  (combined image hash, or note hash when text-only) ignoring failed stubs.
-  **Hybrid reliability:** a quick single-model pass gives the phone instant
-  macros when Gemini is fast; if it's slow, the photos are archived and the meal
-  is handed to a **Cloud Tasks** queue (`202 Queued`) that retries the analysis
-  in the background until the row lands — so a transient Gemini outage can't lose
-  a meal. Replies with the meal + running totals, or a queued ack.
+- `POST /ingest` — **a scale screenshot.** Recognised automatically (you don't say
+  which kind of thing you're sending). All ten metrics the scale computes — weight,
+  BMI, body fat, subcutaneous fat, visceral fat, body water, muscle mass, bone
+  mass, BMR, metabolic age — are read off the screen and merged into
+  `daily_summary`, plus a derived lean mass. The row is keyed on **the reading's own
+  date, printed on the screen**, so weighing at 07:00 and sending at noon still
+  lands on the right day — and screenshotting the app's history backfills old days.
+  Sending a new reading for a day replaces it. Values are bounds-checked before
+  they're written, so an OCR slip is dropped rather than stored.
+
+- `POST /ingest` — **one or more meal photos, a text description, or a mix.**
+  Accepts a raw image body, a JSON `images` array of base64 strings, or a multipart
+  form with any number of image file parts + an optional `note` text field (a
+  `?note=` query param / JSON `{"note": …}` also works). Extra photos can be a
+  nutrition label, packaging, or an ingredient the first shot missed — the AI
+  reasons across all of them (a label is authoritative and scaled to the portion on
+  the plate). The `note` is authoritative context ("only ate half" halves
+  portions); a note with no image estimates the meal from text alone at capped
+  confidence. De-dupes (combined image hash, or note hash when text-only) ignoring
+  failed stubs.
+  **Hybrid reliability:** a quick single-model pass gives the phone instant macros
+  when Gemini is fast; if it's slow, the photos are archived and the meal is handed
+  to a **Cloud Tasks** queue (`202 Queued`) that retries the analysis in the
+  background until the row lands — so a transient Gemini outage can't lose a meal.
+
 - `POST /process` — internal Cloud Tasks worker: the thorough analysis + row
   insert. Returns 5xx to trigger a retry; writes an "analysis failed" stub only
   on the final attempt. Same `X-Auth-Token` gate; not called by the phone.
+
 - `POST /feel` — `{"score": 1-10[, "date": "YYYY-MM-DD"]}` → writes
   `subjective_feel` on that day's `daily_summary` row (`{"score": null}` clears).
+
+## Jobs
+
+- **`health-tracker-daily`** (07:00 Europe/Lisbon) — rolls the `meals` tab up into
+  `daily_summary`'s nutrition columns and refreshes the dashboard. It exists
+  because nutrition uses a **waking-day** grain (05:00 cutoff, so a midnight
+  dessert counts as yesterday) and a day is only totalled once it is *over*.
+  It holds no OAuth token and calls no external API.
+- **`health-tracker-weekly`** (Sun 20:00) — Gemini reads the last five weeks and
+  appends a trend analysis to the `insights` tab.
 
 ## Tests
 
@@ -75,27 +100,17 @@ python -m pytest tests -q
 The same suite gates every deploy in Cloud Build — a red test means nothing
 ships and production keeps the previous version.
 
-## One-time Google Cloud setup
+## Schema changes
 
-In the [Google Cloud Console](https://console.cloud.google.com/) for your project:
+`daily_summary` is written by position, so **never reorder or rename a column**.
+To add one: put it in `src.sheets.DAILY_HEADERS`, then run
 
-1. **Enable the API** — APIs & Services ▸ *Enable APIs and Services* ▸ enable
-   **Google Health API**. (Calls return 403 until this is on.)
-2. **OAuth consent screen** — add the scope
-   `.../auth/googlehealth.health_metrics_and_measurements.readonly` and add your
-   own Google account as a **Test user**.
-   - ⚠️ While the app is in **Testing**, refresh tokens expire after **7 days**
-     (you'd re-login weekly). To run unattended daily, set the publishing status
-     to **In production** — for personal use you can click past the "unverified
-     app" screen; the refresh token then persists.
-3. **OAuth client** — must be type **Desktop app**. (If you made a *Web* client,
-   either recreate it as Desktop, or add `http://localhost` to its authorized
-   redirect URIs.)
-4. `credentials/oauth_client.json` already holds your client id/secret.
+```bash
+python -m src.maintenance
+```
 
-> 🔐 **Rotate the client secret.** It was shared in chat, so treat it as exposed:
-> APIs & Services ▸ Credentials ▸ your client ▸ *Reset secret*, then paste the new
-> value into `credentials/oauth_client.json`. That file is git-ignored.
+which inserts it *in place* so existing rows stay aligned. The daily job refuses to
+run against a stale sheet rather than writing through it.
 
 ## Install
 
@@ -106,25 +121,36 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Run
+## Auth (one-off)
+
+The only user credential in the system is a Drive token — the ingest service
+uploads meal photos into your own Drive, because a service account has no Drive
+storage quota of its own. Everything else runs as a service account.
 
 ```bash
-# First time — opens a browser to log in and stores a refreshable token
-python -m src.authenticate
-
-# Step 1 — fetch weight + body-fat, save raw JSON, print the latest reading
-python -m src.fetch_weight
+python -m src.authenticate   # opens a browser; scope: drive.file
+gcloud secrets versions add drive-oauth-token --data-file=credentials/token.json
 ```
 
-Output lands in `data/bronze/weight_<timestamp>.json`.
+Your OAuth app must be **In production** (not "Testing"), or the refresh token
+expires after 7 days. For personal use you can click past the "unverified app"
+screen.
+
+> 🔐 **Rotate the client secret.** It was shared in chat, so treat it as exposed:
+> APIs & Services ▸ Credentials ▸ your client ▸ *Reset secret*, then paste the new
+> value into `credentials/oauth_client.json`. That file is git-ignored.
 
 ## Continuous deployment
 
-Pushing to `main` auto-builds and redeploys both Cloud Run targets via Cloud
+Pushing to `main` auto-builds and redeploys all three Cloud Run targets via Cloud
 Build (`cloudbuild.yaml`, trigger `health-tracker-deploy` in `europe-west1`):
 
 - `health-tracker-daily` (Job) — built from `./Dockerfile`
+- `health-tracker-weekly` (Job) — same image, different entrypoint
 - `health-tracker-ingest` (Service) — built from `./ingest/Dockerfile`
 
 Images are tagged with the commit SHA; deploys swap only the image, so each
-target keeps its env vars and Secret Manager bindings.
+target's env vars and secret bindings are preserved.
+
+See `CONTEXT.md` for the full system design, auth model, and the gotchas worth
+not rediscovering.

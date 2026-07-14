@@ -2,9 +2,10 @@
 
 * ``daily_summary`` — one row per calendar day holding the 24h "readiness ->
   output" vector (sleep/recovery stamped on the wake day) plus the day's nutrition
-  roll-up and representative body composition. Rows are *merge-upserted* on
-  ``date`` so independent sources (scale, meals, the /feel endpoint and — later —
-  Fitbit biometrics) each fill their own columns without clobbering the rest.
+  roll-up and full body composition. Rows are *merge-upserted* on ``date`` so
+  independent sources (the scale screenshot, the meals roll-up, the /feel endpoint
+  and — later — Fitbit biometrics) each fill their own columns without clobbering
+  the rest.
 
 * ``meals`` — written by the ingest service; read here only as the granular
   nutrition source for the daily roll-up, and otherwise left untouched.
@@ -42,21 +43,69 @@ TIER1_NUTRIENTS: List[str] = [
     "folate_ug", "omega3_g",
 ]
 
+# Body composition, read straight off the smart scale app's result screen (the
+# user screenshots it and the ingest service OCRs every value with Gemini). These
+# are the ten metrics the scale actually computes from bioimpedance — the Google
+# Health API only ever exposed the first three, which is why we stopped using it.
+# Order = the order they appear on the app screen.
+#
+# Mirrored in ingest/main.py BODY_METRICS, which owns the plausibility ranges and
+# is a separate container image that can't import this module. `tests/test_sheets`
+# asserts the two stay in step.
+BODY_METRICS: List[str] = [
+    "weight_kg", "bmi", "body_fat_pct", "subcutaneous_fat_pct", "visceral_fat",
+    "body_water_pct", "muscle_mass_kg", "bone_mass_kg", "bmr_kcal",
+    "metabolic_age",
+]
+
 # Parent schema. Readiness block first (blueprint order), then the nutrition
 # roll-up (macros + Tier-1 micronutrients), then activity and body composition;
 # `updated_at` stays last as bookkeeping. `lean_mass_kg` = weight_kg x
 # (1 - body_fat_pct/100) — stored, not just derived, so the sheet stays
-# self-contained for AI analysis. Schema changes must go through
-# src/maintenance.py so existing rows are realigned in place, never clobbered.
+# self-contained for AI analysis. `body_measured_at` is the reading's own
+# timestamp as printed in the app (a 07:00 fasted weigh-in reads differently from
+# a 21:00 one, so the hour is signal, not bookkeeping). Schema changes must go
+# through src/maintenance.py so existing rows are realigned in place, never
+# clobbered.
 DAILY_HEADERS: List[str] = [
     "date",
     "sleep_score", "hrv_ms", "spo2_pct", "skin_temp_dev", "subjective_feel",
     "total_cals_in", "total_protein_g", "total_carbs_g", "total_fat_g",
     *[f"total_{n}" for n in TIER1_NUTRIENTS],
     "total_active_mins", "steps",
-    "weight_kg", "body_fat_pct", "lean_mass_kg",
+    *BODY_METRICS, "lean_mass_kg", "body_measured_at",
     "updated_at",
 ]
+
+# The dashboard tab's stat block, in order from cell B3: (label, source column,
+# how to reduce it). maintenance.py writes the labels in column A and run_daily.py
+# writes the values in column B — they read this one list so the two can never
+# drift out of alignment.
+#   latest — the most recent non-empty value in that column
+#   avg7   — mean over the last 7 days that have nutrition logged
+#   days7  — how many such days exist
+#   now    — the refresh timestamp
+DASHBOARD_STATS: List[tuple] = [
+    ("Latest weight (kg)", "weight_kg", "latest"),
+    ("Latest BMI", "bmi", "latest"),
+    ("Latest body fat (%)", "body_fat_pct", "latest"),
+    ("Latest subcutaneous fat (%)", "subcutaneous_fat_pct", "latest"),
+    ("Latest visceral fat", "visceral_fat", "latest"),
+    ("Latest body water (%)", "body_water_pct", "latest"),
+    ("Latest muscle mass (kg)", "muscle_mass_kg", "latest"),
+    ("Latest bone mass (kg)", "bone_mass_kg", "latest"),
+    ("Latest lean mass (kg)", "lean_mass_kg", "latest"),
+    ("Latest BMR (kcal)", "bmr_kcal", "latest"),
+    ("Latest metabolic age", "metabolic_age", "latest"),
+    ("Last weigh-in", "body_measured_at", "latest"),
+    ("Avg kcal (last 7 logged days)", "total_cals_in", "avg7"),
+    ("Avg protein g (7d)", "total_protein_g", "avg7"),
+    ("Avg carbs g (7d)", "total_carbs_g", "avg7"),
+    ("Avg fat g (7d)", "total_fat_g", "avg7"),
+    ("Nutrition days in window", "", "days7"),
+    ("Stats updated (UTC)", "", "now"),
+]
+DASHBOARD_FIRST_ROW = 3  # the stat values start at B3, under the title
 
 # Merge-upsert keys this column; everything else in a row is left to its owner.
 _DAILY_KEY = "date"
@@ -106,6 +155,17 @@ class SheetClient:
                 spreadsheetId=self.sid, range=f"{title}!A1",
                 valueInputOption="RAW", body={"values": [list(headers)]},
             ).execute()
+
+    def header(self, tab: str) -> List[str]:
+        """The tab's header row as written in the sheet ([] if the tab is absent)."""
+        if tab not in self.tab_titles():
+            return []
+        values = (
+            self.svc.spreadsheets().values()
+            .get(spreadsheetId=self.sid, range=f"{tab}!1:1")
+            .execute().get("values", [[]])
+        )
+        return values[0] if values else []
 
     # -- reads ----------------------------------------------------------
     def read_rows(self, tab: str) -> List[Dict[str, Any]]:

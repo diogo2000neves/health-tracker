@@ -1,4 +1,27 @@
-"""HTTP ingest service: meal photos + subjective-feel logging.
+"""HTTP ingest service: meal photos, body-composition screenshots, subjective feel.
+
+Everything the phone sends arrives on ONE endpoint and is routed by what the image
+actually is, so the user has a single button and never has to decide which kind of
+thing they are logging.
+
+POST /ingest (X-Auth-Token) — a **screenshot of the smart-scale app**:
+  Gemini's first job on every image is to classify it (see ROUTER_PREFIX). A
+  screenshot of the scale app's result screen is transcribed — all ten metrics the
+  scale computes from bioimpedance (weight, BMI, body fat, subcutaneous fat,
+  visceral fat, body water, muscle mass, bone mass, BMR, metabolic age) — and
+  merged into `daily_summary`'s body columns.
+
+  The screen prints the reading's own date/time, so the row is keyed on THAT day,
+  not on when the screenshot was sent: weigh at 07:00, send at noon, it still lands
+  on the right day, and re-sending an old screenshot rewrites its own historical
+  row instead of today's. Sending a fresh reading for a day just replaces it.
+  Nothing is archived to Drive — the numbers *are* the data, and the screenshot is
+  still on the phone.
+
+  This replaced the Google Health API, which only ever exposed weight + body fat
+  (Fitbit strips the other eight on the way through) and still needed the phone app
+  opened to sync at all. Since opening the app is unavoidable, screenshotting it is
+  free — and it yields the full set, immediately, with no scheduled pull.
 
 POST /ingest (X-Auth-Token) — one or more meal photos, a text description, or
 a mix:
@@ -31,6 +54,7 @@ Auth model:
   * Gemini -> AI Studio key (billing-free project => free tier).
   * Sheets -> the runtime service account (Sheet is shared with it).
   * Drive  -> the *user's* OAuth token (service accounts have no Drive quota).
+    This is now the only user token in the system.
 
 Clients and required env are initialised lazily so this module imports cleanly
 in tests without credentials.
@@ -100,6 +124,29 @@ TEMPLATE_CONFIDENCE = 0.95
 # Rows excluded from all totals (kept in sync with src/run_daily.py NON_MEALS).
 NON_MEALS = {"not food", "analysis failed"}
 
+# The ten metrics the smart scale computes, each a daily_summary column (mirror of
+# src/sheets.py BODY_METRICS — the ingest service is a separate image and can't
+# import src; tests/test_ingest asserts they stay in step).
+#
+# The pair is a plausibility band for a human body. Reading digits off a phone
+# screen is the one place a model can be confidently, silently wrong — a misplaced
+# decimal turns 70.05 kg into 7005 kg and poisons every chart and trend downstream.
+# Anything outside its band is a misread, not a body, so it is dropped rather than
+# written. Bands are deliberately wide: they exist to catch OCR nonsense, not to
+# police what a body may be.
+BODY_METRICS: Dict[str, Tuple[float, float]] = {
+    "weight_kg": (20, 300),
+    "bmi": (8, 70),
+    "body_fat_pct": (2, 70),
+    "subcutaneous_fat_pct": (1, 60),
+    "visceral_fat": (1, 60),        # an index, not a unit
+    "body_water_pct": (20, 85),
+    "muscle_mass_kg": (10, 150),
+    "bone_mass_kg": (0.5, 10),
+    "bmr_kcal": (600, 5000),
+    "metabolic_age": (5, 120),      # years
+}
+
 # Strongest model first (accuracy over speed — response time isn't critical).
 # These are the strongest models available on the FREE tier; Pro models require
 # a paid plan (429 on the free key), so they're intentionally not here. If you
@@ -152,6 +199,29 @@ NUTRIENTS_UG = [
     "folate_ug", "biotin_ug", "selenium_ug", "iodine_ug",
 ]
 NUTRIENT_KEYS = NUTRIENTS_G + NUTRIENTS_MG + NUTRIENTS_UG
+
+# Prepended to every prompt that carries images. One button on the phone sends
+# both meal photos and scale screenshots, so the model's first job is to say which
+# it is looking at — a hard fork, decided before any analysis, so the two rubrics
+# below never bleed into each other. The distinction is visually trivial (a UI
+# screenshot full of numbers vs. food), which is what makes it safe to fold into
+# the single call the meal path already makes: no extra latency, no second chance
+# to hit a free-tier 503.
+ROUTER_PREFIX = """FIRST, CLASSIFY THE IMAGE. Everything else follows from this.
+
+Is it a SCREENSHOT of a body-composition / smart-scale phone app — a list of body
+metrics like weight, BMI, body fat, muscle mass, bone mass, BMR, metabolic age?
+Or is it FOOD — a meal, a drink, a nutrition label, packaging?
+
+  * A screenshot of body metrics -> set `kind` to "body", follow SECTION B and
+    SECTION B ONLY. Return `items` as [] and `confidence` as 0. Do not analyse it
+    as food; there is no food in it.
+  * Anything else -> set `kind` to "meal", leave `body` empty, and follow
+    SECTION A.
+
+================================ SECTION A — MEAL ==============================
+
+"""
 
 PROMPT = """You are an expert nutritionist and food scientist doing computer-
 vision meal analysis. Estimate every ingredient in the photo, its cooked weight
@@ -326,6 +396,62 @@ SAVING A TEMPLATE — if the NOTE asks to save/remember this meal as a template
 (they weighed them on a scale — those grams are ground truth, never override
 them). Otherwise leave `save_template_name` empty."""
 
+# Appended last to every image prompt, as the other half of the ROUTER_PREFIX fork.
+#
+# This is transcription, not estimation — the exact opposite discipline to SECTION
+# A, which spends 200 lines teaching the model to infer, assume and fill gaps. That
+# habit is poison here: the numbers are already on the screen and any "helpful"
+# inference corrupts a measurement. Hence the blunt, repeated NEVER-guess framing.
+#
+# The trap this prompt exists to defuse: these apps print a "since <date>" summary
+# of CHANGES at the top of the screen — "+ 5.35 kg Peso", "+ 1.7 BMI" — using the
+# SAME labels as the real readings, directly above them. Read naively, the user's
+# weight becomes 5.35 kg. Hence rule 2. _normalize_body's plausibility bands are
+# the backstop if it still slips through.
+BODY_SECTION = """
+
+============================ SECTION B — BODY METRICS ==========================
+(Only when `kind` is "body". Ignore SECTION A entirely — there is no food here.)
+
+You are transcribing a smart-scale app's result screen. This is OCR, NOT
+estimation. Report ONLY numbers you can actually read on screen. NEVER infer,
+derive, calculate or guess a value; if a metric is not shown, OMIT it. An omitted
+metric is fine. An invented one corrupts the record permanently.
+
+1) FIND THE MEASUREMENT TIMESTAMP. The screen shows the date and time of the
+reading, in the user's own language (e.g. "4 de julho de 2026 às 19:03" = 4 July
+2026, 19:03). Put it in `body.measured_at` as ISO 8601 local time
+"YYYY-MM-DDTHH:MM". Leave it empty ONLY if no date is shown anywhere.
+
+2) IGNORE THE "SINCE <DATE>" COMPARISON BLOCK. These apps show a summary of
+CHANGES near the top — numbers with a leading + or -, under a heading like "Desde
+6 de agosto de 2023" / "Since ...". Those are DIFFERENCES from an old baseline,
+not measurements, and they are labelled exactly like the real ones ("+ 5.35 kg
+Peso"). NEVER read a value from that block. Read only the metric list that sits
+BELOW the measurement date from step 1. If a value has a +/- sign in front of it,
+it is a delta — skip it.
+
+3) TRANSCRIBE EACH METRIC into `body`, copying the digits EXACTLY as displayed
+(70.05 stays 70.05 — never round it to 70.1). Labels appear in the user's own
+language; map them to these keys:
+  weight_kg              weight / peso — kg
+  bmi                    BMI / IMC
+  body_fat_pct           body fat / gordura corporal — %
+  subcutaneous_fat_pct   subcutaneous fat / gordura subcutânea — %
+  visceral_fat           visceral fat / gordura visceral — a bare index, no unit
+  body_water_pct         body water / água no corpo — %
+  muscle_mass_kg         muscle mass / massa muscular — kg
+  bone_mass_kg           bone mass / massa óssea — kg
+  bmr_kcal               BMR / basal metabolic rate / metabolismo basal — kcal
+  metabolic_age          metabolic age / idade metabólica — years
+Ignore any qualitative badge or commentary printed beside a value ("Elevado",
+"acima da média", "Normal") — transcribe the number only. Values are expected in
+the units listed; if one is shown in another unit (lb, st), convert it and say so
+in `reasoning`.
+
+In `reasoning`, list every metric you read together with the literal on-screen
+text you read it from, so the transcription can be audited afterwards."""
+
 # Text-only path: same schema and per-item rigour, but estimating from a written
 # description with NO photo. Confidence is capped low because there is no scale
 # reference to measure against — the numbers are informed guesses, not readings.
@@ -391,12 +517,33 @@ MEAL DESCRIPTION: {note}"""
 # never by the model, to avoid arithmetic errors.
 _NUTRIENT_PROPS = {k: types.Schema(type=types.Type.NUMBER) for k in NUTRIENT_KEYS}
 
+# The scale screenshot's ten metrics plus the reading's own timestamp. Every field
+# is optional: the model must omit anything it cannot actually read (see
+# BODY_SECTION), and _normalize_body drops whatever is implausible on top of that.
+BODY_RESPONSE_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    property_ordering=["measured_at", *BODY_METRICS],
+    properties={
+        # Local "YYYY-MM-DDTHH:MM" read off the screen — this is what decides which
+        # day's row the reading lands on.
+        "measured_at": types.Schema(type=types.Type.STRING),
+        **{k: types.Schema(type=types.Type.NUMBER) for k in BODY_METRICS},
+    },
+)
+
 RESPONSE_SCHEMA = types.Schema(
     type=types.Type.OBJECT,
-    property_ordering=["reasoning", "meal_time", "template", "template_scale",
-                       "save_template_name", "items", "confidence"],
+    property_ordering=["kind", "reasoning", "body", "meal_time", "template",
+                       "template_scale", "save_template_name", "items",
+                       "confidence"],
     properties={
+        # The ROUTER_PREFIX fork: "meal" or "body". Decided first, before any
+        # analysis, so the model commits to one rubric. Anything but "body" is
+        # treated as a meal — the safe default, and the overwhelmingly common case.
+        "kind": types.Schema(type=types.Type.STRING),
         "reasoning": types.Schema(type=types.Type.STRING),
+        # Filled only when kind == "body"; empty for every meal.
+        "body": BODY_RESPONSE_SCHEMA,
         # Optional "HH:MM" (24h local) inferred from a text note ("breakfast",
         # "lunch", or an explicit time). Empty when unknown / for photo meals.
         "meal_time": types.Schema(type=types.Type.STRING),
@@ -431,7 +578,7 @@ RESPONSE_SCHEMA = types.Schema(
         ),
         "confidence": types.Schema(type=types.Type.NUMBER),
     },
-    required=["reasoning", "items", "confidence"],
+    required=["kind", "reasoning", "items", "confidence"],
 )
 
 
@@ -459,8 +606,10 @@ def _sheets():
 
 @functools.lru_cache(maxsize=1)
 def _drive():
+    # The one user-identity token left in the system: a service account has no
+    # Drive storage quota of its own, so meal photos must be uploaded as the user.
     creds = Credentials.from_authorized_user_info(
-        json.loads(os.environ["HEALTH_OAUTH_TOKEN"])
+        json.loads(os.environ["DRIVE_OAUTH_TOKEN"])
     )
     if not creds.valid:
         creds.refresh(AuthRequest())
@@ -581,6 +730,74 @@ def _normalize_items(raw: Any) -> List[Dict[str, Any]]:
     return items
 
 
+# -- body composition (the scale screenshot) -----------------------------------
+def _normalize_body(raw: Any) -> Dict[str, float]:
+    """Keep the metrics the model actually read, discarding anything that isn't a
+    plausible human value.
+
+    This is the load-bearing guard on the body path. OCR fails silently and
+    confidently — a dropped decimal reads as 7005 kg, and the "+ 5.35 kg" delta
+    printed above the real weight reads as a 5 kg body. Either would sail into the
+    sheet and wreck every downstream trend, so a value outside its band in
+    BODY_METRICS is thrown away and logged rather than trusted."""
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, float] = {}
+    for key, (low, high) in BODY_METRICS.items():
+        value = raw.get(key)
+        # bool is an int subclass — exclude it, a True weight is not 1 kg.
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            continue
+        try:
+            value = round(float(value), 2)
+        except (ValueError, OverflowError):  # runaway number -> drop, never crash
+            continue
+        if low <= value <= high:
+            out[key] = value
+        else:
+            app.logger.warning(
+                "body metric %s=%s outside plausible %s-%s — dropped as a misread",
+                key, value, low, high)
+    return out
+
+
+def _resolve_measured_at(raw: Any, now: datetime) -> datetime:
+    """The reading's own timestamp, as printed on the app screen.
+
+    This is what makes the screenshot self-dating: the row is keyed on when the
+    user actually stepped on the scale, not on when they got round to sending the
+    photo. Falls back to `now` when the screen shows no date, and never trusts a
+    future timestamp (a clock-skewed screenshot must not create tomorrow's row)."""
+    text = str(raw or "").strip()
+    if not text:
+        return now
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        app.logger.warning("unparseable measured_at %r — using now", text[:40])
+        return now
+    if parsed.tzinfo is None:  # the screen prints local wall-clock time
+        parsed = parsed.replace(tzinfo=now.tzinfo)
+    return parsed if parsed <= now else now
+
+
+def _body_row(body: Dict[str, float], measured: datetime) -> Dict[str, Any]:
+    """The daily_summary columns a reading fills, keyed on its own local day.
+
+    `lean_mass_kg` is derived here rather than read: the app doesn't show it, but
+    it's the number that actually matters for body recomposition (it's what should
+    hold steady while weight falls), so the sheet stores it alongside the rest."""
+    row: Dict[str, Any] = {
+        "date": measured.date().isoformat(),
+        **body,
+        "body_measured_at": measured.isoformat(timespec="minutes"),
+    }
+    weight, fat = body.get("weight_kg"), body.get("body_fat_pct")
+    if weight is not None and fat is not None:
+        row["lean_mass_kg"] = round(weight * (1 - fat / 100), 2)
+    return row
+
+
 def _meal_from_items(items: List[Dict[str, Any]], confidence: Any,
                      model: str) -> Dict[str, Any]:
     """Assemble the meal record (row totals = sum over items)."""
@@ -684,9 +901,15 @@ def _gen_config(timeout_ms: Optional[int] = None) -> "types.GenerateContentConfi
 
 def _run_models(contents: List[Any], *, models: Optional[List[str]] = None,
                 retries: Optional[int] = None, timeout_ms: Optional[int] = None,
-                deadline_s: Optional[float] = None) -> Dict[str, Any]:
+                deadline_s: Optional[float] = None,
+                allow_body: bool = True) -> Dict[str, Any]:
     """Send `contents` (photos+prompt or a text prompt) through the fallback
-    chain, strongest model first, and assemble the meal from the JSON reply.
+    chain, strongest model first, and assemble the record from the JSON reply.
+
+    Returns either a meal record (`kind` == "meal") or a body-composition record
+    (`kind` == "body"), depending on what the model says the image was. `allow_body`
+    is False on the text-only path, where there is no image to be a screenshot of
+    and a "body" verdict could only ever be a hallucination.
 
     The `quick` sync path and the background worker share this by overriding the
     chain / retries / per-call timeout / wall-clock deadline: the phone gets a
@@ -741,8 +964,22 @@ def _run_models(contents: List[Any], *, models: Optional[List[str]] = None,
                     "model %s produced unparseable output, next model: %s",
                     model, perr)
                 break
+            # The ROUTER_PREFIX fork. Only an explicit "body" verdict on a request
+            # that actually carried an image takes the body path; everything else
+            # is a meal, which is both the common case and the safe default.
+            if allow_body and str(data.get("kind") or "").strip().lower() == "body":
+                body = _normalize_body(data.get("body"))
+                app.logger.info("%s read a scale screenshot: %d metric(s)",
+                                model, len(body))
+                return {
+                    "kind": "body", "model": model, "body": body,
+                    "measured_at": str(
+                        (data.get("body") or {}).get("measured_at") or "").strip(),
+                }
+
             items = _normalize_items(data.get("items"))
             meal = _meal_from_items(items, data.get("confidence"), model)
+            meal["kind"] = "meal"
             meal["meal_time"] = str(data.get("meal_time") or "").strip()
             meal["template"] = str(data.get("template") or "").strip()
             meal["template_scale"] = data.get("template_scale")
@@ -764,31 +1001,37 @@ def _templates_block(templates: Optional[List[Dict[str, Any]]]) -> str:
 
 def _build_prompt(num_images: int, note: str, now: Optional[datetime] = None,
                   templates: Optional[List[Dict[str, Any]]] = None) -> str:
-    """Assemble the vision prompt: the base rubric, plus a multi-image block when
-    the log has several photos, the authoritative note block when given, a
-    meal-time block (with `now`) so a photo logged after the fact lands at the
-    right hour, and the template match/save rules."""
-    prompt = PROMPT
+    """Assemble the vision prompt as ROUTER + SECTION A (meal) + SECTION B (body).
+
+    Section A is the meal rubric plus its conditional blocks: a multi-image block
+    when the log has several photos, the authoritative note block when given, a
+    meal-time block (with `now`) so a photo logged after the fact lands at the right
+    hour, and the template match/save rules. Section B (transcribing a scale
+    screenshot) is constant and always last. The router at the top picks one."""
+    prompt = ROUTER_PREFIX + PROMPT
     if num_images > 1:
         prompt += MULTI_IMAGE_SUFFIX.format(n=num_images)
     if note:
         prompt += NOTE_SUFFIX.format(note=note)
         if now is not None:
             prompt += MEAL_TIME_SUFFIX.format(now_hhmm=now.strftime("%H:%M"))
-    return prompt + _templates_block(templates)
+    return prompt + _templates_block(templates) + BODY_SECTION
 
 
 def analyze(images: List[Tuple[bytes, str]], note: str = "",
             now: Optional[datetime] = None,
             templates: Optional[List[Dict[str, Any]]] = None,
             **kw) -> Dict[str, Any]:
-    """Analyse one or more photos of a single meal, reasoning across all of them.
+    """Analyse the image(s) the phone sent — either a meal or a scale screenshot;
+    the model decides which (see ROUTER_PREFIX) and the returned record's `kind`
+    says what came back.
 
-    A `note`, if given, is appended as authoritative context that overrides the
-    visual estimate where the two conflict; with `now` it can also infer the
-    meal's hour from the note. `templates` lets the model recognise a dish the
-    user has weighed and hand back its name instead of estimating. `kw` overrides
-    (models/retries/timeout_ms/deadline_s) let the sync path run a quick pass."""
+    For a meal, all images are reasoned across together. A `note`, if given, is
+    appended as authoritative context that overrides the visual estimate where the
+    two conflict; with `now` it can also infer the meal's hour from the note.
+    `templates` lets the model recognise a dish the user has weighed and hand back
+    its name instead of estimating. `kw` overrides (models/retries/timeout_ms/
+    deadline_s) let the sync path run a quick pass."""
     parts: List[Any] = [types.Part.from_bytes(data=img, mime_type=mime)
                         for img, mime in images]
     parts.append(_build_prompt(len(images), note, now, templates))
@@ -804,7 +1047,9 @@ def analyze_text(note: str, now: datetime,
     costume")."""
     prompt = (TEXT_PROMPT.format(note=note, now_hhmm=now.strftime("%H:%M"))
               + _templates_block(templates))
-    return _run_models([prompt], **kw)
+    # No image => nothing that could be a scale screenshot; a "body" verdict here
+    # could only be a hallucination, so the fork is closed off entirely.
+    return _run_models([prompt], allow_body=False, **kw)
 
 
 def _quick_kwargs() -> Dict[str, Any]:
@@ -881,8 +1126,11 @@ def download_photos(refs: List[Dict[str, str]]) -> List[Tuple[bytes, str]]:
 
 # -- Sheets --------------------------------------------------------------------
 def _read_tab(tab: str) -> List[List[Any]]:
+    # Through BZ (78 columns): daily_summary is already 40 wide and grows every time
+    # a metric is added, and a short range would silently truncate the header — so
+    # a column past the cut would look "missing" and its writes would land nowhere.
     return _execute(lambda: _sheets().spreadsheets().values().get(
-        spreadsheetId=_sid(), range=f"{tab}!A1:Z",
+        spreadsheetId=_sid(), range=f"{tab}!A1:BZ",
         valueRenderOption="UNFORMATTED_VALUE")).get("values", [])
 
 
@@ -1156,26 +1404,48 @@ def append_meal(nut: Dict[str, Any], photo_url: str, when: datetime,
             app.logger.warning("meals sort failed (non-fatal)", exc_info=True)
 
 
-def _write_daily_cell(day: str, header_name: str, value: Any) -> None:
-    """Set one cell on daily_summary's row for `day` (appends the row if new)."""
-    values = _read_tab(DAILY_TAB)
-    header = values[0] if values else []
-    if header_name not in header:
-        raise RuntimeError(f"column {header_name!r} missing from {DAILY_TAB}")
-    idx = header.index(header_name)
+def _col_letter(index: int) -> str:
+    """0-based column index -> A1 letter, e.g. 0->'A', 26->'AA'."""
     letters = ""
-    n = idx + 1
-    while n:
-        n, rem = divmod(n - 1, 26)
+    index += 1
+    while index:
+        index, rem = divmod(index - 1, 26)
         letters = chr(ord("A") + rem) + letters
-    for i, row in enumerate(values[1:], start=2):
+    return letters
+
+
+def write_daily(day: str, values: Dict[str, Any]) -> None:
+    """Merge named columns into daily_summary's row for `day`, appending the row if
+    that day is new.
+
+    Only the given columns are touched, which is what lets three independent writers
+    share one row: the scale screenshot owns the body columns, /feel owns
+    subjective_feel, and the daily job owns the nutrition roll-up. Re-sending a
+    reading for a day simply overwrites its own columns again.
+
+    Raises if a column is missing rather than guessing at a position — a stale sheet
+    must fail loudly, not shift every value one column to the left."""
+    grid = _read_tab(DAILY_TAB)
+    header = grid[0] if grid else []
+    missing = [name for name in values if name not in header]
+    if missing:
+        raise RuntimeError(
+            f"column(s) {missing} missing from {DAILY_TAB} — run `python -m src.maintenance`")
+
+    for rownum, row in enumerate(grid[1:], start=2):
         if row and str(row[0]) == day:
-            _execute(lambda i=i: _sheets().spreadsheets().values().update(
-                spreadsheetId=_sid(), range=f"{DAILY_TAB}!{letters}{i}",
-                valueInputOption="RAW", body={"values": [[value]]}))
+            data = [{"range": f"{DAILY_TAB}!{_col_letter(header.index(name))}{rownum}",
+                     "values": [[value]]}
+                    for name, value in values.items()]
+            _execute(lambda: _sheets().spreadsheets().values().batchUpdate(
+                spreadsheetId=_sid(),
+                body={"valueInputOption": "RAW", "data": data}))
             return
+
     new_row: List[Any] = [""] * len(header)
-    new_row[0], new_row[idx] = day, value
+    new_row[0] = day
+    for name, value in values.items():
+        new_row[header.index(name)] = value
     _execute(lambda: _sheets().spreadsheets().values().append(
         spreadsheetId=_sid(), range=f"{DAILY_TAB}!A1",
         valueInputOption="RAW", insertDataOption="INSERT_ROWS",
@@ -1347,6 +1617,47 @@ def _resolve_templates(nut: Dict[str, Any], note: str, when: datetime,
     return apply_template(nut, templates)
 
 
+def _finalize_body(rec: Dict[str, Any], now: datetime):
+    """Write a scale reading into daily_summary and tell the phone what landed.
+
+    Keyed on the reading's own date (from the screen), not on `now` — see
+    _resolve_measured_at. Nothing is archived to Drive: unlike a meal photo, whose
+    estimate might need re-deriving from the original, these numbers ARE the data,
+    and the screenshot is still sitting in the user's camera roll."""
+    body = rec.get("body") or {}
+    if not body:
+        return jsonify({
+            "summary": "That looks like a scale screenshot, but no readable "
+                       "metrics were found — nothing logged.",
+            "kind": "body", "not_read": True,
+        }), 200
+
+    measured = _resolve_measured_at(rec.get("measured_at"), now)
+    row = _body_row(body, measured)
+    day = row.pop("date")
+    write_daily(day, row)
+
+    def shown(key: str, fmt: str) -> Optional[str]:
+        return fmt.format(body[key]) if key in body else None
+
+    highlights = [text for text in (
+        shown("weight_kg", "{:g} kg"),
+        shown("body_fat_pct", "{:g}% fat"),
+        shown("muscle_mass_kg", "{:g} kg muscle"),
+        shown("bmi", "BMI {:g}"),
+        shown("visceral_fat", "visceral {:g}"),
+        shown("bmr_kcal", "BMR {:.0f} kcal"),
+    ) if text]
+    summary = (
+        f"⚖️ {measured.strftime('%-d %b %H:%M')} — " + " · ".join(highlights)
+        + f" · {len(body)} metrics saved to {day}"
+    )
+    app.logger.info("body: %d metric(s) -> %s", len(body), day)
+    return jsonify({"summary": summary, "kind": "body", "date": day,
+                    "measured_at": row["body_measured_at"], "body": body,
+                    "lean_mass_kg": row.get("lean_mass_kg")}), 200
+
+
 def _finalize(nut: Dict[str, Any], photo_url: str, when: datetime,
               image_sha: str, note: str, text_only: bool,
               todays: List[Dict[str, Any]]):
@@ -1447,6 +1758,13 @@ def ingest():
         app.logger.info("quick analysis missed, deferring to worker: %s", err)
         nut, quick_ok = None, False
 
+    # A scale screenshot short-circuits here, before any Drive work: it needs no
+    # archive, no meals row and no template logic — just the numbers, straight into
+    # the day's row. Transcription is also far quicker than nutrition reasoning, so
+    # the quick pass essentially always carries it.
+    if quick_ok and nut.get("kind") == "body":
+        return _finalize_body(nut, when)
+
     # Archive now — the sheet needs the links and the worker needs the bytes.
     archived: List[Dict[str, str]] = []
     if images:
@@ -1523,6 +1841,13 @@ def process():
         app.logger.warning("worker attempt %d failed, will retry: %s", attempt + 1, err)
         return jsonify({"error": str(err)}), 500  # 5xx => Cloud Tasks retries
 
+    # The quick pass never got far enough to classify, so a scale screenshot can
+    # reach the worker too (rare — it only takes a Gemini outage at the wrong
+    # moment). It was archived to Drive on the way in as if it were a meal, which
+    # is harmless: we just ignore the photo and write the metrics.
+    if nut.get("kind") == "body":
+        return _finalize_body(nut, when)
+
     nut = _resolve_templates(nut, note, when, templates)
     return _finalize(nut, photo_url, when, image_sha, note, text_only, todays)
 
@@ -1547,6 +1872,6 @@ def feel():
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
         return jsonify({"error": "date must be YYYY-MM-DD"}), 400
 
-    _write_daily_cell(day, "subjective_feel", "" if clearing else score)
+    write_daily(day, {"subjective_feel": "" if clearing else score})
     return jsonify({"date": day,
                     "subjective_feel": None if clearing else score}), 200

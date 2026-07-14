@@ -8,8 +8,14 @@
 A **zero-friction personal health dashboard**. The golden rule: I only perform the
 inevitable physical actions of my day (step on the scale, wear my tracker, snap a
 photo of what I eat). *Everything else* — collection, extraction, organisation —
-is automated background work. If I have to open apps, type data, or export
-reports, the system has failed.
+is automated background work. If I have to type data or export reports, the system
+has failed.
+
+The rule is about *added* effort, not zero taps. The scale forces its app open to
+sync at all — so a screenshot of that app, sent with the same button as a meal
+photo, adds nothing to the ritual while yielding three times the data (see source
+1). Prefer capturing what the user is *already forced to do* over building a
+pipeline around it.
 
 The end goal is to **correlate nutrition against physique on a per-day basis**:
 what I ate vs what my body did.
@@ -22,29 +28,51 @@ Google Sheet + Google Drive that I own and can download anytime.
 
 | # | Source | Hardware / input | Status |
 |---|---|---|---|
-| 1 | **Body composition** | Tefal **Goodvibes** smart scale | ✅ Built (weight + body-fat only) |
+| 1 | **Body composition** | Tefal **Goodvibes** smart scale → app screenshot | ✅ Built (all 10 metrics) |
 | 2 | **Biometrics / activity** | **Fitbit Air** (steps, sleep, HR) | ❌ **NOT built yet** |
 | 3 | **Nutrition** | iPhone camera → meal photos | ✅ Built |
 
-### Source 1 — Scale (weight, body fat)
-Scale → Goodvibes app → Fitbit cloud → **Google Health**. A daily Cloud Run **Job**
-pulls it via the **Google Health API** and writes one row per day.
+### Source 1 — Scale (10 metrics, via a screenshot)
+Step on the scale, open the Goodvibes app (which is the only way it syncs at all),
+**screenshot the result screen and send it through the same Shortcut button as a
+meal photo**. The ingest service recognises it is a scale screenshot rather than
+food, reads every value off it with Gemini, and writes them straight into
+`daily_summary`.
 
-**Hard limitation (already researched, don't redo):** the scale measures ~14
-metrics (visceral fat, body water, muscle/bone mass, BMR, metabolic age…), but
-**only weight, body-fat and height survive** the trip to Google Health — Fitbit
-strips the rest. The Google Health API exposes *only* the data types `weight`,
-`body-fat`, `height`. The rich metrics are computed on-device from bioimpedance
-and exist only inside the Goodvibes app (no public API). The only way to capture
-them would be reading the scale's **Bluetooth** signal directly with an always-on
-device (e.g. `ble-scale-sync` on a Raspberry Pi). **Decision: not doing it.** We
-deliberately keep just **weight + body_fat_pct**.
+We capture all ten metrics the scale computes: `weight_kg`, `bmi`,
+`body_fat_pct`, `subcutaneous_fat_pct`, `visceral_fat`, `body_water_pct`,
+`muscle_mass_kg`, `bone_mass_kg`, `bmr_kcal`, `metabolic_age` — plus a derived
+`lean_mass_kg` and the reading's own `body_measured_at` timestamp.
+
+**Why not the Google Health API (we used to, don't go back):** the scale measures
+~14 metrics, but **only weight, body-fat and height survive** the trip through
+Fitbit's cloud into Google Health — the rest are computed on-device from
+bioimpedance and exist only inside the Goodvibes app, which has no public API.
+Worse, the scale **only syncs while the app is open in the foreground anyway**. So
+the API path cost a daily OAuth pull, a scheduled job and a token that couldn't be
+shared with Drive — and still gave us 3 metrics out of 10, only if we'd remembered
+to open the app. Since opening the app is unavoidable, screenshotting it is free.
+The screenshot gives the full set, immediately, with no scheduled pull and no user
+OAuth. **The Google Health API integration has been deleted.**
+
+Two properties worth knowing:
+* **The screenshot is self-dating.** The app prints the reading's date and time
+  ("4 de julho de 2026 às 19:03"); the row is keyed on **that**, not on when the
+  photo was sent. Weigh at 07:00, send at noon — it still lands on the right day.
+  Re-sending an old screenshot rewrites its own historical row, which also means
+  scrolling the app's history and screenshotting old readings **backfills** them.
+* **The delta block is a trap.** These apps print a "since \<date\>" summary of
+  *changes* above the real values, using the same labels (`+ 5.35 kg Peso`). The
+  prompt explicitly rejects it, and `_normalize_body` enforces plausibility bands
+  (weight 20–300 kg, BMI 8–70, …) so a misread is dropped rather than written.
 
 ### Source 2 — Fitbit Air (NOT built)
-This is the next obvious feature. It should reuse the *same* Google Health API and
-the *same* OAuth token — just different `dataTypes` (steps, sleep, heart rate) and
-extra scopes (`activity_and_fitness.readonly`, `sleep.readonly`). Unlike the
-scale's body composition, this biometric data **is** fully available via the API.
+The next obvious feature, and now the *only* reason to bring back a user OAuth
+token for health data. Steps, sleep stages, HRV, SpO2 and resting HR **are** fully
+available via the **Google Health API** (unlike the scale's body composition),
+using scopes `activity_and_fitness.readonly` + `sleep.readonly`. It would fill the
+readiness columns through the same merge-upsert. Note the token would have to be
+**health-only** — see gotcha 8.
 
 ### Source 3 — Meal photos
 iPhone **Shortcut** (a button in Control Center) → takes a photo → HTTP **POST**s
@@ -83,6 +111,7 @@ capture time (the model leaves `meal_time` empty).
               ┌────────────────── Google Sheet "Health Tracker" ──────────────────┐
               │ `daily_summary` : one row/day (readiness + nutrition + physique)  │
               │ `meals`         : one row/photo (per-ingredient `items` JSON)     │
+              │ `templates`     : measured, reusable meals                        │
               │ `dashboard`     : stat cells + embedded charts                    │
               │ `insights`      : weekly AI trend summaries                       │
               └────────────────────────────────────────────────────────────────────┘
@@ -90,14 +119,23 @@ capture time (the model leaves `meal_time` empty).
   Cloud Scheduler    │   Cloud Scheduler  │                       │
   (07:00 Lisbon) ─► JOB   (Sun 20:00) ─► JOB              SERVICE ◄── iPhone Shortcut
        health-tracker-daily   health-tracker-weekly   health-tracker-ingest
-               │                      │                    │  │      (POST /ingest photo,
-       Google Health API         Gemini API        Gemini API │       POST /feel score)
-       (weight, body-fat)        (insights)       (nutrition) │
-                                                       Google Drive (photo archive)
+               │                      │                    │  │   (POST /ingest — a meal
+        (Sheet only —            Gemini API        Gemini API │    photo OR a scale
+         no user OAuth,          (insights)      (nutrition + │    screenshot; the model
+         no health API)                           body OCR)   │    tells them apart.
+               │                                              │    POST /feel score)
+    rolls `meals` up into                            Google Drive (meal photos only)
+    the nutrition columns
 ```
 
-- **Job vs Service:** Jobs are *pulls* on a timer (scale data; weekly analysis).
-  The Service is a *push* endpoint that waits for the phone. All scale to zero.
+- **Job vs Service:** the Service is a *push* endpoint that waits for the phone —
+  it is where **all** user data now enters the system (meals *and* body
+  composition). The Jobs are timers that only ever *derive* from what's already in
+  the Sheet. All scale to zero.
+- **Why the daily job still exists** (it is no longer a "sync"): nutrition uses a
+  **waking-day** grain and a day is only totalled once it is *over* (see below), so
+  something has to run after the day ends. That is its whole remaining purpose,
+  plus refreshing the dashboard. It holds no OAuth token and calls no external API.
 - **Meal ingestion is hybrid (reliability):** `/ingest` does a quick single-model
   pass for **instant macros** when Gemini is fast; if it's slow/unavailable, it
   archives the photos and enqueues a **Cloud Tasks** job (queue `meal-ingest`,
@@ -120,17 +158,20 @@ capture time (the model leaves `meal_time` empty).
   **`europe-west1`**. Log-based alert policies email on any job error, ingest
   error, or failed build.
 
-## 4. Auth model (three identities, least-privilege)
+## 4. Auth model (least-privilege)
 
 | What | Identity | Why |
 |---|---|---|
-| Read Google Health API | **User OAuth token** | health data requires *user* consent; a service account can't read it |
 | Write the Sheet | **Service account** | the Sheet is shared with it as Editor |
-| Upload photos to Drive | **User OAuth token** (`drive.file`) | ⚠️ a service account has **zero Drive storage quota** — uploads must run as the user to use their 5 TB |
+| Upload photos to Drive | **User OAuth token** (`drive.file` only) | ⚠️ a service account has **zero Drive storage quota** — uploads must run as the user to use their 5 TB |
 | Call Gemini | **API key** | free tier |
 
 Service account: `health-tracker-job@health-tracker-501322.iam.gserviceaccount.com`
 (has no project-level roles; only resource-level secret access + run.invoker).
+
+Dropping Google Health left **exactly one user token** in the system, held by the
+ingest service purely to write meal photos into the user's own Drive
+(`drive-oauth-token`). The daily job now runs with no user identity at all.
 
 ## 5. Key resources
 
@@ -139,32 +180,38 @@ Service account: `health-tracker-job@health-tracker-501322.iam.gserviceaccount.c
 | GCP project | `health-tracker-501322` (billing enabled) |
 | Cloud Run Job | `health-tracker-daily` (europe-west1) |
 | Cloud Run Service | `health-tracker-ingest` (europe-west1, public URL, gated by `X-Auth-Token` header) |
-| Scheduler | `health-tracker-daily-trigger` — `0 7 * * *` Europe/Lisbon |
+| Scheduler | `health-tracker-daily-trigger` — `0 7 * * *` Europe/Lisbon (nutrition roll-up only) |
 | Cloud Tasks queue | `meal-ingest` (europe-west1) — background meal analysis, 8 attempts / ~15 min backoff; SA has `cloudtasks.enqueuer` |
 | Sheet ID | `1JQWYkSgzU3F4mqR7BRE8wfoBif0xLU7uBM0iwHwxNAk` |
 | Drive photo folder | `1i0wYuIzcD7ifs_wVQVdsUpI26vGmJdfP` ("Health Tracker Meals", owned by user) |
-| Secrets (Secret Manager) | `health-oauth-token`, `ingest-token`, `gemini-api-key` |
+| Secrets (Secret Manager) | `drive-oauth-token`, `ingest-token`, `gemini-api-key` |
 | Code (master copy) | `/Users/dneves/Health Tracker/` — `src/` (job), `ingest/` (service) |
 
 ### Sheet schema
-- **`daily_summary`**: `date` | readiness (`sleep_score, hrv_ms, spo2_pct,
-  skin_temp_dev, subjective_feel`) | macros (`total_cals_in, total_protein_g,
-  total_carbs_g, total_fat_g`) | **15 Tier-1 micronutrient totals**
-  (`total_fiber_g, total_sugar_g, total_saturated_fat_g, total_sodium_mg,
+- **`daily_summary`** (40 columns): `date` | readiness (`sleep_score, hrv_ms,
+  spo2_pct, skin_temp_dev, subjective_feel`) | macros (`total_cals_in,
+  total_protein_g, total_carbs_g, total_fat_g`) | **15 Tier-1 micronutrient
+  totals** (`total_fiber_g, total_sugar_g, total_saturated_fat_g, total_sodium_mg,
   total_potassium_mg, total_calcium_mg, total_iron_mg, total_magnesium_mg,
   total_zinc_mg, total_vitamin_c_mg, total_vitamin_d_ug, total_vitamin_b12_ug,
   total_vitamin_a_ug, total_folate_ug, total_omega3_g`) | activity
-  (`total_active_mins, steps`) | body (`weight_kg, body_fat_pct, lean_mass_kg`) |
-  `updated_at`. Column order lives in `src.sheets.DAILY_HEADERS`.
+  (`total_active_mins, steps`) | **body** (`weight_kg, bmi, body_fat_pct,
+  subcutaneous_fat_pct, visceral_fat, body_water_pct, muscle_mass_kg,
+  bone_mass_kg, bmr_kcal, metabolic_age, lean_mass_kg, body_measured_at`) |
+  `updated_at`. Column order lives in `src.sheets.DAILY_HEADERS`; the scale metrics
+  are `src.sheets.BODY_METRICS`, **mirrored** in `ingest/main.py BODY_METRICS`
+  (which also owns their plausibility bands) because ingest is a separate image
+  and can't import `src`. A test asserts the two stay in step.
   - **Merge-upsert keyed on `date`** — each source fills only its own columns
-    (scale → physique, meals roll-up → nutrition, /feel → subjective_feel;
+    (scale screenshot → body, meals roll-up → nutrition, /feel → subjective_feel;
     Fitbit biometrics will fill the readiness block). Never overwrites a column
     it doesn't own.
   - Nutrition columns are keyed on the **waking day** (05:00 cutoff) and only
     written once that day is **over**, so a late-night snack joins the right day
     and today's row shows no nutrition total until tomorrow morning's run.
-  - Multiple weigh-ins/day → the **first of the local day** wins;
-    `lean_mass_kg = weight_kg × (1 − body_fat_pct/100)` is derived by the job.
+  - Body columns are keyed on the reading's **own** date, read off the screenshot.
+    Several weigh-ins in a day → the **last one sent wins** (it just overwrites).
+    `lean_mass_kg = weight_kg × (1 − body_fat_pct/100)` is derived at write time.
   - The daily job re-rolls a trailing `HEALTH_RECONCILE_DAYS` (7) window; set 0
     + `HEALTH_START_DATE=2000-01-01` for a full backfill run.
 - **`meals`**: `datetime | foods | items | calories | protein_g | carbs_g | fat_g |
@@ -238,40 +285,49 @@ Google One storage (from AI Pro).
 
 ## 8. Gotchas learned (don't rediscover these)
 
-1. Legacy **Fitbit Web API dies Sept 2026**; Google Fit REST dies end-2026. Use the
-   **Google Health API** (`https://health.googleapis.com/v4`).
-2. Google Health response shape is **nested**: `dataPoints[].weight.weightGrams`,
-   `.weight.sampleTime.physicalTime` (UTC); body-fat is `.bodyFat.percentage`.
-3. OAuth app must be **In production** (not "Testing"), or refresh tokens expire
+1. **The Goodvibes scale only syncs while its app is open in the foreground.** No
+   amount of cloud plumbing avoids opening the app — which is exactly why
+   screenshotting it costs nothing extra, and why the Google Health pull was never
+   the "zero-touch" win it looked like.
+2. **Body composition dies in transit to Google Health.** Fitbit's cloud keeps only
+   weight/body-fat/height; the other seven metrics never leave the phone app. Don't
+   re-attempt the API route for body composition — it cannot work. (Fitbit Air's
+   *biometrics* are a different story and **are** available; see source 2.)
+3. **Reading numbers off a screen is where a model lies most convincingly.** Always
+   pair OCR with a plausibility band (`ingest/main.py BODY_METRICS`) and never let
+   an unvalidated number reach the sheet. The specific trap here is the app's
+   "since \<date\>" **delta block**, which uses identical labels to the real values.
+4. OAuth app must be **In production** (not "Testing"), or refresh tokens expire
    after 7 days.
-4. Cloud Build fails until the **default compute SA** gets `roles/cloudbuild.builds.builder`.
-5. `gcloud --set-env-vars` **breaks on commas inside a value** — use the delimiter
+5. Cloud Build fails until the **default compute SA** gets `roles/cloudbuild.builds.builder`.
+6. `gcloud --set-env-vars` **breaks on commas inside a value** — use the delimiter
    syntax: `--set-env-vars "^@^VAR=a,b@VAR2=c"`.
-6. Service accounts have **no Drive storage quota** → Drive uploads must use the
-   user's OAuth token.
-7. **Google Photos API cannot read your library** (since Mar 2025) and **iCloud has
-   no server API** — that's why photos are POSTed directly to our endpoint.
+7. Service accounts have **no Drive storage quota** → Drive uploads must use the
+   user's OAuth token. This is the only reason a user token still exists.
 8. **The Google Health API rejects any token that also carries a Drive scope**
-   (`403 DISALLOWED_OAUTH_SCOPES`). The daily job is pinned to
-   `health-oauth-token:1` (health-only); ingest uses `latest` (health+drive).
-   One combined token can never serve both APIs.
-9. The sheet's **European locale renders decimals with commas** — every Sheets
-   read must use `valueRenderOption="UNFORMATTED_VALUE"`, or `float("7,8")`
-   silently zeroes the numbers. Avoid locale-sensitive formulas; charts and
-   stats are written via the API instead.
-10. A reading's day is its **local civil day** (`civilTime`/`utcOffset` from the
-    Health API), matching the Lisbon-local `datetime` in `meals`. Never `[:10]`
-    a UTC timestamp to get the day.
+   (`403 DISALLOWED_OAUTH_SCOPES`) — one token can never serve both. Moot today
+   (we hold a Drive-only token), but it will bite again the moment Fitbit Air
+   biometrics need a health token: it must be a **separate secret**, not an extra
+   scope on `drive-oauth-token`.
+9. **Google Photos API cannot read your library** (since Mar 2025) and **iCloud has
+   no server API** — that's why photos are POSTed directly to our endpoint.
+10. The sheet's **European locale renders decimals with commas** — every Sheets
+    read must use `valueRenderOption="UNFORMATTED_VALUE"`, or `float("7,8")`
+    silently zeroes the numbers. Avoid locale-sensitive formulas; charts and
+    stats are written via the API instead.
+11. **Read ranges must be wide enough for the schema.** `daily_summary` is already
+    40 columns; an `A1:Z` read silently truncates the header, so a column past the
+    cut looks "missing" and its writes land nowhere. Reads go to `BZ`.
+12. A day is the **local civil day** (Europe/Lisbon), never the UTC day. Never
+    `[:10]` a UTC timestamp to get it.
 
 ## 9. Open TODOs
 
-1. **Fitbit Air biometrics** (steps, sleep stages, HRV, SpO2, resting HR) —
-   same Google Health API, new dataTypes + extra scopes
-   (`activity_and_fitness.readonly`, `sleep.readonly`). Requires a re-consent,
-   which is also the moment to do #2:
-2. **Token split** — mint a health-only token (with the new scopes) for the
-   jobs and a separate `drive.file`-only token (new secret `drive-oauth-token`)
-   for ingest; unpin the job from `health-oauth-token:1`; rotate the OAuth
-   **client secret** (it was once pasted in chat).
-3. Optional: mirror raw Health API payloads to a GCS bucket (bronze layer) for
-   provenance / re-derivation.
+1. **Fitbit Air biometrics** (steps, sleep stages, HRV, SpO2, resting HR) — the
+   Google Health API, new dataTypes, scopes `activity_and_fitness.readonly` +
+   `sleep.readonly`. Requires a fresh consent and a **new, health-only secret**
+   (see gotcha 8 — do not add the scopes to `drive-oauth-token`).
+2. Rotate the OAuth **client secret** (it was once pasted in chat).
+3. Optional: archive scale screenshots to Drive as a provenance/bronze layer. They
+   are deliberately *not* archived today — the transcribed numbers are the data,
+   and the screenshot is still in the camera roll.

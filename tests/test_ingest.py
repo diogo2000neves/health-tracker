@@ -41,10 +41,15 @@ def test_normalize_items_carries_cooking_method_when_present():
     assert "cooking_method" not in items[1]
 
 
-def test_response_schema_reasons_before_numbers():
-    # reasoning must be present and generated first so it conditions the numbers
+def test_response_schema_classifies_then_reasons_before_numbers():
+    order = ingest.RESPONSE_SCHEMA.property_ordering
+    # `kind` is decided first — the meal/body fork conditions everything after it.
+    assert order[0] == "kind"
+    assert "kind" in ingest.RESPONSE_SCHEMA.required
+    # then reasoning, still ahead of the numbers it is meant to condition
     assert "reasoning" in ingest.RESPONSE_SCHEMA.required
-    assert ingest.RESPONSE_SCHEMA.property_ordering[0] == "reasoning"
+    assert order.index("reasoning") < order.index("items")
+    assert order.index("reasoning") < order.index("confidence")
 
 
 def test_meal_from_items_totals_and_label():
@@ -158,7 +163,7 @@ def test_quick_kwargs_is_a_single_fast_pass(monkeypatch):
 
 def test_run_models_respects_model_override(monkeypatch):
     # the quick pass must call ONLY the model it's given, not the whole chain
-    fm = _fake_genai([_GOOD_BODY], monkeypatch)
+    fm = _fake_genai([_GOOD_MEAL], monkeypatch)
     monkeypatch.setenv("GEMINI_MODELS", "a,b,c")
     ingest._run_models(["prompt"], models=["only-this"], retries=1)
     assert fm.calls == ["only-this"]
@@ -416,9 +421,11 @@ def test_extract_images_collects_every_multipart_file_in_order():
 
 
 def test_build_prompt_adds_multi_and_note_blocks_only_when_relevant():
-    # one photo, no note => the base rubric (+ the always-on save-template rule)
+    # one photo, no note => router + base rubric (+ the always-on save-template
+    # rule) + the body section, which every image prompt carries
     plain = ingest._build_prompt(1, "")
-    assert plain == ingest.PROMPT + ingest.TEMPLATE_SAVE_SUFFIX
+    assert plain == (ingest.ROUTER_PREFIX + ingest.PROMPT
+                     + ingest.TEMPLATE_SAVE_SUFFIX + ingest.BODY_SECTION)
     assert "MULTIPLE IMAGES" not in plain and "NOTE:" not in plain
     # several photos => the multi-image block, carrying the count
     multi = ingest._build_prompt(3, "")
@@ -457,7 +464,7 @@ def test_multi_image_dedup_hash_is_combined_and_order_sensitive():
 
 
 # -- model loop hardening (the 504 timeout fix) --------------------------------
-_GOOD_BODY = ('{"reasoning":"x","items":[{"name":"rice","portion_g":100,'
+_GOOD_MEAL = ('{"reasoning":"x","items":[{"name":"rice","portion_g":100,'
               '"calories":130,"protein_g":2,"carbs_g":28,"fat_g":0}],'
               '"confidence":0.8}')
 
@@ -500,7 +507,7 @@ def test_gen_config_caps_output_and_sets_timeout(monkeypatch):
 
 def test_unparseable_output_skips_to_next_model_without_retrying(monkeypatch):
     # model 1 emits junk; we must jump to model 2, NOT retry model 1 three times
-    fm = _fake_genai(["{ truncated json", _GOOD_BODY], monkeypatch)
+    fm = _fake_genai(["{ truncated json", _GOOD_MEAL], monkeypatch)
     monkeypatch.setenv("GEMINI_MODELS", "m1,m2,m3")
     monkeypatch.setenv("GEMINI_RETRIES", "3")
     nut = ingest._run_models(["prompt"])
@@ -523,7 +530,7 @@ def test_runaway_number_never_crashes_coercion():
 
 
 def test_transient_api_error_still_retries_same_model(monkeypatch):
-    fm = _fake_genai([Exception("503 UNAVAILABLE high demand"), _GOOD_BODY],
+    fm = _fake_genai([Exception("503 UNAVAILABLE high demand"), _GOOD_MEAL],
                      monkeypatch)
     monkeypatch.setenv("GEMINI_MODELS", "m1")
     monkeypatch.setenv("GEMINI_RETRIES", "3")
@@ -533,7 +540,7 @@ def test_transient_api_error_still_retries_same_model(monkeypatch):
 
 
 def test_deadline_returns_before_request_timeout(monkeypatch):
-    fm = _fake_genai([_GOOD_BODY], monkeypatch)
+    fm = _fake_genai([_GOOD_MEAL], monkeypatch)
     monkeypatch.setenv("GEMINI_MODELS", "m1,m2")
     monkeypatch.setenv("GEMINI_DEADLINE_S", "-1")  # already past
     with pytest.raises(RuntimeError, match="deadline"):
@@ -636,3 +643,147 @@ def test_text_only_dedup_hash_is_stable_and_distinct():
     assert h("oatmeal") == h("oatmeal")
     assert h("oatmeal") != h("toast")
     assert h("oatmeal") != ingest._sha12(b"oatmeal")
+
+
+# -- body composition: the scale-app screenshot --------------------------------
+from datetime import datetime, timezone, timedelta  # noqa: E402
+
+_LISBON = timezone(timedelta(hours=1))
+
+# Exactly what the Goodvibes screen showed on 2026-07-04 at 19:03.
+_SCREEN = {
+    "measured_at": "2026-07-04T19:03",
+    "weight_kg": 70.05, "bmi": 22.1, "body_fat_pct": 19.5,
+    "subcutaneous_fat_pct": 17.6, "visceral_fat": 5, "body_water_pct": 58.1,
+    "muscle_mass_kg": 53.6, "bone_mass_kg": 2.82, "bmr_kcal": 1588,
+    "metabolic_age": 19,
+}
+
+
+def test_body_metrics_mirror_the_sheet_schema():
+    # ingest is a separate image and can't import src, so the metric list is
+    # duplicated. If the two drift, values land in the wrong columns.
+    from src.sheets import BODY_METRICS, DAILY_HEADERS
+    assert list(ingest.BODY_METRICS) == BODY_METRICS
+    for metric in ingest.BODY_METRICS:
+        assert metric in DAILY_HEADERS
+    # the two columns ingest derives/stamps rather than reads must exist too
+    assert "lean_mass_kg" in DAILY_HEADERS and "body_measured_at" in DAILY_HEADERS
+
+
+def test_normalize_body_reads_every_metric_off_the_screen():
+    body = ingest._normalize_body(_SCREEN)
+    assert len(body) == 10                     # all ten, none lost
+    assert body["weight_kg"] == 70.05          # exact digits, not rounded to 70.1
+    assert body["bone_mass_kg"] == 2.82
+    assert body["visceral_fat"] == 5
+    assert body["bmr_kcal"] == 1588
+    assert "measured_at" not in body           # the timestamp is not a metric
+
+
+def test_normalize_body_drops_implausible_readings():
+    # the failure this guard exists for: a dropped decimal, and the "+ 5.35 kg"
+    # delta printed above the real weight being read as the weight itself.
+    body = ingest._normalize_body({
+        "weight_kg": 7005,        # decimal lost -> not a body
+        "body_fat_pct": 5.0,      # actually the "+5.0%" delta, but plausible: kept
+        "bmi": 0,                 # below the band -> dropped
+        "bone_mass_kg": 2.82,     # fine
+        "metabolic_age": 19,
+    })
+    assert "weight_kg" not in body
+    assert "bmi" not in body
+    assert body["bone_mass_kg"] == 2.82 and body["metabolic_age"] == 19
+
+
+def test_normalize_body_ignores_junk_and_unknown_keys():
+    body = ingest._normalize_body({
+        "weight_kg": "70.05",       # string, not a number -> dropped
+        "muscle_mass_kg": True,     # bool is an int subclass -> must not become 1
+        "protein_pct": 17.0,        # a metric we don't track -> dropped
+        "body_fat_pct": 19.5,
+    })
+    assert body == {"body_fat_pct": 19.5}
+    assert ingest._normalize_body(None) == {}
+    assert ingest._normalize_body("nope") == {}
+
+
+def test_resolve_measured_at_uses_the_screens_own_timestamp():
+    now = datetime(2026, 7, 14, 12, 0, tzinfo=_LISBON)
+    # the reading is dated on screen -> that wins over "when the photo was sent",
+    # so weighing at 07:00 and sending at noon still lands on the right day/hour
+    assert ingest._resolve_measured_at("2026-07-04T19:03", now) == \
+        datetime(2026, 7, 4, 19, 3, tzinfo=_LISBON)
+    # no date on screen, or unreadable -> fall back to now
+    assert ingest._resolve_measured_at("", now) == now
+    assert ingest._resolve_measured_at("ontem à noite", now) == now
+    # a future timestamp is never trusted (it would create tomorrow's row)
+    assert ingest._resolve_measured_at("2026-12-25T10:00", now) == now
+
+
+def test_body_row_keys_the_day_and_derives_lean_mass():
+    measured = datetime(2026, 7, 4, 19, 3, tzinfo=_LISBON)
+    row = ingest._body_row(ingest._normalize_body(_SCREEN), measured)
+    assert row["date"] == "2026-07-04"                  # the reading's own day
+    assert row["body_measured_at"] == "2026-07-04T19:03+01:00"
+    assert row["weight_kg"] == 70.05
+    # lean mass isn't on the screen — it's derived: 70.05 * (1 - 0.195)
+    assert row["lean_mass_kg"] == 56.39
+
+
+def test_body_row_skips_lean_mass_without_both_inputs():
+    measured = datetime(2026, 7, 4, 19, 3, tzinfo=_LISBON)
+    row = ingest._body_row({"weight_kg": 70.0}, measured)   # no body fat read
+    assert "lean_mass_kg" not in row
+
+
+def test_run_models_routes_a_scale_screenshot_to_the_body_path(monkeypatch):
+    import json
+    reply = json.dumps({"kind": "body", "reasoning": "read the scale screen",
+                        "body": _SCREEN, "items": [], "confidence": 0})
+    _fake_genai([reply], monkeypatch)
+    monkeypatch.setenv("GEMINI_MODELS", "m1")
+    rec = ingest._run_models(["prompt"])
+    assert rec["kind"] == "body"
+    assert rec["measured_at"] == "2026-07-04T19:03"
+    assert rec["body"]["weight_kg"] == 70.05
+    assert "foods" not in rec            # never assembled as a meal
+
+
+def test_text_only_path_cannot_be_hijacked_into_a_body_reading(monkeypatch):
+    # no image => a "body" verdict could only be a hallucination; force meal.
+    import json
+    reply = json.dumps({"kind": "body", "reasoning": "x", "body": _SCREEN,
+                        "items": [], "confidence": 0})
+    _fake_genai([reply], monkeypatch)
+    monkeypatch.setenv("GEMINI_MODELS", "m1")
+    rec = ingest._run_models(["prompt"], allow_body=False)
+    assert rec["kind"] == "meal"
+    assert rec["foods"] == "not food"    # no items -> logged as nothing
+
+
+def test_unclassified_reply_defaults_to_meal(monkeypatch):
+    _fake_genai([_GOOD_MEAL], monkeypatch)   # carries no `kind` at all
+    monkeypatch.setenv("GEMINI_MODELS", "m1")
+    assert ingest._run_models(["prompt"])["kind"] == "meal"
+
+
+def test_body_section_defuses_the_delta_block_and_forbids_guessing():
+    section = ingest.BODY_SECTION
+    # the trap: "+ 5.35 kg Peso" sits above the real weight, labelled the same
+    assert "SINCE" in section.upper() and "DIFFERENCES" in section
+    assert "NEVER infer" in section and "OMIT it" in section
+    # every metric we store must be named for the model, or it can't fill it
+    for metric in ingest.BODY_METRICS:
+        assert metric in section
+    # the router forks before either rubric is read
+    assert '`kind` to "body"' in ingest.ROUTER_PREFIX
+    assert '`kind` to "meal"' in ingest.ROUTER_PREFIX
+
+
+def test_col_letter_reaches_past_z():
+    # daily_summary is 40 columns wide — the body block lives past Z
+    assert ingest._col_letter(0) == "A"
+    assert ingest._col_letter(25) == "Z"
+    assert ingest._col_letter(26) == "AA"
+    assert ingest._col_letter(39) == "AN"
