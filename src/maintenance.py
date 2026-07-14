@@ -33,7 +33,14 @@ INSIGHTS_HEADERS = ["week_ending", "insights", "model", "updated_at"]
 MEALS_HEADERS = [
     "datetime", "foods", "items", "calories",
     "protein_g", "carbs_g", "fat_g", "confidence", "model", "photo_url",
-    "portion_g", "image_sha", "note",
+    "portion_g", "image_sha", "note", "template",
+]
+
+# Measured, reusable meals (mirror of ingest/main.py TEMPLATES_HEADERS).
+TEMPLATES_TAB = "templates"
+TEMPLATES_HEADERS = [
+    "name", "description", "items", "portion_g",
+    "calories", "protein_g", "carbs_g", "fat_g", "created_at", "updated_at",
 ]
 
 DASHBOARD_LABELS = [
@@ -216,6 +223,19 @@ def main() -> None:
         print("insights: tab created")
     else:
         print("insights: tab already present")
+
+    # 4. templates tab (measured, reusable meals; written by the ingest service).
+    if TEMPLATES_TAB not in sheets:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=sid,
+            body={"requests": [{"addSheet": {"properties": {"title": TEMPLATES_TAB}}}]},
+        ).execute()
+        print("templates: tab created")
+    svc.spreadsheets().values().update(
+        spreadsheetId=sid, range=f"{TEMPLATES_TAB}!A1",
+        valueInputOption="RAW", body={"values": [TEMPLATES_HEADERS]},
+    ).execute()
+    print("templates: header in sync")
 
     print(f"maintenance done (spreadsheet {sid}, project {project}).")
 

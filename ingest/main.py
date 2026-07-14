@@ -69,18 +69,33 @@ app.config["MAX_CONTENT_LENGTH"] = 30 * 1024 * 1024
 
 MEALS_TAB = "meals"
 DAILY_TAB = "daily_summary"
+TEMPLATES_TAB = "templates"
 
 # One row per meal. `items` is a JSON array breaking the plate into ingredients,
 # each with its own portion, macros and a `nutrients` map; the flat columns are
 # the row totals the daily job rolls up. `model` records which AI analysed the
-# photo (audit); `image_sha` powers de-duplication. Schema changes (add/remove a
-# column) must be mirrored in src/maintenance.py so existing rows are realigned.
+# photo (audit); `image_sha` powers de-duplication; `template` records which
+# measured template supplied the numbers (blank = estimated from the photo).
+# Schema changes (add/remove a column) must be mirrored in src/maintenance.py so
+# existing rows are realigned.
 MEALS_HEADERS = [
     "datetime", "foods", "items", "calories",
     "protein_g", "carbs_g", "fat_g", "confidence", "model", "photo_url",
-    "portion_g", "image_sha", "note",
+    "portion_g", "image_sha", "note", "template",
 ]
-LAST_COL = chr(ord("A") + len(MEALS_HEADERS) - 1)  # "M"
+LAST_COL = chr(ord("A") + len(MEALS_HEADERS) - 1)  # "N"
+
+# Meals the user has weighed on a real scale. `items` holds the SAME
+# per-ingredient JSON shape as meals, so a template is just a canonical, measured
+# items array. Matching a photo to one of these replaces the vision estimate with
+# these exact numbers, so a repeat meal gets identical values every time.
+TEMPLATES_HEADERS = [
+    "name", "description", "items", "portion_g",
+    "calories", "protein_g", "carbs_g", "fat_g", "created_at", "updated_at",
+]
+TEMPLATES_LAST_COL = chr(ord("A") + len(TEMPLATES_HEADERS) - 1)  # "J"
+# A template's numbers are measured, not guessed — so a matched meal is confident.
+TEMPLATE_CONFIDENCE = 0.95
 
 # Rows excluded from all totals (kept in sync with src/run_daily.py NON_MEALS).
 NON_MEALS = {"not food", "analysis failed"}
@@ -271,6 +286,39 @@ brunch ~10:30, lunch ~13:00, afternoon snack ~16:30, dinner ~20:00, late/supper
 return a later time. If the note says nothing about timing, leave `meal_time`
 empty (the photo's capture time is used)."""
 
+# Injected whenever the user has saved templates. A template's weights come from a
+# real kitchen scale, so matching one replaces the vision estimate with measured
+# numbers — the whole point is that the same meal yields IDENTICAL values every
+# day. A wrong match would overwrite measured data with a guess, so the bar for
+# matching is deliberately high and the server re-validates the name afterwards.
+TEMPLATE_MATCH_SUFFIX = """
+
+KNOWN MEAL TEMPLATES — dishes this user has already weighed on a real scale, so
+their ingredient weights and nutrition are MEASURED, not estimated:
+{catalogue}
+
+If what you see IS one of these dishes, set `template` to its name copied VERBATIM
+and explain the match in `reasoning`. The stored measured values are then used
+instead of your estimate, so a repeat meal always gets identical numbers. (Still
+fill `items` with your own estimate as a fallback — it is discarded on a match.)
+Match ONLY when you are confident it is the same dish with the same components.
+If anything material differs — a different bread or protein, an extra or missing
+ingredient, a clearly different size — leave `template` EMPTY and estimate
+normally. A wrong match replaces measured data with a guess; when in doubt, don't.
+If the user ate only part of it, still match and set `template_scale` to the
+fraction eaten (e.g. 0.5 for half). Otherwise leave `template_scale` at 1."""
+
+# Always injected: lets the user create a template by simply saying so in the note
+# (no extra step in the phone Shortcut). The server only honours this when the note
+# genuinely mentions a template, so a stray field can't silently persist one.
+TEMPLATE_SAVE_SUFFIX = """
+
+SAVING A TEMPLATE — if the NOTE asks to save/remember this meal as a template
+(any phrasing, any language), put the name the user gives it in
+`save_template_name`, and fill `items` using the EXACT weights stated in the note
+(they weighed them on a scale — those grams are ground truth, never override
+them). Otherwise leave `save_template_name` empty."""
+
 # Text-only path: same schema and per-item rigour, but estimating from a written
 # description with NO photo. Confidence is capped low because there is no scale
 # reference to measure against — the numbers are informed guesses, not readings.
@@ -338,12 +386,20 @@ _NUTRIENT_PROPS = {k: types.Schema(type=types.Type.NUMBER) for k in NUTRIENT_KEY
 
 RESPONSE_SCHEMA = types.Schema(
     type=types.Type.OBJECT,
-    property_ordering=["reasoning", "meal_time", "items", "confidence"],
+    property_ordering=["reasoning", "meal_time", "template", "template_scale",
+                       "save_template_name", "items", "confidence"],
     properties={
         "reasoning": types.Schema(type=types.Type.STRING),
         # Optional "HH:MM" (24h local) inferred from a text note ("breakfast",
         # "lunch", or an explicit time). Empty when unknown / for photo meals.
         "meal_time": types.Schema(type=types.Type.STRING),
+        # Name of a KNOWN template this meal is, verbatim (empty = estimate it).
+        # The server validates it and swaps in the measured items.
+        "template": types.Schema(type=types.Type.STRING),
+        # Fraction of the template actually eaten (1 = all of it, 0.5 = half).
+        "template_scale": types.Schema(type=types.Type.NUMBER),
+        # Set only when the note asks to save this meal as a reusable template.
+        "save_template_name": types.Schema(type=types.Type.STRING),
         "items": types.Schema(
             type=types.Type.ARRAY,
             items=types.Schema(
@@ -681,16 +737,30 @@ def _run_models(contents: List[Any], *, models: Optional[List[str]] = None,
             items = _normalize_items(data.get("items"))
             meal = _meal_from_items(items, data.get("confidence"), model)
             meal["meal_time"] = str(data.get("meal_time") or "").strip()
+            meal["template"] = str(data.get("template") or "").strip()
+            meal["template_scale"] = data.get("template_scale")
+            meal["save_template_name"] = str(
+                data.get("save_template_name") or "").strip()
             return meal
     raise RuntimeError(f"all models failed ({models}); last error: {last_err}")
 
 
-def _build_prompt(num_images: int, note: str,
-                  now: Optional[datetime] = None) -> str:
+def _templates_block(templates: Optional[List[Dict[str, Any]]]) -> str:
+    """The template rules appended to every prompt: how to MATCH a saved dish
+    (only when the user has any) and how to SAVE one from the note (always)."""
+    block = ""
+    if templates:
+        block += TEMPLATE_MATCH_SUFFIX.format(
+            catalogue=_template_catalogue(templates))
+    return block + TEMPLATE_SAVE_SUFFIX
+
+
+def _build_prompt(num_images: int, note: str, now: Optional[datetime] = None,
+                  templates: Optional[List[Dict[str, Any]]] = None) -> str:
     """Assemble the vision prompt: the base rubric, plus a multi-image block when
-    the log has several photos, the authoritative note block when given, and —
-    when a note AND the current time are supplied — a meal-time block so a photo
-    logged after the fact ("this yogurt with my lunch") is stamped at that hour."""
+    the log has several photos, the authoritative note block when given, a
+    meal-time block (with `now`) so a photo logged after the fact lands at the
+    right hour, and the template match/save rules."""
     prompt = PROMPT
     if num_images > 1:
         prompt += MULTI_IMAGE_SUFFIX.format(n=num_images)
@@ -698,29 +768,36 @@ def _build_prompt(num_images: int, note: str,
         prompt += NOTE_SUFFIX.format(note=note)
         if now is not None:
             prompt += MEAL_TIME_SUFFIX.format(now_hhmm=now.strftime("%H:%M"))
-    return prompt
+    return prompt + _templates_block(templates)
 
 
 def analyze(images: List[Tuple[bytes, str]], note: str = "",
-            now: Optional[datetime] = None, **kw) -> Dict[str, Any]:
+            now: Optional[datetime] = None,
+            templates: Optional[List[Dict[str, Any]]] = None,
+            **kw) -> Dict[str, Any]:
     """Analyse one or more photos of a single meal, reasoning across all of them.
 
     A `note`, if given, is appended as authoritative context that overrides the
     visual estimate where the two conflict; with `now` it can also infer the
-    meal's hour from the note. `kw` overrides (models/retries/timeout_ms/
-    deadline_s) let the sync path run a quick single-model pass."""
+    meal's hour from the note. `templates` lets the model recognise a dish the
+    user has weighed and hand back its name instead of estimating. `kw` overrides
+    (models/retries/timeout_ms/deadline_s) let the sync path run a quick pass."""
     parts: List[Any] = [types.Part.from_bytes(data=img, mime_type=mime)
                         for img, mime in images]
-    parts.append(_build_prompt(len(images), note, now))
+    parts.append(_build_prompt(len(images), note, now, templates))
     return _run_models(parts, **kw)
 
 
-def analyze_text(note: str, now: datetime, **kw) -> Dict[str, Any]:
+def analyze_text(note: str, now: datetime,
+                 templates: Optional[List[Dict[str, Any]]] = None,
+                 **kw) -> Dict[str, Any]:
     """Estimate a meal from a written description alone (no photo). `now` is the
     current local time, injected so the model can infer the meal's hour and never
-    place it in the future."""
-    return _run_models(
-        [TEXT_PROMPT.format(note=note, now_hhmm=now.strftime("%H:%M"))], **kw)
+    place it in the future. Templates match here too ("o meu pequeno-almoço do
+    costume")."""
+    prompt = (TEXT_PROMPT.format(note=note, now_hhmm=now.strftime("%H:%M"))
+              + _templates_block(templates))
+    return _run_models([prompt], **kw)
 
 
 def _quick_kwargs() -> Dict[str, Any]:
@@ -852,6 +929,174 @@ def _sort_meals_by_datetime(meals_id: int) -> None:
         }}]}))
 
 
+# -- templates (measured, reusable meals) --------------------------------------
+def _parse_items_cell(raw: Any) -> List[Dict[str, Any]]:
+    """The `items` cell holds a JSON array of per-ingredient objects."""
+    if isinstance(raw, list):
+        return raw
+    try:
+        parsed = json.loads(raw) if raw else []
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def read_templates() -> List[Dict[str, Any]]:
+    """The user's measured meal templates. Never fatal: a missing/broken tab just
+    means no templates, and analysis falls back to estimating."""
+    try:
+        rows = _rows_as_dicts(_read_tab(TEMPLATES_TAB))
+    except Exception:
+        return []
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        name = str(row.get("name") or "").strip()
+        items = _normalize_items(_parse_items_cell(row.get("items")))
+        if name and items:
+            out.append({"name": name,
+                        "description": str(row.get("description") or "").strip(),
+                        "items": items})
+    return out
+
+
+def _template_catalogue(templates: List[Dict[str, Any]]) -> str:
+    """Compact listing injected into the prompt so the model can recognise a
+    saved dish: name, what it is, and its measured ingredients."""
+    lines = []
+    for t in templates:
+        parts = ", ".join(f"{i['name']} {int(i['portion_g'])}g" for i in t["items"])
+        kcal = int(sum(i["calories"] for i in t["items"]))
+        desc = f" — {t['description']}" if t["description"] else ""
+        lines.append(f'- "{t["name"]}"{desc} [{parts}] ~{kcal} kcal')
+    return "\n".join(lines)
+
+
+def _find_template(templates: List[Dict[str, Any]],
+                   name: str) -> Optional[Dict[str, Any]]:
+    """Look a template up by name, case/space-insensitively. Returns None for a
+    name the model invented — the estimate is then kept instead."""
+    key = " ".join(str(name or "").lower().split())
+    for t in templates:
+        if " ".join(t["name"].lower().split()) == key:
+            return t
+    return None
+
+
+def _scale_items(items: List[Dict[str, Any]], factor: float) -> List[Dict[str, Any]]:
+    """Scale a template's measured items (portion, macros and every nutrient) by
+    the fraction actually eaten."""
+    if factor == 1:
+        return [dict(i) for i in items]
+    out: List[Dict[str, Any]] = []
+    for item in items:
+        scaled = dict(item)
+        for key in ("portion_g", "calories", "protein_g", "carbs_g", "fat_g"):
+            scaled[key] = _round_num(item.get(key, 0) * factor)
+        if item.get("nutrients"):
+            scaled["nutrients"] = {
+                k: round(v * factor, 2 if k.endswith("_g") else 1)
+                for k, v in item["nutrients"].items()
+            }
+        out.append(scaled)
+    return out
+
+
+def apply_template(nut: Dict[str, Any],
+                   templates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Swap the model's *estimate* for a template's *measured* values when it
+    recognised a saved dish. An unknown name (a hallucination) is ignored and the
+    estimate kept, so a bad match can never invent numbers."""
+    name = str(nut.get("template") or "").strip()
+    if not name:
+        return nut
+    tpl = _find_template(templates, name)
+    if not tpl:
+        app.logger.warning("model returned unknown template %r — keeping estimate",
+                           name)
+        nut["template"] = ""
+        return nut
+
+    scale = _round_num(nut.get("template_scale"), 2)
+    if scale <= 0:
+        scale = 1.0
+    scale = min(scale, 3.0)  # a sane cap; the note drives fractions, not multiples
+
+    meal = _meal_from_items(_scale_items(tpl["items"], scale),
+                            TEMPLATE_CONFIDENCE, nut.get("model", ""))
+    meal["meal_time"] = nut.get("meal_time", "")
+    meal["template"] = tpl["name"] if scale == 1 else f"{tpl['name']} (x{scale:g})"
+    app.logger.info("template %r applied (scale %s)", tpl["name"], scale)
+    return meal
+
+
+def _ensure_templates_tab() -> None:
+    meta = _execute(lambda: _sheets().spreadsheets().get(spreadsheetId=_sid()))
+    titles = {s["properties"]["title"] for s in meta.get("sheets", [])}
+    if TEMPLATES_TAB not in titles:
+        _execute(lambda: _sheets().spreadsheets().batchUpdate(
+            spreadsheetId=_sid(),
+            body={"requests": [{"addSheet": {
+                "properties": {"title": TEMPLATES_TAB}}}]}))
+    rng = f"{TEMPLATES_TAB}!A1:{TEMPLATES_LAST_COL}1"
+    current = _execute(lambda: _sheets().spreadsheets().values().get(
+        spreadsheetId=_sid(), range=rng)).get("values", [[]])
+    if not current or current[0] != TEMPLATES_HEADERS:
+        _execute(lambda: _sheets().spreadsheets().values().update(
+            spreadsheetId=_sid(), range=f"{TEMPLATES_TAB}!A1",
+            valueInputOption="RAW", body={"values": [TEMPLATES_HEADERS]}))
+
+
+def save_template(name: str, nut: Dict[str, Any], when: datetime) -> None:
+    """Upsert a template from an analysed meal (its items carry the exact weights
+    the user stated in the note). Re-saving the same name updates it in place."""
+    _ensure_templates_tab()
+    values = _read_tab(TEMPLATES_TAB)
+    row = [
+        name, nut["foods"], json.dumps(nut["items"], ensure_ascii=False),
+        nut["portion_g"], nut["calories"], nut["protein_g"], nut["carbs_g"],
+        nut["fat_g"], when.isoformat(timespec="seconds"),
+        when.isoformat(timespec="seconds"),
+    ]
+    idx = None
+    if values:
+        header = values[0]
+        if "name" in header:
+            n_i = header.index("name")
+            key = " ".join(name.lower().split())
+            for i, r in enumerate(values[1:], start=2):
+                if len(r) > n_i and " ".join(str(r[n_i]).lower().split()) == key:
+                    idx = i
+                    break
+    if idx is not None:
+        row[8] = values[idx - 1][8] if len(values[idx - 1]) > 8 else row[8]  # keep created_at
+        _execute(lambda: _sheets().spreadsheets().values().update(
+            spreadsheetId=_sid(),
+            range=f"{TEMPLATES_TAB}!A{idx}:{TEMPLATES_LAST_COL}{idx}",
+            valueInputOption="RAW", body={"values": [row]}))
+    else:
+        _execute(lambda: _sheets().spreadsheets().values().append(
+            spreadsheetId=_sid(), range=f"{TEMPLATES_TAB}!A1",
+            valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+            body={"values": [row]}))
+
+
+def maybe_save_template(nut: Dict[str, Any], note: str,
+                        when: datetime) -> str:
+    """Persist this meal as a template when the note asked for it. Guarded twice:
+    the model must name it AND the note must actually mention a template, so a
+    stray field can never silently create one. Returns the saved name (or "")."""
+    name = str(nut.get("save_template_name") or "").strip()
+    if not name or "template" not in note.lower():
+        return ""
+    try:
+        save_template(name, nut, when)
+    except Exception:
+        app.logger.exception("saving template %r failed", name)
+        return ""
+    app.logger.info("template %r saved", name)
+    return name
+
+
 def append_meal(nut: Dict[str, Any], photo_url: str, when: datetime,
                 image_sha: str, note: str = "") -> None:
     row = [
@@ -860,7 +1105,7 @@ def append_meal(nut: Dict[str, Any], photo_url: str, when: datetime,
         json.dumps(nut["items"], ensure_ascii=False),
         nut["calories"], nut["protein_g"], nut["carbs_g"], nut["fat_g"],
         nut["confidence"], nut["model"], photo_url, nut["portion_g"],
-        image_sha, note,
+        image_sha, note, str(nut.get("template") or ""),
     ]
     meals_id = _ensure_meals_tab()
     # Upsert: a photo re-sent with a corrected note replaces its own row rather
@@ -1042,6 +1287,21 @@ def health():
     return "ok", 200
 
 
+def _resolve_templates(nut: Dict[str, Any], note: str, when: datetime,
+                       templates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Settle the template question for this meal.
+
+    Saving and matching are mutually exclusive: a note asking to SAVE is defining
+    a template (its items are the weights the user stated), so it must not also be
+    overwritten by a match. Otherwise, if the model recognised a saved dish, its
+    measured values replace the estimate."""
+    saved = maybe_save_template(nut, note, when)
+    if saved:
+        nut["template"] = saved  # this meal *is* that dish — record it
+        return nut
+    return apply_template(nut, templates)
+
+
 def _finalize(nut: Dict[str, Any], photo_url: str, when: datetime,
               image_sha: str, note: str, text_only: bool,
               todays: List[Dict[str, Any]]):
@@ -1076,11 +1336,13 @@ def _finalize(nut: Dict[str, Any], photo_url: str, when: datetime,
         prefix = f"Logged for {when.strftime('%H:%M')}: "
     else:
         prefix = "Logged: "
+    tpl = str(nut.get("template") or "")
     summary = (
         f"{prefix}{nut['foods']} (~{int(nut['portion_g'])} g) — "
         f"~{int(nut['calories'])} kcal "
-        f"({int(nut['protein_g'])}P/{int(nut['carbs_g'])}C/{int(nut['fat_g'])}F) · "
-        f"Today: {int(running['calories'])} kcal "
+        f"({int(nut['protein_g'])}P/{int(nut['carbs_g'])}C/{int(nut['fat_g'])}F)"
+        + (f" · 📐 {tpl}" if tpl else "")  # measured template, not an estimate
+        + f" · Today: {int(running['calories'])} kcal "
         f"({int(running['protein_g'])}P/{int(running['carbs_g'])}C/"
         f"{int(running['fat_g'])}F)"
     )
@@ -1124,12 +1386,17 @@ def ingest():
             "duplicate": True,
         }), 200
 
+    # The user's measured templates: the model may recognise this dish and hand
+    # back its name, and the note may ask to save a new one.
+    templates = read_templates()
+
     # Quick, best-effort pass for instant macros on the phone. If Gemini isn't
     # fast enough, we don't make the phone wait (or risk a 504) — we archive and
     # hand the meal to the background worker, which retries until it lands.
     try:
-        nut = (analyze_text(note, when, **_quick_kwargs()) if text_only
-               else analyze(images, note, now=when, **_quick_kwargs()))
+        nut = (analyze_text(note, when, templates, **_quick_kwargs()) if text_only
+               else analyze(images, note, now=when, templates=templates,
+                            **_quick_kwargs()))
         quick_ok = True
     except Exception as err:
         app.logger.info("quick analysis missed, deferring to worker: %s", err)
@@ -1145,6 +1412,7 @@ def ingest():
     photo_url = " ".join(a["url"] for a in archived if a.get("url"))
 
     if quick_ok:
+        nut = _resolve_templates(nut, note, when, templates)
         return _finalize(nut, photo_url, when, image_sha, note, text_only, todays)
 
     # Hand off to the background queue (guaranteed-insert path).
@@ -1194,10 +1462,11 @@ def process():
     if _exact_duplicate(image_sha, note, todays):  # idempotent: retry after success
         return jsonify({"status": "already-logged"}), 200
 
+    templates = read_templates()
     try:
         images = download_photos(refs) if not text_only else []
-        nut = (analyze_text(note, when) if text_only
-               else analyze(images, note, now=when))
+        nut = (analyze_text(note, when, templates) if text_only
+               else analyze(images, note, now=when, templates=templates))
     except Exception as err:
         attempt = int(request.headers.get("X-CloudTasks-TaskRetryCount", "0"))
         max_attempts = int(os.environ.get(
@@ -1209,6 +1478,7 @@ def process():
         app.logger.warning("worker attempt %d failed, will retry: %s", attempt + 1, err)
         return jsonify({"error": str(err)}), 500  # 5xx => Cloud Tasks retries
 
+    nut = _resolve_templates(nut, note, when, templates)
     return _finalize(nut, photo_url, when, image_sha, note, text_only, todays)
 
 

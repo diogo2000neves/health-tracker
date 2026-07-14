@@ -170,13 +170,110 @@ def test_sha12_stable():
     assert ingest._sha12(b"abc") != ingest._sha12(b"abd")
 
 
-def test_meals_headers_have_note_and_mirror_maintenance():
-    # `note` stores the user's free-text description for provenance; the two
-    # copies (ingest + maintenance) must stay identical or the sync corrupts rows.
+# -- measured meal templates ---------------------------------------------------
+_TPL = [{
+    "name": "Sandes mista PA",
+    "description": "baguette, ham, cheese, butter",
+    "items": ingest._normalize_items([
+        {"name": "baguette", "portion_g": 80, "calories": 200,
+         "protein_g": 7, "carbs_g": 40, "fat_g": 1,
+         "nutrients": {"fiber_g": 2.0, "sodium_mg": 300}},
+        {"name": "ham", "portion_g": 40, "calories": 60,
+         "protein_g": 8, "carbs_g": 1, "fat_g": 3},
+    ]),
+}]
+
+
+def test_apply_template_swaps_estimate_for_measured_values():
+    est = ingest._meal_from_items(ingest._normalize_items(
+        [{"name": "sandwich", "portion_g": 150, "calories": 400,
+          "protein_g": 20, "carbs_g": 45, "fat_g": 12}]), 0.6, "m1")
+    est["template"], est["template_scale"] = "Sandes mista PA", 1
+    out = ingest.apply_template(est, _TPL)
+    assert out["calories"] == 260.0            # 200 + 60, the MEASURED values
+    assert out["portion_g"] == 120.0           # 80 + 40
+    assert out["confidence"] == ingest.TEMPLATE_CONFIDENCE   # measured, not guessed
+    assert out["template"] == "Sandes mista PA"
+    assert out["model"] == "m1"                # which model matched (audit)
+
+
+def test_apply_template_scales_when_only_part_eaten():
+    est = ingest._meal_from_items([], 0.5, "m1")
+    est["template"], est["template_scale"] = "sandes  mista pa", 0.5  # loose name
+    out = ingest.apply_template(est, _TPL)
+    assert out["calories"] == 130.0            # half of 260
+    assert out["portion_g"] == 60.0
+    assert out["template"] == "Sandes mista PA (x0.5)"
+    assert out["items"][0]["nutrients"]["fiber_g"] == 1.0   # nutrients scale too
+
+
+def test_apply_template_ignores_a_hallucinated_name():
+    est = ingest._meal_from_items(ingest._normalize_items(
+        [{"name": "rice", "portion_g": 100, "calories": 130,
+          "protein_g": 3, "carbs_g": 28, "fat_g": 0}]), 0.7, "m1")
+    est["template"] = "A Template That Does Not Exist"
+    out = ingest.apply_template(est, _TPL)
+    assert out["calories"] == 130.0            # the ESTIMATE is kept
+    assert out["template"] == ""               # and the bogus name is dropped
+
+
+def test_apply_template_is_a_noop_without_a_match():
+    est = ingest._meal_from_items(ingest._normalize_items(
+        [{"name": "rice", "portion_g": 100, "calories": 130,
+          "protein_g": 3, "carbs_g": 28, "fat_g": 0}]), 0.7, "m1")
+    est["template"] = ""
+    assert ingest.apply_template(est, _TPL) is est
+
+
+def test_template_catalogue_lists_measured_ingredients():
+    cat = ingest._template_catalogue(_TPL)
+    assert '"Sandes mista PA"' in cat and "baguette 80g" in cat and "ham 40g" in cat
+    assert "260 kcal" in cat
+
+
+def test_maybe_save_template_requires_the_note_to_mention_one(monkeypatch):
+    saved = {}
+    monkeypatch.setattr(ingest, "save_template",
+                        lambda n, nut, when: saved.update(name=n))
+    from datetime import datetime
+    nut = ingest._meal_from_items([], 1, "m1")
+    nut["save_template_name"] = "Sandes mista PA"
+    # the model named one but the note never asked -> refuse to persist
+    assert ingest.maybe_save_template(nut, "just a normal meal", datetime.now()) == ""
+    assert not saved
+    # note genuinely asks -> saved
+    assert ingest.maybe_save_template(
+        nut, "guarda como template Sandes mista PA", datetime.now()) == "Sandes mista PA"
+    assert saved["name"] == "Sandes mista PA"
+
+
+def test_templates_block_has_match_rules_only_when_templates_exist():
+    with_tpl = ingest._templates_block(_TPL)
+    assert "KNOWN MEAL TEMPLATES" in with_tpl and "Sandes mista PA" in with_tpl
+    assert "SAVING A TEMPLATE" in with_tpl
+    # no templates yet: no match rules, but you can still create the first one
+    empty = ingest._templates_block([])
+    assert "KNOWN MEAL TEMPLATES" not in empty
+    assert "SAVING A TEMPLATE" in empty
+
+
+def test_template_fields_are_optional_in_the_schema():
+    props = ingest.RESPONSE_SCHEMA.properties
+    for field in ("template", "template_scale", "save_template_name"):
+        assert field in props
+        assert field not in ingest.RESPONSE_SCHEMA.required
+
+
+def test_meals_headers_mirror_maintenance():
+    # `note` (user's text) and `template` (which measured template supplied the
+    # numbers) are provenance columns. The two copies (ingest + maintenance) must
+    # stay identical or the schema sync corrupts existing rows.
     from src import maintenance
-    assert ingest.MEALS_HEADERS[-1] == "note"
+    assert ingest.MEALS_HEADERS[-2:] == ["note", "template"]
     assert ingest.MEALS_HEADERS == maintenance.MEALS_HEADERS
-    assert ingest.LAST_COL == "M"
+    assert ingest.LAST_COL == "N"
+    # the templates tab schema is mirrored too
+    assert ingest.TEMPLATES_HEADERS == maintenance.TEMPLATES_HEADERS
 
 
 def test_note_suffix_and_text_prompt_are_authoritative():
@@ -285,15 +382,17 @@ def test_extract_images_collects_every_multipart_file_in_order():
 
 
 def test_build_prompt_adds_multi_and_note_blocks_only_when_relevant():
-    # one photo, no note => the base rubric verbatim
-    assert ingest._build_prompt(1, "") == ingest.PROMPT
+    # one photo, no note => the base rubric (+ the always-on save-template rule)
+    plain = ingest._build_prompt(1, "")
+    assert plain == ingest.PROMPT + ingest.TEMPLATE_SAVE_SUFFIX
+    assert "MULTIPLE IMAGES" not in plain and "NOTE:" not in plain
     # several photos => the multi-image block, carrying the count
     multi = ingest._build_prompt(3, "")
     assert "MULTIPLE IMAGES" in multi and "these 3 images" in multi
     assert "NUTRITION LABEL" in multi  # labels are authoritative
     # a note always appends its authoritative block
     assert "only ate half" in ingest._build_prompt(2, "only ate half")
-    assert ingest._build_prompt(1, "no oil").endswith("NOTE: no oil")
+    assert "NOTE: no oil" in ingest._build_prompt(1, "no oil")
 
 
 def test_build_prompt_adds_meal_time_block_for_a_photo_with_note_and_now():

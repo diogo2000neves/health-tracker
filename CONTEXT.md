@@ -168,9 +168,27 @@ Service account: `health-tracker-job@health-tracker-501322.iam.gserviceaccount.c
   - The daily job re-rolls a trailing `HEALTH_RECONCILE_DAYS` (7) window; set 0
     + `HEALTH_START_DATE=2000-01-01` for a full backfill run.
 - **`meals`**: `datetime | foods | items | calories | protein_g | carbs_g | fat_g |
-  confidence | model | photo_url | portion_g | image_sha | note`
+  confidence | model | photo_url | portion_g | image_sha | note | template`
   - `note` = the user's optional free-text description (empty for most rows);
     stored for provenance, especially for text-only meals (empty `photo_url`).
+  - `template` = which measured template supplied the numbers (blank = estimated
+    from the photo). See `templates` below.
+- **`templates`**: `name | description | items | portion_g | calories |
+  protein_g | carbs_g | fat_g | created_at | updated_at` — meals the user weighed
+  on a **real scale**, so their `items` (same per-ingredient JSON shape as
+  `meals`) are **measured, not estimated**.
+  - **Created from a note**: logging a weighed meal with a note that asks to save
+    it as a template (any phrasing) persists its items under that name — no extra
+    step in the Shortcut. Re-saving the same name updates it in place.
+  - **Matched automatically**: every analysis gets a compact catalogue of the
+    templates injected into the prompt. If the model recognises the dish it
+    returns the template's name, and the server **swaps its estimate for the
+    measured values** — so a repeat meal yields *identical* numbers every day
+    (confidence `0.95`). `template_scale` handles "only ate half".
+  - **Guardrails**: the model must be confident it's the same dish; a name it
+    invents is rejected (the estimate is kept); the `meals.template` column
+    records every application for audit; the note always wins (it can suppress a
+    match or scale it), and a corrected note re-analyses and replaces the row.
   - `items` = JSON array, one object per ingredient with its portion, macros,
     `cooking_method` and a `nutrients` map (~36 possible nutrients, only the
     non-negligible ones stored). The flat columns are the row totals; the daily
