@@ -787,3 +787,61 @@ def test_col_letter_reaches_past_z():
     assert ingest._col_letter(25) == "Z"
     assert ingest._col_letter(26) == "AA"
     assert ingest._col_letter(39) == "AN"
+
+
+# -- bowel-movement note (the plain-text "fiz cocó" log) -----------------------
+def test_a_text_note_can_be_classified_as_a_bowel_movement(monkeypatch):
+    import json
+    reply = json.dumps({"kind": "bowel", "reasoning": "user reported a poop",
+                        "items": [], "confidence": 0})
+    _fake_genai([reply], monkeypatch)
+    monkeypatch.setenv("GEMINI_MODELS", "m1")
+    rec = ingest._run_models(["prompt"], allow_body=False, allow_bowel=True)
+    assert rec["kind"] == "bowel"
+    assert "foods" not in rec           # never assembled as a meal
+
+
+def test_bowel_verdict_is_ignored_on_the_image_path(monkeypatch):
+    # images never enable the bowel fork; a stray "bowel" verdict falls back to meal
+    import json
+    reply = json.dumps({"kind": "bowel", "reasoning": "x", "items": [],
+                        "confidence": 0})
+    _fake_genai([reply], monkeypatch)
+    monkeypatch.setenv("GEMINI_MODELS", "m1")
+    rec = ingest._run_models(["prompt"])   # allow_bowel defaults False
+    assert rec["kind"] == "meal"
+    assert rec["foods"] == "not food"
+
+
+def test_a_food_note_still_logs_as_a_meal_not_a_bowel_movement(monkeypatch):
+    # the fork must not swallow real meals — a food description stays a meal
+    _fake_genai([_GOOD_MEAL], monkeypatch)   # kind absent -> meal
+    monkeypatch.setenv("GEMINI_MODELS", "m1")
+    rec = ingest._run_models(["prompt"], allow_body=False, allow_bowel=True)
+    assert rec["kind"] == "meal"
+    assert rec["foods"] == "rice"
+
+
+def test_analyze_text_prepends_the_router_and_opens_the_bowel_fork(monkeypatch):
+    from datetime import datetime
+    captured = {}
+
+    def fake_run(contents, **kw):
+        captured["prompt"] = contents[0]
+        captured["kw"] = kw
+        return {"kind": "meal"}
+
+    monkeypatch.setattr(ingest, "_run_models", fake_run)
+    ingest.analyze_text("fiz cocó", datetime(2026, 7, 15, 9, 0))
+    assert captured["prompt"].startswith(ingest.TEXT_ROUTER_PREFIX)
+    assert captured["kw"]["allow_bowel"] is True      # text can be a bowel log…
+    assert captured["kw"]["allow_body"] is False      # …but never a scale reading
+
+
+def test_text_router_offers_the_bowel_classification():
+    r = ingest.TEXT_ROUTER_PREFIX
+    assert '`kind` to "bowel"' in r
+    assert '`kind` to "meal"' in r
+    assert "cocó" in r                 # multilingual — the user writes Portuguese
+    # a food note is explicitly kept as a meal even if it mentions the bathroom
+    assert "in passing" in r

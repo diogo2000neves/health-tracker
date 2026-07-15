@@ -64,12 +64,15 @@ BODY_METRICS: List[str] = [
 # (1 - body_fat_pct/100) — stored, not just derived, so the sheet stays
 # self-contained for AI analysis. `body_measured_at` is the reading's own
 # timestamp as printed in the app (a 07:00 fasted weigh-in reads differently from
-# a 21:00 one, so the hour is signal, not bookkeeping). Schema changes must go
-# through src/maintenance.py so existing rows are realigned in place, never
-# clobbered.
+# a 21:00 one, so the hour is signal, not bookkeeping). `bowel_movement` is a
+# TRUE/blank flag that sits beside `subjective_feel` — both are things the user
+# self-reports about a day rather than sensor readings; it's set from a plain text
+# note ("fiz cocó") via the ingest service. Schema changes must go through
+# src/maintenance.py so existing rows are realigned in place, never clobbered.
 DAILY_HEADERS: List[str] = [
     "date",
-    "sleep_score", "hrv_ms", "spo2_pct", "skin_temp_dev", "subjective_feel",
+    "sleep_score", "hrv_ms", "spo2_pct", "skin_temp_dev",
+    "subjective_feel", "bowel_movement",
     "total_cals_in", "total_protein_g", "total_carbs_g", "total_fat_g",
     *[f"total_{n}" for n in TIER1_NUTRIENTS],
     "total_active_mins", "steps",
@@ -84,6 +87,7 @@ DAILY_HEADERS: List[str] = [
 #   latest — the most recent non-empty value in that column
 #   avg7   — mean over the last 7 days that have nutrition logged
 #   days7  — how many such days exist
+#   count7 — how many of the last 7 calendar days have TRUE in that column
 #   now    — the refresh timestamp
 DASHBOARD_STATS: List[tuple] = [
     ("Latest weight (kg)", "weight_kg", "latest"),
@@ -103,6 +107,7 @@ DASHBOARD_STATS: List[tuple] = [
     ("Avg carbs g (7d)", "total_carbs_g", "avg7"),
     ("Avg fat g (7d)", "total_fat_g", "avg7"),
     ("Nutrition days in window", "", "days7"),
+    ("Bowel movements (last 7 days)", "bowel_movement", "count7"),
     ("Stats updated (UTC)", "", "now"),
 ]
 DASHBOARD_FIRST_ROW = 3  # the stat values start at B3, under the title

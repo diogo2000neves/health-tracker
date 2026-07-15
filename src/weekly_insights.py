@@ -34,7 +34,7 @@ CSV_COLUMNS = [
     "weight_kg", "bmi", "body_fat_pct", "subcutaneous_fat_pct", "visceral_fat",
     "body_water_pct", "muscle_mass_kg", "bone_mass_kg", "lean_mass_kg",
     "bmr_kcal", "metabolic_age",
-    "subjective_feel", "sleep_score", "steps",
+    "subjective_feel", "bowel_movement", "sleep_score", "steps",
 ]
 
 PROMPT_TEMPLATE = """You are a precise, no-nonsense personal health-data analyst.
@@ -47,7 +47,9 @@ Write your analysis as 4-6 short markdown bullets, in this spirit:
 - Body-composition trend vs intake — cite actual numbers. Weight alone is noise;
   read muscle mass, lean mass and body fat % together against calories and
   protein, and say whether the change is muscle, fat or water.
-- Any notable pattern, correlation or anomaly worth my attention.
+- Any notable pattern, correlation or anomaly worth my attention. `bowel_movement`
+  is TRUE on days I had one (blank = none logged); note regularity and any link to
+  fibre, hydration or intake if the data supports it — don't over-read sparse data.
 - Data gaps that most limit the analysis (be specific: which metric, how often).
 - End with ONE concrete, specific action for next week.
 No preamble, no disclaimers, no generic health advice — only what the data shows."""

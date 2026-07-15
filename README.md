@@ -79,6 +79,13 @@ Health Tracker/
   insert. Returns 5xx to trigger a retry; writes an "analysis failed" stub only
   on the final attempt. Same `X-Auth-Token` gate; not called by the phone.
 
+- `POST /ingest` — **a bowel-movement note.** A plain text note through the same
+  note Shortcut — "fiz cocó", "I just pooped", any phrasing/language — sets
+  `daily_summary.bowel_movement` = TRUE for the day (a blank cell is "no"). The
+  model classifies every text note first: a bathroom report flags the day, anything
+  describing food is estimated as a meal. Nothing from the note is stored; the whole
+  feature is one boolean.
+
 - `POST /feel` — `{"score": 1-10[, "date": "YYYY-MM-DD"]}` → writes
   `subjective_feel` on that day's `daily_summary` row (`{"score": null}` clears).
 

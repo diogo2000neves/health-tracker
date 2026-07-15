@@ -22,6 +22,15 @@ def test_daily_schema_shape():
     assert len(DAILY_HEADERS) == len(set(DAILY_HEADERS))  # no duplicates
 
 
+def test_bowel_movement_is_a_self_reported_daily_flag():
+    # a TRUE/blank marker that sits next to subjective_feel — both are things the
+    # user self-reports about a day, not sensor data.
+    assert "bowel_movement" in DAILY_HEADERS
+    i = DAILY_HEADERS.index
+    assert i("bowel_movement") == i("subjective_feel") + 1
+    assert DAILY_HEADERS[-1] == "updated_at"  # still last
+
+
 def test_tier1_nutrients_have_daily_columns():
     assert len(TIER1_NUTRIENTS) == 15
     for n in TIER1_NUTRIENTS:
@@ -51,11 +60,13 @@ def test_dashboard_stats_reference_real_columns():
     # them from this one list; a column that doesn't exist would render blank
     # forever, and a mismatched length would slide every number up a row.
     for _label, col, kind in DASHBOARD_STATS:
-        assert kind in {"latest", "avg7", "days7", "now"}
-        if kind in {"latest", "avg7"}:
+        assert kind in {"latest", "avg7", "count7", "days7", "now"}
+        if kind in {"latest", "avg7", "count7"}:
             assert col in DAILY_HEADERS, col
         else:
             assert col == ""
+    # the bowel-movement tally is surfaced (the point of the feature)
+    assert ("Bowel movements (last 7 days)", "bowel_movement", "count7") in DASHBOARD_STATS
     assert DASHBOARD_FIRST_ROW == 3
     # every metric the scale gives us is surfaced, not just weight
     shown = {col for _label, col, _kind in DASHBOARD_STATS}

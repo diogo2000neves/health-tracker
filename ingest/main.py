@@ -147,6 +147,11 @@ BODY_METRICS: Dict[str, Tuple[float, float]] = {
     "metabolic_age": (5, 120),      # years
 }
 
+# A plain text note ("fiz cocó", "I just pooped") sets this TRUE on the day's
+# daily_summary row — the whole feature is one boolean. The user goes at most once
+# a day, so yes/no is enough; the note itself is not stored anywhere.
+BOWEL_COLUMN = "bowel_movement"
+
 # Strongest model first (accuracy over speed — response time isn't critical).
 # These are the strongest models available on the FREE tier; Pro models require
 # a paid plan (429 on the free key), so they're intentionally not here. If you
@@ -451,6 +456,33 @@ in `reasoning`.
 
 In `reasoning`, list every metric you read together with the literal on-screen
 text you read it from, so the transcription can be audited afterwards."""
+
+# Prepended to every text-only note, the way ROUTER_PREFIX fronts the image path:
+# one Shortcut sends every note, so the model's first job is to say what the note
+# IS. Today that's meal-vs-bowel; a body reading can't arrive as text (no screen to
+# read), so that fork stays on the image side.
+#
+# "Bowel" is deliberately narrow: it fires only when the note is *just* reporting a
+# trip to the toilet, in any language ("fiz cocó", "I pooped"). A note that
+# describes food wins as a meal even if it mentions the bathroom in passing, so a
+# real meal log is never swallowed. The multilingual examples matter — the user
+# writes in Portuguese.
+TEXT_ROUTER_PREFIX = """FIRST, CLASSIFY THIS NOTE — this decides everything below.
+
+Is the note simply the user recording that they had a BOWEL MOVEMENT — that they
+went to the toilet to defecate / pooped? This may be in ANY language or phrasing:
+"I pooped", "just had a poo", "did a number two", "fiz cocó", "acabei de evacuar",
+"já fui à casa de banho fazer cocó", "fui de ventre". The note reports only the
+event and describes no food eaten.
+  * If YES -> set `kind` to "bowel". Set `items` to [] and `confidence` to 0 and
+    STOP — do not treat it as food, there is nothing to estimate.
+  * If the note instead describes FOOD OR DRINK the user consumed (even if it
+    mentions a bathroom visit in passing) -> set `kind` to "meal" and estimate it
+    with the rubric below.
+
+===================== MEAL DESCRIPTION (only when kind is "meal") ================
+
+"""
 
 # Text-only path: same schema and per-item rigour, but estimating from a written
 # description with NO photo. Confidence is capped low because there is no scale
@@ -902,14 +934,16 @@ def _gen_config(timeout_ms: Optional[int] = None) -> "types.GenerateContentConfi
 def _run_models(contents: List[Any], *, models: Optional[List[str]] = None,
                 retries: Optional[int] = None, timeout_ms: Optional[int] = None,
                 deadline_s: Optional[float] = None,
-                allow_body: bool = True) -> Dict[str, Any]:
+                allow_body: bool = True, allow_bowel: bool = False) -> Dict[str, Any]:
     """Send `contents` (photos+prompt or a text prompt) through the fallback
     chain, strongest model first, and assemble the record from the JSON reply.
 
-    Returns either a meal record (`kind` == "meal") or a body-composition record
-    (`kind` == "body"), depending on what the model says the image was. `allow_body`
-    is False on the text-only path, where there is no image to be a screenshot of
-    and a "body" verdict could only ever be a hallucination.
+    Returns one of three records by the model's `kind` verdict: a meal
+    (`kind` == "meal"), a body-composition reading (`kind` == "body", images only),
+    or a bowel-movement log (`kind` == "bowel", text only). `allow_body` and
+    `allow_bowel` gate which non-meal verdicts each path accepts — an image can't
+    be a bowel note and a text note can't be a scale screenshot, so a verdict the
+    path can't produce is a hallucination and falls back to "meal".
 
     The `quick` sync path and the background worker share this by overriding the
     chain / retries / per-call timeout / wall-clock deadline: the phone gets a
@@ -964,10 +998,11 @@ def _run_models(contents: List[Any], *, models: Optional[List[str]] = None,
                     "model %s produced unparseable output, next model: %s",
                     model, perr)
                 break
-            # The ROUTER_PREFIX fork. Only an explicit "body" verdict on a request
-            # that actually carried an image takes the body path; everything else
-            # is a meal, which is both the common case and the safe default.
-            if allow_body and str(data.get("kind") or "").strip().lower() == "body":
+            # The router fork. Only a verdict the current path can legitimately
+            # produce is honoured; anything else is a meal — the common case and the
+            # safe default.
+            kind = str(data.get("kind") or "").strip().lower()
+            if allow_body and kind == "body":
                 body = _normalize_body(data.get("body"))
                 app.logger.info("%s read a scale screenshot: %d metric(s)",
                                 model, len(body))
@@ -976,6 +1011,10 @@ def _run_models(contents: List[Any], *, models: Optional[List[str]] = None,
                     "measured_at": str(
                         (data.get("body") or {}).get("measured_at") or "").strip(),
                 }
+            if allow_bowel and kind == "bowel":
+                app.logger.info("%s classified the note as a bowel-movement log",
+                                model)
+                return {"kind": "bowel", "model": model}
 
             items = _normalize_items(data.get("items"))
             meal = _meal_from_items(items, data.get("confidence"), model)
@@ -1041,15 +1080,17 @@ def analyze(images: List[Tuple[bytes, str]], note: str = "",
 def analyze_text(note: str, now: datetime,
                  templates: Optional[List[Dict[str, Any]]] = None,
                  **kw) -> Dict[str, Any]:
-    """Estimate a meal from a written description alone (no photo). `now` is the
-    current local time, injected so the model can infer the meal's hour and never
-    place it in the future. Templates match here too ("o meu pequeno-almoço do
-    costume")."""
-    prompt = (TEXT_PROMPT.format(note=note, now_hhmm=now.strftime("%H:%M"))
+    """Classify a text-only note and act on it: a bowel-movement log
+    (`kind` == "bowel", see TEXT_ROUTER_PREFIX), or otherwise a meal estimated from
+    the description alone. `now` is the current local time, injected so the model
+    can infer a meal's hour and never place it in the future. Templates match here
+    too ("o meu pequeno-almoço do costume")."""
+    prompt = (TEXT_ROUTER_PREFIX
+              + TEXT_PROMPT.format(note=note, now_hhmm=now.strftime("%H:%M"))
               + _templates_block(templates))
-    # No image => nothing that could be a scale screenshot; a "body" verdict here
-    # could only be a hallucination, so the fork is closed off entirely.
-    return _run_models([prompt], allow_body=False, **kw)
+    # A text note can be a meal or a bowel log, never a scale reading (no screen to
+    # OCR) — so open the bowel fork and close the body one.
+    return _run_models([prompt], allow_body=False, allow_bowel=True, **kw)
 
 
 def _quick_kwargs() -> Dict[str, Any]:
@@ -1689,6 +1730,21 @@ def _finalize_body(rec: Dict[str, Any], now: datetime):
                     "lean_mass_kg": row.get("lean_mass_kg")}), 200
 
 
+def _finalize_bowel(when: datetime):
+    """Flag the day's bowel movement and tell the phone. The whole feature is one
+    boolean, keyed on the local day the note was sent (like /feel) — the note text
+    is not stored anywhere. Setting the flag again is idempotent, so a re-sent note
+    or a Cloud Tasks retry is harmless; only ever TRUE, never FALSE (a blank cell is
+    'no'). The user goes at most once a day, so yes/no is the whole model."""
+    day = when.date().isoformat()
+    write_daily(day, {BOWEL_COLUMN: True})
+    app.logger.info("bowel movement logged for %s", day)
+    return jsonify({
+        "summary": f"🚽 Bowel movement logged for {when.strftime('%-d %b')}.",
+        "kind": "bowel", "date": day, "bowel_movement": True,
+    }), 200
+
+
 def _finalize(nut: Dict[str, Any], photo_url: str, when: datetime,
               image_sha: str, note: str, text_only: bool,
               todays: List[Dict[str, Any]]):
@@ -1789,12 +1845,15 @@ def ingest():
         app.logger.info("quick analysis missed, deferring to worker: %s", err)
         nut, quick_ok = None, False
 
-    # A scale screenshot short-circuits here, before any Drive work: it needs no
-    # archive, no meals row and no template logic — just the numbers, straight into
-    # the day's row. Transcription is also far quicker than nutrition reasoning, so
-    # the quick pass essentially always carries it.
+    # Non-meal notes short-circuit here, before any Drive work: a scale screenshot
+    # (its ten metrics) or a bowel-movement note (one boolean) needs no archive, no
+    # meals row and no template logic — just a write into the day's row. Both are
+    # far quicker than nutrition reasoning, so the quick pass essentially always
+    # carries them.
     if quick_ok and nut.get("kind") == "body":
         return _finalize_body(nut, when)
+    if quick_ok and nut.get("kind") == "bowel":
+        return _finalize_bowel(when)
 
     # Archive now — the sheet needs the links and the worker needs the bytes.
     archived: List[Dict[str, str]] = []
@@ -1872,12 +1931,14 @@ def process():
         app.logger.warning("worker attempt %d failed, will retry: %s", attempt + 1, err)
         return jsonify({"error": str(err)}), 500  # 5xx => Cloud Tasks retries
 
-    # The quick pass never got far enough to classify, so a scale screenshot can
-    # reach the worker too (rare — it only takes a Gemini outage at the wrong
-    # moment). It was archived to Drive on the way in as if it were a meal, which
-    # is harmless: we just ignore the photo and write the metrics.
+    # The quick pass never got far enough to classify, so a non-meal note can reach
+    # the worker too (rare — only when a Gemini outage happens at the wrong moment).
+    # A screenshot was archived to Drive on the way in as if it were a meal, which
+    # is harmless: we just ignore the photo and write the numbers.
     if nut.get("kind") == "body":
         return _finalize_body(nut, when)
+    if nut.get("kind") == "bowel":
+        return _finalize_bowel(when)
 
     nut = _resolve_templates(nut, note, when, templates)
     return _finalize(nut, photo_url, when, image_sha, note, text_only, todays)

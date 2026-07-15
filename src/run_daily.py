@@ -99,6 +99,12 @@ def _num(value: Any) -> float:
         return 0.0
 
 
+def _is_true(value: Any) -> bool:
+    """A daily boolean flag (e.g. bowel_movement) reads back as Python True from an
+    UNFORMATTED_VALUE fetch, but tolerate the string form too."""
+    return value is True or str(value).strip().upper() == "TRUE"
+
+
 # -- nutrition roll-up ---------------------------------------------------------
 def _parse_items(raw: Any) -> List[Dict[str, Any]]:
     """The meals `items` cell holds a JSON array of per-ingredient objects."""
@@ -178,6 +184,7 @@ def refresh_dashboard(sheet: SheetClient) -> None:
         return
     rows = sorted(sheet.read_rows(DAILY_TAB), key=lambda r: str(r.get("date", "")))
     logged = [r for r in rows if _num(r.get("total_cals_in")) > 0][-7:]
+    week_ago = (datetime.now(timezone.utc).date() - timedelta(days=6)).isoformat()
 
     def latest(col: str) -> Any:
         """The most recent non-empty reading — body columns are only filled on days
@@ -193,10 +200,17 @@ def refresh_dashboard(sheet: SheetClient) -> None:
             return ""
         return round(sum(_num(r.get(col)) for r in logged) / len(logged))
 
+    def count7(col: str) -> int:
+        """How many of the last 7 calendar days carry TRUE in `col` (bowel_movement).
+        Counts by date, not by row, so gap days don't distort the tally."""
+        return sum(1 for r in rows
+                   if str(r.get("date", "")) >= week_ago and _is_true(r.get(col)))
+
     reduce = {
         "latest": latest,
         "avg7": avg7,
         "days7": lambda _col: len(logged),
+        "count7": count7,
         "now": lambda _col: datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     stats = [[reduce[kind](col)] for _label, col, kind in DASHBOARD_STATS]

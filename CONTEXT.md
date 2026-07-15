@@ -105,6 +105,23 @@ append**, so back-dated rows slot into chronological order. Scope is **today
 only** — other dates aren't parsed yet. A photo with **no timing note** keeps its
 capture time (the model leaves `meal_time` empty).
 
+### Source 4 — Bowel-movement note (a boolean per day)
+A plain text note through the **same note Shortcut** — "fiz cocó", "I just pooped",
+any phrasing, any language — sets `daily_summary.bowel_movement` = TRUE for the
+day. No new button and nothing stored from the note text; the whole feature is one
+boolean (the user goes at most once a day, so yes/no suffices; a blank cell is
+"no").
+
+Routing mirrors the image path's meal-vs-body fork: every text note is classified
+first (`TEXT_ROUTER_PREFIX`). `kind:"bowel"` → flag the day and return; anything
+describing food → the normal meal estimate. The classifier is deliberately narrow —
+a note that mentions food wins as a meal even if it also mentions the bathroom, so
+a real meal log is never swallowed. A text note can only ever be a meal or a bowel
+log, never a scale reading (there's no screen to OCR), so `analyze_text` runs with
+`allow_bowel=True, allow_body=False`. Setting the flag is idempotent (a re-send or a
+Cloud Tasks retry just re-sets TRUE). Keyed on the **local day the note was sent**,
+like `/feel` — not the waking-day grain nutrition uses.
+
 ## 3. Architecture
 
 ```
@@ -120,12 +137,12 @@ capture time (the model leaves `meal_time` empty).
   (07:00 Lisbon) ─► JOB   (Sun 20:00) ─► JOB              SERVICE ◄── iPhone Shortcut
        health-tracker-daily   health-tracker-weekly   health-tracker-ingest
                │                      │                    │  │   (POST /ingest — a meal
-        (Sheet only —            Gemini API        Gemini API │    photo OR a scale
-         no user OAuth,          (insights)      (nutrition + │    screenshot; the model
-         no health API)                           body OCR)   │    tells them apart.
-               │                                              │    POST /feel score)
-    rolls `meals` up into                            Google Drive (meal photos only)
-    the nutrition columns
+        (Sheet only —            Gemini API        Gemini API │    photo, a scale
+         no user OAuth,          (insights)      (nutrition + │    screenshot, or a text
+         no health API)                          body OCR +   │    note that's a meal or
+               │                                 note router) │    a bowel log; the model
+    rolls `meals` up into                                     │    routes it. POST /feel)
+    the nutrition columns                            Google Drive (meal photos only)
 ```
 
 - **Job vs Service:** the Service is a *push* endpoint that waits for the phone —
@@ -188,24 +205,25 @@ ingest service purely to write meal photos into the user's own Drive
 | Code (master copy) | `/Users/dneves/Health Tracker/` — `src/` (job), `ingest/` (service) |
 
 ### Sheet schema
-- **`daily_summary`** (40 columns): `date` | readiness (`sleep_score, hrv_ms,
-  spo2_pct, skin_temp_dev, subjective_feel`) | macros (`total_cals_in,
-  total_protein_g, total_carbs_g, total_fat_g`) | **15 Tier-1 micronutrient
-  totals** (`total_fiber_g, total_sugar_g, total_saturated_fat_g, total_sodium_mg,
-  total_potassium_mg, total_calcium_mg, total_iron_mg, total_magnesium_mg,
-  total_zinc_mg, total_vitamin_c_mg, total_vitamin_d_ug, total_vitamin_b12_ug,
-  total_vitamin_a_ug, total_folate_ug, total_omega3_g`) | activity
-  (`total_active_mins, steps`) | **body** (`weight_kg, bmi, body_fat_pct,
-  subcutaneous_fat_pct, visceral_fat, body_water_pct, muscle_mass_kg,
-  bone_mass_kg, bmr_kcal, metabolic_age, lean_mass_kg, body_measured_at`) |
-  `updated_at`. Column order lives in `src.sheets.DAILY_HEADERS`; the scale metrics
-  are `src.sheets.BODY_METRICS`, **mirrored** in `ingest/main.py BODY_METRICS`
-  (which also owns their plausibility bands) because ingest is a separate image
-  and can't import `src`. A test asserts the two stay in step.
+- **`daily_summary`** (41 columns): `date` | readiness + self-report
+  (`sleep_score, hrv_ms, spo2_pct, skin_temp_dev, subjective_feel,
+  bowel_movement`) | macros (`total_cals_in, total_protein_g, total_carbs_g,
+  total_fat_g`) | **15 Tier-1 micronutrient totals** (`total_fiber_g,
+  total_sugar_g, total_saturated_fat_g, total_sodium_mg, total_potassium_mg,
+  total_calcium_mg, total_iron_mg, total_magnesium_mg, total_zinc_mg,
+  total_vitamin_c_mg, total_vitamin_d_ug, total_vitamin_b12_ug, total_vitamin_a_ug,
+  total_folate_ug, total_omega3_g`) | activity (`total_active_mins, steps`) |
+  **body** (`weight_kg, bmi, body_fat_pct, subcutaneous_fat_pct, visceral_fat,
+  body_water_pct, muscle_mass_kg, bone_mass_kg, bmr_kcal, metabolic_age,
+  lean_mass_kg, body_measured_at`) | `updated_at`. Column order lives in
+  `src.sheets.DAILY_HEADERS`; the scale metrics are `src.sheets.BODY_METRICS`,
+  **mirrored** in `ingest/main.py BODY_METRICS` (which also owns their plausibility
+  bands) because ingest is a separate image and can't import `src`. A test asserts
+  the two stay in step. `bowel_movement` is a TRUE/blank self-report (see source 4).
   - **Merge-upsert keyed on `date`** — each source fills only its own columns
-    (scale screenshot → body, meals roll-up → nutrition, /feel → subjective_feel;
-    Fitbit biometrics will fill the readiness block). Never overwrites a column
-    it doesn't own.
+    (scale screenshot → body, meals roll-up → nutrition, /feel → subjective_feel,
+    a bowel note → bowel_movement; Fitbit biometrics will fill the readiness
+    block). Never overwrites a column it doesn't own.
   - Nutrition columns are keyed on the **waking day** (05:00 cutoff) and only
     written once that day is **over**, so a late-night snack joins the right day
     and today's row shows no nutrition total until tomorrow morning's run.
