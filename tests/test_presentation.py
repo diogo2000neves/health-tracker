@@ -126,3 +126,30 @@ def test_schema_tab_documents_every_column():
     assert sleep["description"]
     # ranges are published so a reader knows what's plausible
     assert by_name["weight_kg"]["min"] == 20 and by_name["weight_kg"]["max"] == 300
+
+
+# -- the "reported success it never checked" bug --------------------------------
+def test_clear_requests_survive_an_omitted_zero_start_index():
+    # Google omits int fields equal to zero, so a group anchored at column A comes
+    # back as {"endIndex": n} with NO startIndex. A direct [...] lookup raises
+    # KeyError, which the caller swallowed — silently skipping all presentation.
+    reqs = clear_group_requests(7, [{"range": {"endIndex": 14}, "depth": 1}])
+    assert reqs[0]["deleteDimensionGroup"]["range"]["startIndex"] == 0
+    assert reqs[0]["deleteDimensionGroup"]["range"]["endIndex"] == 14
+
+
+def test_clear_requests_target_every_group_it_is_given():
+    # deleteDimensionGroup only decrements depth by one level, so the caller must
+    # loop; this just guarantees we ask for each group we were handed.
+    existing = [
+        {"range": {"startIndex": 3, "endIndex": 14}, "depth": 1},
+        {"range": {"startIndex": 15, "endIndex": 25}, "depth": 1},
+        {"range": {"startIndex": 3, "endIndex": 78}, "depth": 2},   # nested
+    ]
+    reqs = clear_group_requests(7, existing)
+    assert len(reqs) == 3
+    spans = [(r["deleteDimensionGroup"]["range"]["startIndex"],
+              r["deleteDimensionGroup"]["range"]["endIndex"]) for r in reqs]
+    assert spans == [(3, 14), (15, 25), (3, 78)]
+    assert all(r["deleteDimensionGroup"]["range"]["dimension"] == "COLUMNS"
+               for r in reqs)

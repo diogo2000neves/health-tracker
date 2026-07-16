@@ -1,31 +1,20 @@
-"""Derived views that make `daily_summary` safe and easy to reason about.
+"""The `baselines` tab: what "normal" looks like *for this person*.
 
-Two tabs, both rebuilt from scratch on every daily run (like `dashboard`), so they
-can never drift out of step with the observations they derive from:
+Rebuilt from scratch on every daily run, so it can never drift out of step with the
+observations it derives from.
 
-* **`analysis`** — the causally aligned view. This exists because
-  `daily_summary` is an *observation* table, not a causal one, and correlating it
-  naively gives answers that are backwards in time.
-* **`baselines`** — what "normal" looks like *for this person*, so an absolute
-  number becomes interpretable.
+An absolute reading is close to meaningless on its own — 73 ms of HRV is excellent
+for one person and a warning for another — so this turns each metric into a mean,
+a spread and a z-score over a trailing window, plus a plain sentence saying whether
+the latest value is normal *for you*.
 
-## Why `analysis` has to exist
-
-A `daily_summary` row for day N mixes three different time windows:
-
-    sleep / recovery   -> the night that ENDED on the morning of N
-    weight             -> measured on the morning of N, fasted
-    food / activity    -> happened DURING day N, after both of the above
-
-So the food on row N is eaten *after* the sleep on row N and *after* the weigh-in
-on row N. Ask "does `total_cals_in` correlate with `sleep_efficiency_pct`?" on the
-raw table and you are asking whether **tomorrow's dinner affected last night's
-sleep**. The honest pairing is inputs from day N against outcomes from day N+1,
-which is what this module builds — driven entirely by each column's declared
-`causal` window in the registry, not by a hand-maintained list.
-
-Storage stays honest (every value stamped when it was measured, which is
-unambiguous and survives a migration); the alignment lives here, in the view.
+**Reading correlations out of `daily_summary` needs care**, and the tab that used
+to do it for you is gone. A row is an *observation of a date*, not a causal unit:
+sleep and recovery on row N happened the night BEFORE N, and the weigh-in was taken
+that morning BEFORE the day's food. So pairing intake with same-row sleep asks
+whether tomorrow's dinner affected last night's sleep. Every column's real
+measurement window is declared in `schema/registry.py` and published in the sheet's
+`schema` tab as `measures_when` — pair day N's intake against day N+1's outcomes.
 """
 from __future__ import annotations
 
@@ -34,18 +23,11 @@ from datetime import date, timedelta
 from statistics import mean, pstdev
 from typing import Any, Dict, List, Optional, Sequence
 
-from schema.registry import (
-    BY_NAME, CAUSAL_LABELS, Column, causal_inputs, causal_outcomes,
-    numeric_columns,
-)
+from schema.registry import Column, numeric_columns
 
 # How many days back the personal baselines look. 28 days ~= 4 weeks, so it spans
 # whole weeks and isn't skewed by "weekends are different".
 BASELINE_DAYS = 28
-
-# Outcome columns get this suffix in the analysis tab: they are read from the day
-# AFTER the inputs on the same row.
-NEXT_SUFFIX = "_next"
 
 
 def _num(value: Any) -> Optional[float]:
@@ -56,58 +38,6 @@ def _num(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return out if math.isfinite(out) else None
-
-
-# -- analysis (causally aligned) ----------------------------------------------
-def analysis_headers() -> List[str]:
-    """`date`, then everything I did on that day, then what my body did next."""
-    return (["date"]
-            + [c.name for c in causal_inputs()]
-            + [c.name + NEXT_SUFFIX for c in causal_outcomes()])
-
-
-def analysis_rows(daily: Sequence[Dict[str, Any]]) -> List[List[Any]]:
-    """Inputs from day N beside the outcomes they plausibly caused, on day N+1.
-
-    Keyed on real dates, not row adjacency: a gap in the data must not silently
-    pair Monday's food with Friday's sleep. A day whose successor is missing keeps
-    its inputs and leaves the outcomes blank.
-    """
-    by_date: Dict[str, Dict[str, Any]] = {}
-    for row in daily:
-        key = str(row.get("date") or "")
-        if key:
-            by_date[key] = row
-
-    inputs, outcomes = causal_inputs(), causal_outcomes()
-    rows: List[List[Any]] = []
-    for day in sorted(by_date):
-        try:
-            nxt = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
-        except ValueError:
-            continue  # not a real date — skip rather than mispair
-        today, tomorrow = by_date[day], by_date.get(nxt, {})
-        # Skip days that carry no inputs at all: a row that only holds outcomes
-        # would add an empty line whose outcomes already appear on the day before.
-        if not any(today.get(c.name) not in (None, "") for c in inputs):
-            continue
-        rows.append(
-            [day]
-            + [today.get(c.name, "") for c in inputs]
-            + [tomorrow.get(c.name, "") for c in outcomes]
-        )
-    return rows
-
-
-def analysis_legend() -> List[str]:
-    """A one-line note explaining the tab, written above the header."""
-    return [
-        "CAUSALLY ALIGNED VIEW — rebuilt every run, do not edit. Each row pairs "
-        "what I did on `date` with what my body did AFTERWARDS: columns ending "
-        f"`{NEXT_SUFFIX}` are read from the FOLLOWING day's row. Correlate across "
-        "this tab, not daily_summary, or you will be asking whether tomorrow's "
-        "dinner affected last night's sleep."
-    ]
 
 
 # -- baselines (what is normal for THIS person) --------------------------------

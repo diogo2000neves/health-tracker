@@ -154,13 +154,26 @@ def format_requests(daily_id: int) -> List[Dict[str, Any]]:
 
 def clear_group_requests(daily_id: int,
                          existing: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Drop the groups already on the sheet so they can be rebuilt cleanly.
+    """Requests to drop the groups currently on the sheet, so they can be rebuilt.
 
-    Needed because groups are positional: after a schema reorder the old ranges
-    span the wrong columns, and because Sheets silently merges adjacent groups,
-    a stale run can leave one giant group that no new request will match."""
+    Needed because groups are positional: after a schema change the old ranges span
+    the wrong columns, and Sheets merges overlapping/adjacent groups — so stale
+    groups plus new ones shifted by one column collapse into a single giant block.
+
+    NOTE this is only ONE pass. `deleteDimensionGroup` *decrements the depth* of the
+    dimensions in a range rather than deleting a group object, so nested groups
+    survive a single pass. The caller must loop until the sheet reports none left
+    (see maintenance._flatten_groups) — believing one pass is what let a broken
+    layout survive three "successful" maintenance runs.
+
+    `startIndex` is read with a default because Google omits int fields equal to
+    zero: a group anchored at column A comes back as `{"endIndex": n}` and a direct
+    lookup would KeyError, silently skipping the whole presentation step.
+    """
     return [{"deleteDimensionGroup": {"range": _grid_range(
-        daily_id, g["range"]["startIndex"], g["range"]["endIndex"])}}
+        daily_id,
+        g.get("range", {}).get("startIndex", 0),
+        g.get("range", {}).get("endIndex", 0))}}
         for g in existing]
 
 

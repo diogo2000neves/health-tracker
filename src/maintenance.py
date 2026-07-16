@@ -175,8 +175,12 @@ def main() -> None:
     # 5. schema tab — the data dictionary, regenerated from the registry.
     print(_sync_schema_tab(svc, sid, sheets))
 
-    # 6. presentation: frozen panes, collapsible blocks, units, header notes.
-    print(_apply_presentation(svc, sid, sheets[DAILY_TAB]["properties"]["sheetId"]))
+    # 6. drop physical columns the schema no longer has (empty ones only), then
+    #    apply presentation. Order matters: trimming shifts column indices, so the
+    #    groups must be rebuilt afterwards or they'd span the wrong columns.
+    daily_id = sheets[DAILY_TAB]["properties"]["sheetId"]
+    print(_trim_stale_columns(svc, sid, daily_id))
+    print(_apply_presentation(svc, sid, daily_id))
 
     print(f"maintenance done (spreadsheet {sid}, project {project}).")
 
@@ -201,29 +205,102 @@ def _sync_schema_tab(svc, sid: str, sheets: Dict[str, Any]) -> str:
     return f"schema: documented {len(schema_rows())} column(s)"
 
 
+# Column groups can nest, and each delete pass only strips one level. Six is far
+# more depth than this sheet will ever have; the loop exists to terminate, not to
+# iterate.
+_MAX_GROUP_PASSES = 6
+
+
+def _column_groups(svc, sid: str, daily_id: int) -> List[Dict[str, Any]]:
+    """The column groups currently on the tab, straight from the API."""
+    meta = svc.spreadsheets().get(
+        spreadsheetId=sid,
+        fields="sheets(properties(sheetId),columnGroups(range,depth,collapsed))",
+    ).execute()
+    for sheet in meta.get("sheets", []):
+        if sheet["properties"]["sheetId"] == daily_id:
+            return sheet.get("columnGroups", []) or []
+    return []
+
+
+def _flatten_groups(svc, sid: str, daily_id: int) -> int:
+    """Remove EVERY column group, re-reading until the sheet agrees none are left.
+
+    `deleteDimensionGroup` decrements the depth of the dimensions in a range rather
+    than removing a group object, so one pass cannot clear nested groups. The old
+    code deleted once and then reported success using the count it had read
+    *before* deleting — so it printed "replaced 5" on three consecutive runs while
+    the sheet stayed broken. Never trust a write you haven't read back.
+    """
+    removed = 0
+    for _ in range(_MAX_GROUP_PASSES):
+        groups = _column_groups(svc, sid, daily_id)
+        if not groups:
+            return removed
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=sid,
+            body={"requests": clear_group_requests(daily_id, groups)},
+        ).execute()
+        removed += len(groups)
+    left = _column_groups(svc, sid, daily_id)
+    if left:
+        raise RuntimeError(
+            f"could not flatten column groups: {len(left)} still on the sheet "
+            f"after {_MAX_GROUP_PASSES} passes ({left[:2]})")
+    return removed
+
+
+def _trim_stale_columns(svc, sid: str, daily_id: int) -> str:
+    """Delete grid columns past the end of the schema.
+
+    Shrinking the schema leaves the physical column behind: dropping
+    `subjective_feel` took the header from 79 to 78, and the realign blanked the
+    79th but could not remove it — that is the stray empty `CA` at the end of the
+    sheet. Only deletes columns that are both outside DAILY_HEADERS *and* empty, so
+    this can never eat data.
+    """
+    meta = svc.spreadsheets().get(
+        spreadsheetId=sid,
+        fields="sheets(properties(sheetId,gridProperties(columnCount)))",
+    ).execute()
+    count = 0
+    for sheet in meta.get("sheets", []):
+        if sheet["properties"]["sheetId"] == daily_id:
+            count = sheet["properties"]["gridProperties"]["columnCount"]
+    want = len(DAILY_HEADERS)
+    if count <= want:
+        return f"columns: {count} — no stale columns past the schema"
+
+    first, last = col_letter(want), col_letter(count - 1)
+    values = (
+        svc.spreadsheets().values()
+        .get(spreadsheetId=sid, range=f"{DAILY_TAB}!{first}:{last}")
+        .execute().get("values", [])
+    )
+    if any(str(cell).strip() for row in values for cell in row):
+        return (f"columns: {count - want} past the schema ({first}:{last}) still "
+                "hold data — left alone, migrate them first")
+
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=sid,
+        body={"requests": [{"deleteDimension": {"range": {
+            "sheetId": daily_id, "dimension": "COLUMNS",
+            "startIndex": want, "endIndex": count,
+        }}}]},
+    ).execute()
+    return f"columns: deleted {count - want} empty column(s) past the schema ({first}:{last})"
+
+
 def _apply_presentation(svc, sid: str, daily_id: int) -> str:
     """Formatting only — never touches a value, so it is always safe to re-run.
 
-    Three passes, in this order for real reasons: existing groups are deleted first
-    (they're positional, so a schema reorder leaves them spanning the wrong
-    columns), then rebuilt, then collapsed — a group must exist before it can be
-    collapsed, and it must be created in its own batch to be visible to the next.
+    Flatten, rebuild, collapse, then **verify against the sheet**. Each step is its
+    own batch because a group must exist before it can be collapsed, and the final
+    read-back is the point: this function's whole failure mode was reporting a
+    success it never checked.
     """
     try:
-        meta = svc.spreadsheets().get(
-            spreadsheetId=sid,
-            fields="sheets(properties(sheetId),columnGroups(range,depth))",
-        ).execute()
-        existing: List[Dict[str, Any]] = []
-        for sheet in meta.get("sheets", []):
-            if sheet["properties"]["sheetId"] == daily_id:
-                existing = sheet.get("columnGroups", [])
-        if existing:
-            svc.spreadsheets().batchUpdate(
-                spreadsheetId=sid,
-                body={"requests": clear_group_requests(daily_id, existing)},
-            ).execute()
-
+        removed = _flatten_groups(svc, sid, daily_id)
         svc.spreadsheets().batchUpdate(
             spreadsheetId=sid,
             body={"requests": format_requests(daily_id)
@@ -232,11 +309,18 @@ def _apply_presentation(svc, sid: str, daily_id: int) -> str:
         svc.spreadsheets().batchUpdate(
             spreadsheetId=sid, body={"requests": collapse_requests(daily_id)},
         ).execute()
-        return (f"presentation: {len(block_groups())} collapsible block(s) "
-                f"(replaced {len(existing)}), frozen panes, number formats, "
+
+        want = block_groups()
+        final = _column_groups(svc, sid, daily_id)
+        if len(final) != len(want):
+            return (f"presentation: BROKEN — wanted {len(want)} groups, the sheet "
+                    f"has {len(final)}. Ranges: "
+                    f"{[(g.get('range', {}).get('startIndex', 0), g.get('range', {}).get('endIndex')) for g in final]}")
+        return (f"presentation: {len(want)} collapsible block(s) verified on the "
+                f"sheet (removed {removed} stale), frozen panes, number formats, "
                 "header notes")
-    except Exception as err:  # cosmetic — never fail maintenance
-        return f"presentation: skipped ({err})"
+    except Exception as err:  # cosmetic — must never fail the data migration
+        return f"presentation: FAILED ({err})"
 
 
 if __name__ == "__main__":

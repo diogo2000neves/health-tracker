@@ -1,9 +1,7 @@
-"""Tests for the derived views: causal alignment and personal baselines."""
+"""Tests for the `baselines` tab: what is normal for this person."""
 from datetime import date
 
-from src.analysis import (
-    BASELINE_HEADERS, analysis_headers, analysis_rows, baseline_rows,
-)
+from src.analysis import BASELINE_HEADERS, baseline_rows
 
 # Two real-shaped days: intake on the 15th, and the night/weigh-in that followed
 # it recorded on the 16th.
@@ -17,67 +15,6 @@ DAILY = [
      "sleep_efficiency_pct": 98.3, "hrv_ms": 73.1, "resting_hr_bpm": 62,
      "weight_kg": 69.05},
 ]
-
-
-def _row(rows, day):
-    idx = {n: i for i, n in enumerate(analysis_headers())}
-    for r in rows:
-        if r[0] == day:
-            return {n: r[i] for n, i in idx.items()}
-    raise AssertionError(f"no analysis row for {day}")
-
-
-# -- the causal fix ------------------------------------------------------------
-def test_intake_is_paired_with_the_night_that_followed_it():
-    # THE point of this module. On the raw table, the 15th's food sits beside the
-    # 15th's sleep — which happened the night BEFORE that food was eaten. Here the
-    # 15th's intake is paired with the 16th's sleep, which it could actually cause.
-    r = _row(analysis_rows(DAILY), "2026-07-15")
-    assert r["total_cals_in"] == 2000.0            # eaten on the 15th
-    assert r["sleep_mins_next"] == 525             # the night of 15->16
-    assert r["sleep_efficiency_pct_next"] == 98.3
-    assert r["hrv_ms_next"] == 73.1
-    assert r["weight_kg_next"] == 69.05            # the 16th's fasted weigh-in
-
-
-def test_outcomes_are_never_taken_from_the_same_row():
-    r = _row(analysis_rows(DAILY), "2026-07-15")
-    # 470 / 96.5 / 75.2 / 70.0 are the 15th's OWN outcome values — they belong to
-    # the 14th's inputs, and must not appear on the 15th's analysis row.
-    assert r["sleep_mins_next"] != 470
-    assert r["hrv_ms_next"] != 75.2
-    assert r["weight_kg_next"] != 70.0
-
-
-def test_a_gap_in_the_data_never_mispairs_days():
-    # Monday's food must not be paired with Friday's sleep just because Friday is
-    # the next ROW. Alignment is by real date, so a missing successor blanks out.
-    sparse = [DAILY[0], {**DAILY[1], "date": "2026-07-20"}]
-    r = _row(analysis_rows(sparse), "2026-07-15")
-    assert r["total_cals_in"] == 2000.0
-    assert r["sleep_mins_next"] == ""              # 16th absent -> blank, not the 20th
-
-
-def test_days_with_no_inputs_are_skipped():
-    # A row holding only outcomes would add a line whose values already appear as
-    # `_next` on the day before.
-    rows = analysis_rows([{"date": "2026-07-15", "sleep_mins": 470}])
-    assert rows == []
-
-
-def test_headers_split_inputs_from_next_day_outcomes():
-    h = analysis_headers()
-    assert h[0] == "date"
-    assert "total_cals_in" in h and "steps" in h          # inputs, unsuffixed
-    assert "sleep_mins_next" in h and "weight_kg_next" in h
-    assert "sleep_mins" not in h                          # outcomes only as _next
-    assert len(h) == len(set(h))
-
-
-def test_analysis_is_sorted_and_complete():
-    rows = analysis_rows(DAILY)
-    assert [r[0] for r in rows] == ["2026-07-15", "2026-07-16"]
-    assert all(len(r) == len(analysis_headers()) for r in rows)
 
 
 # -- baselines -----------------------------------------------------------------
