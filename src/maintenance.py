@@ -151,40 +151,55 @@ def _chart_requests(dashboard_id: int, daily_id: int) -> List[Dict[str, Any]]:
             "widthPixels": 860, "heightPixels": 320,
         }}
 
-    date_i = DAILY_HEADERS.index("date")
-    weight_i = DAILY_HEADERS.index("weight_kg")
-    lean_i = DAILY_HEADERS.index("lean_mass_kg")
-    cals_i = DAILY_HEADERS.index("total_cals_in")
+    def index(name: str) -> int:
+        return DAILY_HEADERS.index(name)
 
-    def series(idx: int) -> Dict[str, Any]:
-        return {"series": {"sourceRange": {"sources": [col(idx)]}},
+    def series(name: str) -> Dict[str, Any]:
+        return {"series": {"sourceRange": {"sources": [col(index(name))]}},
                 "targetAxis": "LEFT_AXIS"}
+
+    domain = [{"domain": {"sourceRange": {"sources": [col(index("date"))]}}}]
 
     line = {"addChart": {"chart": {
         "spec": {
             "title": "Weight & lean mass (kg)",
             "basicChart": {
                 "chartType": "LINE", "legendPosition": "BOTTOM_LEGEND",
-                "headerCount": 1,
-                "domains": [{"domain": {"sourceRange": {"sources": [col(date_i)]}}}],
-                "series": [series(weight_i), series(lean_i)],
+                "headerCount": 1, "domains": domain,
+                "series": [series("weight_kg"), series("lean_mass_kg")],
             },
         },
         "position": anchor(1),
     }}}
-    bars = {"addChart": {"chart": {
+    # Both sides of the energy balance on one chart: intake (meals) against
+    # measured expenditure (Fitbit). The gap between the two lines is the whole
+    # point of the system — a surplus or deficit you can actually see, rather than
+    # a guess from weight alone.
+    energy = {"addChart": {"chart": {
         "spec": {
-            "title": "Calories in (kcal/day)",
+            "title": "Energy balance (kcal/day): in vs out",
             "basicChart": {
-                "chartType": "COLUMN", "legendPosition": "NO_LEGEND",
-                "headerCount": 1,
-                "domains": [{"domain": {"sourceRange": {"sources": [col(date_i)]}}}],
-                "series": [series(cals_i)],
+                "chartType": "COLUMN", "legendPosition": "BOTTOM_LEGEND",
+                "headerCount": 1, "domains": domain,
+                "series": [series("total_cals_in"), series("total_cals_out")],
             },
         },
         "position": anchor(18),
     }}}
-    return [line, bars]
+    # Sleep quality over time: the honest stand-in for the score the API doesn't
+    # expose — how much of the night was actually spent restoring.
+    sleep = {"addChart": {"chart": {
+        "spec": {
+            "title": "Sleep: deep & REM (mins)",
+            "basicChart": {
+                "chartType": "COLUMN", "legendPosition": "BOTTOM_LEGEND",
+                "headerCount": 1, "domains": domain,
+                "series": [series("sleep_deep_mins"), series("sleep_rem_mins")],
+            },
+        },
+        "position": anchor(35),
+    }}}
+    return [line, energy, sleep]
 
 
 def main() -> None:
