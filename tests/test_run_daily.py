@@ -97,8 +97,8 @@ def test_daily_nutrition_rolls_up_tier1_nutrients_from_items():
 
 
 # -- merge rows -------------------------------------------------------------------
-def test_build_daily_rows_carries_nutrition_only():
-    # The job owns the nutrition columns and nothing else. It must never emit a
+def test_build_daily_rows_carries_only_the_columns_it_owns():
+    # The job owns biometrics + nutrition and nothing else. It must never emit a
     # body column, or `upsert_daily` would overwrite the scale reading the ingest
     # service wrote when the user stepped on the scale.
     rows = build_daily_rows({
@@ -111,6 +111,26 @@ def test_build_daily_rows_carries_nutrition_only():
     ]
     assert not any(k.startswith("weight") or k.startswith("body") or "mass" in k
                    for row in rows for k in row)
+
+
+def test_build_daily_rows_folds_sources_into_one_row_per_date():
+    # The contract upsert_daily depends on: ONE row per date. Two rows for the same
+    # date would be merged against the same grid snapshot, so the second would
+    # clobber the first's columns — or append the day twice if it were new.
+    rows = build_daily_rows(
+        {"2026-07-16": {"steps": 728, "hrv_ms": 73.1}},      # biometrics
+        {"2026-07-16": {"total_cals_in": 2000.0}},           # nutrition
+    )
+    assert rows == [{"date": "2026-07-16", "steps": 728, "hrv_ms": 73.1,
+                     "total_cals_in": 2000.0}]
+
+
+def test_build_daily_rows_unions_dates_across_sources():
+    # a day with only a weigh-in-less Fitbit night, and a day with only meals
+    rows = build_daily_rows({"2026-07-16": {"steps": 728}},
+                            {"2026-07-15": {"total_cals_in": 2000.0}})
+    assert [r["date"] for r in rows] == ["2026-07-15", "2026-07-16"]
+    assert build_daily_rows() == []
 
 
 # -- bowel-movement flag + dashboard tally ----------------------------------------

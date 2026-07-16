@@ -26,6 +26,8 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from googleapiclient.discovery import build
 
+from src.biometrics import BIOMETRIC_COLUMNS
+
 DAILY_TAB = "daily_summary"
 MEALS_TAB = "meals"
 DASHBOARD_TAB = "dashboard"
@@ -58,24 +60,35 @@ BODY_METRICS: List[str] = [
     "metabolic_age",
 ]
 
-# Parent schema. Readiness block first (blueprint order), then the nutrition
-# roll-up (macros + Tier-1 micronutrients), then activity and body composition;
-# `updated_at` stays last as bookkeeping. `lean_mass_kg` = weight_kg x
-# (1 - body_fat_pct/100) — stored, not just derived, so the sheet stays
-# self-contained for AI analysis. `body_measured_at` is the reading's own
-# timestamp as printed in the app (a 07:00 fasted weigh-in reads differently from
-# a 21:00 one, so the hour is signal, not bookkeeping). `bowel_movement` is a
-# TRUE/blank flag that sits beside `subjective_feel` — both are things the user
-# self-reports about a day rather than sensor readings; it's set from a plain text
-# note ("fiz cocó") via the ingest service. Schema changes must go through
-# src/maintenance.py so existing rows are realigned in place, never clobbered.
+# Parent schema, grouped by source so a reader can see who owns what:
+#   self-report -> the /feel endpoint and a plain note (ingest service)
+#   sleep / recovery / activity -> Fitbit Air via the Google Health API (daily job)
+#   nutrition -> the meals roll-up (daily job)
+#   body -> the scale screenshot (ingest service)
+# `updated_at` stays last as bookkeeping.
+#
+# Derived-but-stored columns (the sheet must stay self-contained for AI analysis):
+# `lean_mass_kg` = weight_kg x (1 - body_fat_pct/100); `sleep_efficiency_pct` =
+# asleep / in-bed; `skin_temp_dev` = nightly - 30-day baseline.
+#
+# There is deliberately **no `sleep_score`**: Fitbit's 0-100 score is proprietary
+# and appears nowhere in the Google Health API (checked field-by-field against
+# discovery rev 20260715 — the Sleep message has interval/type/metadata/summary/
+# stages only). The components it is computed from *are* here, which is strictly
+# more information. Don't re-add the column expecting the API to fill it.
+#
+# Schema changes must go through src/maintenance.py so existing rows are realigned
+# in place, never clobbered.
 DAILY_HEADERS: List[str] = [
     "date",
-    "sleep_score", "hrv_ms", "spo2_pct", "skin_temp_dev",
+    # self-reported
     "subjective_feel", "bowel_movement",
+    # sleep + recovery + activity (Fitbit Air)
+    *BIOMETRIC_COLUMNS,
+    # nutrition roll-up (meals)
     "total_cals_in", "total_protein_g", "total_carbs_g", "total_fat_g",
     *[f"total_{n}" for n in TIER1_NUTRIENTS],
-    "total_active_mins", "steps",
+    # body composition (scale screenshot)
     *BODY_METRICS, "lean_mass_kg", "body_measured_at",
     "updated_at",
 ]
@@ -86,7 +99,10 @@ DAILY_HEADERS: List[str] = [
 # drift out of alignment.
 #   latest — the most recent non-empty value in that column
 #   avg7   — mean over the last 7 days that have nutrition logged
-#   days7  — how many such days exist
+#   avgd7  — mean over the last 7 *calendar* days that have this column filled
+#            (biometrics arrive every day the tracker is worn, independently of
+#            whether meals were logged, so they must not use the nutrition window)
+#   days7  — how many nutrition-logged days exist
 #   count7 — how many of the last 7 calendar days have TRUE in that column
 #   now    — the refresh timestamp
 DASHBOARD_STATS: List[tuple] = [
@@ -102,12 +118,24 @@ DASHBOARD_STATS: List[tuple] = [
     ("Latest BMR (kcal)", "bmr_kcal", "latest"),
     ("Latest metabolic age", "metabolic_age", "latest"),
     ("Last weigh-in", "body_measured_at", "latest"),
-    ("Avg kcal (last 7 logged days)", "total_cals_in", "avg7"),
+    ("Avg kcal in (last 7 logged days)", "total_cals_in", "avg7"),
     ("Avg protein g (7d)", "total_protein_g", "avg7"),
     ("Avg carbs g (7d)", "total_carbs_g", "avg7"),
     ("Avg fat g (7d)", "total_fat_g", "avg7"),
     ("Nutrition days in window", "", "days7"),
     ("Bowel movements (last 7 days)", "bowel_movement", "count7"),
+    # Fitbit Air. `latest` skips blanks, so these show the last night actually
+    # recorded rather than going empty on a day the tracker wasn't worn.
+    ("Last night asleep (mins)", "sleep_mins", "latest"),
+    ("Last night efficiency (%)", "sleep_efficiency_pct", "latest"),
+    ("Last night deep (mins)", "sleep_deep_mins", "latest"),
+    ("Last night REM (mins)", "sleep_rem_mins", "latest"),
+    ("Latest resting HR (bpm)", "resting_hr_bpm", "latest"),
+    ("Latest HRV (ms)", "hrv_ms", "latest"),
+    ("Latest SpO2 (%)", "spo2_pct", "latest"),
+    ("Latest skin temp dev (C)", "skin_temp_dev", "latest"),
+    ("Avg steps (7d)", "steps", "avgd7"),
+    ("Avg calories out (7d)", "total_cals_out", "avgd7"),
     ("Stats updated (UTC)", "", "now"),
 ]
 DASHBOARD_FIRST_ROW = 3  # the stat values start at B3, under the title
@@ -124,6 +152,13 @@ def col_letter(index: int) -> str:
         index, rem = divmod(index - 1, 26)
         letters = chr(ord("A") + rem) + letters
     return letters
+
+
+# Read ranges are derived from the schema, never hard-coded: daily_summary has
+# already outgrown A:Z once (silently truncating the header, so columns past the
+# cut looked "missing" and their writes went nowhere) and is now ~84 wide. The
+# headroom lets a few columns be added before this needs a thought.
+READ_LAST_COL = col_letter(len(DAILY_HEADERS) + 40)
 
 
 class SheetClient:
@@ -209,7 +244,7 @@ class SheetClient:
             self.svc.spreadsheets().values()
             .get(
                 spreadsheetId=self.sid,
-                range=f"{tab}!A1:{col_letter(51)}",  # A:AZ
+                range=f"{tab}!A1:{READ_LAST_COL}",
                 valueRenderOption="UNFORMATTED_VALUE",
             )
             .execute().get("values", [])

@@ -29,7 +29,7 @@ Google Sheet + Google Drive that I own and can download anytime.
 | # | Source | Hardware / input | Status |
 |---|---|---|---|
 | 1 | **Body composition** | Tefal **Goodvibes** smart scale → app screenshot | ✅ Built (all 10 metrics) |
-| 2 | **Biometrics / activity** | **Fitbit Air** (steps, sleep, HR) | ❌ **NOT built yet** |
+| 2 | **Biometrics / activity** | **Fitbit Air** (sleep, recovery, activity) | ✅ Built (~40 metrics/day) |
 | 3 | **Nutrition** | iPhone camera → meal photos | ✅ Built |
 
 ### Source 1 — Scale (10 metrics, via a screenshot)
@@ -66,13 +66,42 @@ Two properties worth knowing:
   prompt explicitly rejects it, and `_normalize_body` enforces plausibility bands
   (weight 20–300 kg, BMI 8–70, …) so a misread is dropped rather than written.
 
-### Source 2 — Fitbit Air (NOT built)
-The next obvious feature, and now the *only* reason to bring back a user OAuth
-token for health data. Steps, sleep stages, HRV, SpO2 and resting HR **are** fully
-available via the **Google Health API** (unlike the scale's body composition),
-using scopes `activity_and_fitness.readonly` + `sleep.readonly`. It would fill the
-readiness columns through the same merge-upsert. Note the token would have to be
-**health-only** — see gotcha 8.
+### Source 2 — Fitbit Air (sleep, recovery, activity)
+The tracker syncs to **Google Health** in the background — no app to open, nothing
+to tap — so unlike the scale, the API really is zero-touch here. The daily job
+pulls it with a **health-only** OAuth token (`health-oauth-token`; see gotcha 8)
+and fills ~40 columns per day. Scopes: `sleep.readonly`,
+`health_metrics_and_measurements.readonly`, `activity_and_fitness.readonly`.
+
+Two endpoints, chosen per data type (`src/google_health.py`):
+* **`list`** for sleep sessions and the `daily-*` summaries (already one per day).
+* **`dailyRollUp`** for everything intraday (steps, distance, calories, heart
+  rate…). It aggregates server-side over **civil** days — our exact day grain —
+  instead of us summing ~200 one-minute buckets. It is also the *only* route to
+  some data: `floors` has no `list` endpoint at all, and **`total-calories`
+  (calories OUT) exists only as a rollup**. Pair it with `total_cals_in` and you
+  have true energy balance — the number this whole system was built to find.
+
+**There is no sleep score, and there never will be.** Fitbit's 0-100 score is
+proprietary and appears nowhere in the API (checked field-by-field against
+discovery rev 20260715: the `Sleep` message is interval/type/metadata/summary/
+stages only). Same story as the scale's body composition. What we store instead is
+strictly *more* information — the components the score is computed from:
+`sleep_efficiency_pct` (asleep÷in-bed, honest arithmetic), deep/REM/light minutes,
+latency, awakenings, plus resting HR, HRV, SpO2, respiration and skin temperature.
+Don't re-add a `sleep_score` column expecting the API to fill it.
+
+**Naps are separated, and this matters.** A 2-hour afternoon nap ends on the same
+*wake day* a night would land on, so left alone it silently overwrites that night.
+`metadata.nap` routes it to `nap_mins` instead. If a night is fragmented into
+several non-nap sessions, the longest is the night and the rest become naps, so the
+sleep columns always describe one coherent sleep.
+
+**Not produced by this device** (verified empty against the live API, not guessed):
+floors and altitude (no altimeter), VO2 max / cardio fitness (needs a tracked run),
+exercise sessions, blood glucose, core body temperature. ECG and irregular-rhythm
+notifications sit behind their own extra scopes (`ecg`, `irn`) and were left
+ungranted — least privilege, and the hardware almost certainly lacks the sensor.
 
 ### Source 3 — Meal photos
 iPhone **Shortcut** (a button in Control Center) → takes a photo → HTTP **POST**s
@@ -126,7 +155,8 @@ like `/feel` — not the waking-day grain nutrition uses.
 
 ```
               ┌────────────────── Google Sheet "Health Tracker" ──────────────────┐
-              │ `daily_summary` : one row/day (readiness + nutrition + physique)  │
+              │ `daily_summary` : one row/day (sleep + recovery + activity +      │
+              │                    nutrition + physique + self-report)            │
               │ `meals`         : one row/photo (per-ingredient `items` JSON)     │
               │ `templates`     : measured, reusable meals                        │
               │ `dashboard`     : stat cells + embedded charts                    │
@@ -137,22 +167,21 @@ like `/feel` — not the waking-day grain nutrition uses.
   (07:00 Lisbon) ─► JOB   (Sun 20:00) ─► JOB              SERVICE ◄── iPhone Shortcut
        health-tracker-daily   health-tracker-weekly   health-tracker-ingest
                │                      │                    │  │   (POST /ingest — a meal
-        (Sheet only —            Gemini API        Gemini API │    photo, a scale
-         no user OAuth,          (insights)      (nutrition + │    screenshot, or a text
-         no health API)                          body OCR +   │    note that's a meal or
-               │                                 note router) │    a bowel log; the model
-    rolls `meals` up into                                     │    routes it. POST /feel)
-    the nutrition columns                            Google Drive (meal photos only)
+    Google Health API           Gemini API        Gemini API │    photo, a scale
+    (Fitbit Air: sleep,         (insights)      (nutrition + │    screenshot, or a text
+     recovery, activity)                         body OCR +  │    note that's a meal or
+               │                                note router)  │    a bowel log; the model
+    + rolls `meals` up into                                   │    routes it. POST /feel)
+      the nutrition columns                          Google Drive (meal photos only)
 ```
 
 - **Job vs Service:** the Service is a *push* endpoint that waits for the phone —
-  it is where **all** user data now enters the system (meals *and* body
-  composition). The Jobs are timers that only ever *derive* from what's already in
-  the Sheet. All scale to zero.
-- **Why the daily job still exists** (it is no longer a "sync"): nutrition uses a
-  **waking-day** grain and a day is only totalled once it is *over* (see below), so
-  something has to run after the day ends. That is its whole remaining purpose,
-  plus refreshing the dashboard. It holds no OAuth token and calls no external API.
+  meals, body composition and self-reports enter there, on one button. The daily
+  Job *pulls* what a worn tracker syncs on its own. All scale to zero.
+- **Why the daily job runs at 07:00**, two reasons: nutrition uses a **waking-day**
+  grain and a day is only totalled once it is *over* (see below); and by then the
+  night that just ended has been scored and synced, so it lands on its own wake-day
+  row the same morning.
 - **Meal ingestion is hybrid (reliability):** `/ingest` does a quick single-model
   pass for **instant macros** when Gemini is fast; if it's slow/unavailable, it
   archives the photos and enqueues a **Cloud Tasks** job (queue `meal-ingest`,
@@ -179,16 +208,19 @@ like `/feel` — not the waking-day grain nutrition uses.
 
 | What | Identity | Why |
 |---|---|---|
+| Read Fitbit biometrics | **User OAuth token** — health scopes only (`health-oauth-token`) | health data needs *user* consent; a service account can't read it |
+| Upload photos to Drive | **User OAuth token** — `drive.file` only (`drive-oauth-token`) | ⚠️ a service account has **zero Drive storage quota** — uploads must run as the user to use their 5 TB |
 | Write the Sheet | **Service account** | the Sheet is shared with it as Editor |
-| Upload photos to Drive | **User OAuth token** (`drive.file` only) | ⚠️ a service account has **zero Drive storage quota** — uploads must run as the user to use their 5 TB |
 | Call Gemini | **API key** | free tier |
 
 Service account: `health-tracker-job@health-tracker-501322.iam.gserviceaccount.com`
 (has no project-level roles; only resource-level secret access + run.invoker).
 
-Dropping Google Health left **exactly one user token** in the system, held by the
-ingest service purely to write meal photos into the user's own Drive
-(`drive-oauth-token`). The daily job now runs with no user identity at all.
+**Two user tokens, deliberately never merged** — the Health API 403s on any token
+that also carries a Drive scope (gotcha 8). `src/auth.py` mints them separately
+(`python -m src.authenticate health|drive`), into separate secrets. The health
+token is read-only across `sleep`, `health_metrics_and_measurements` and
+`activity_and_fitness`; nothing in this system ever writes back to Google Health.
 
 ## 5. Key resources
 
@@ -201,29 +233,54 @@ ingest service purely to write meal photos into the user's own Drive
 | Cloud Tasks queue | `meal-ingest` (europe-west1) — background meal analysis, 8 attempts / ~15 min backoff; SA has `cloudtasks.enqueuer` |
 | Sheet ID | `1JQWYkSgzU3F4mqR7BRE8wfoBif0xLU7uBM0iwHwxNAk` |
 | Drive photo folder | `1i0wYuIzcD7ifs_wVQVdsUpI26vGmJdfP` ("Health Tracker Meals", owned by user) |
-| Secrets (Secret Manager) | `drive-oauth-token`, `ingest-token`, `gemini-api-key` |
+| Secrets (Secret Manager) | `health-oauth-token` (health scopes only), `drive-oauth-token` (drive.file only), `ingest-token`, `gemini-api-key` |
 | Code (master copy) | `/Users/dneves/Health Tracker/` — `src/` (job), `ingest/` (service) |
 
 ### Sheet schema
-- **`daily_summary`** (41 columns): `date` | readiness + self-report
-  (`sleep_score, hrv_ms, spo2_pct, skin_temp_dev, subjective_feel,
-  bowel_movement`) | macros (`total_cals_in, total_protein_g, total_carbs_g,
-  total_fat_g`) | **15 Tier-1 micronutrient totals** (`total_fiber_g,
-  total_sugar_g, total_saturated_fat_g, total_sodium_mg, total_potassium_mg,
-  total_calcium_mg, total_iron_mg, total_magnesium_mg, total_zinc_mg,
-  total_vitamin_c_mg, total_vitamin_d_ug, total_vitamin_b12_ug, total_vitamin_a_ug,
-  total_folate_ug, total_omega3_g`) | activity (`total_active_mins, steps`) |
-  **body** (`weight_kg, bmi, body_fat_pct, subcutaneous_fat_pct, visceral_fat,
-  body_water_pct, muscle_mass_kg, bone_mass_kg, bmr_kcal, metabolic_age,
-  lean_mass_kg, body_measured_at`) | `updated_at`. Column order lives in
-  `src.sheets.DAILY_HEADERS`; the scale metrics are `src.sheets.BODY_METRICS`,
-  **mirrored** in `ingest/main.py BODY_METRICS` (which also owns their plausibility
-  bands) because ingest is a separate image and can't import `src`. A test asserts
-  the two stay in step. `bowel_movement` is a TRUE/blank self-report (see source 4).
+- **`daily_summary`** (78 columns), grouped by **who owns each block** — the
+  merge-upsert means a source only ever writes its own columns:
+  - `date`
+  - **self-report** (ingest): `subjective_feel`, `bowel_movement`
+  - **sleep** (Fitbit, wake-day): `sleep_start, sleep_end, time_in_bed_mins,
+    sleep_mins, sleep_efficiency_pct, sleep_latency_mins, sleep_awake_mins,
+    sleep_deep_mins, sleep_rem_mins, sleep_light_mins, sleep_awakenings, nap_mins`
+  - **recovery** (Fitbit): `resting_hr_bpm, hrv_ms, hrv_deep_sleep_ms, hrv_entropy,
+    non_rem_hr_bpm, spo2_pct, spo2_lower_pct, spo2_upper_pct,
+    respiratory_rate_brpm, skin_temp_c, skin_temp_dev`
+  - **activity** (Fitbit): `steps, distance_km, total_cals_out, active_cals,
+    total_active_mins, active_mins_light/moderate/vigorous,
+    azm_fat_burn_mins/azm_cardio_mins/azm_peak_mins, sedentary_mins,
+    hr_min_bpm/hr_avg_bpm/hr_max_bpm, mins_hr_light/moderate/vigorous/peak,
+    swim_strokes`
+  - **nutrition** (meals roll-up): `total_cals_in, total_protein_g,
+    total_carbs_g, total_fat_g` + **15 Tier-1 micronutrient totals**
+    (`total_fiber_g, total_sugar_g, total_saturated_fat_g, total_sodium_mg,
+    total_potassium_mg, total_calcium_mg, total_iron_mg, total_magnesium_mg,
+    total_zinc_mg, total_vitamin_c_mg, total_vitamin_d_ug, total_vitamin_b12_ug,
+    total_vitamin_a_ug, total_folate_ug, total_omega3_g`)
+  - **body** (scale screenshot): `weight_kg, bmi, body_fat_pct,
+    subcutaneous_fat_pct, visceral_fat, body_water_pct, muscle_mass_kg,
+    bone_mass_kg, bmr_kcal, metabolic_age, lean_mass_kg, body_measured_at`
+  - `updated_at`
+
+  Column order lives in `src.sheets.DAILY_HEADERS`, composed from
+  `src.biometrics.BIOMETRIC_COLUMNS` and `src.sheets.BODY_METRICS`. The scale
+  metrics are **mirrored** in `ingest/main.py BODY_METRICS` (which also owns their
+  plausibility bands) because ingest is a separate image and can't import `src`; a
+  test asserts the two stay in step.
+
+  Derived-and-stored (the sheet must stand alone for AI analysis):
+  `sleep_efficiency_pct` = asleep÷in-bed · `skin_temp_dev` = nightly − 30-day
+  baseline · `lean_mass_kg` = weight × (1 − fat%).
   - **Merge-upsert keyed on `date`** — each source fills only its own columns
-    (scale screenshot → body, meals roll-up → nutrition, /feel → subjective_feel,
-    a bowel note → bowel_movement; Fitbit biometrics will fill the readiness
-    block). Never overwrites a column it doesn't own.
+    (scale screenshot → body, meals roll-up → nutrition, Fitbit → sleep/recovery/
+    activity, /feel → subjective_feel, a bowel note → bowel_movement). Never
+    overwrites a column it doesn't own.
+    - ⚠️ **Exactly one row per date may reach `upsert_daily`.** It merges every
+      row against the *same* pre-read grid snapshot, so two rows for one date make
+      the second clobber the first's columns with stale values — or append the day
+      twice if it's new. `run_daily.build_daily_rows` folds the biometric and
+      nutrition column groups into one row per date for this reason.
   - Nutrition columns are keyed on the **waking day** (05:00 cutoff) and only
     written once that day is **over**, so a late-night snack joins the right day
     and today's row shows no nutrition total until tomorrow morning's run.
@@ -323,29 +380,57 @@ Google One storage (from AI Pro).
 7. Service accounts have **no Drive storage quota** → Drive uploads must use the
    user's OAuth token. This is the only reason a user token still exists.
 8. **The Google Health API rejects any token that also carries a Drive scope**
-   (`403 DISALLOWED_OAUTH_SCOPES`) — one token can never serve both. Moot today
-   (we hold a Drive-only token), but it will bite again the moment Fitbit Air
-   biometrics need a health token: it must be a **separate secret**, not an extra
-   scope on `drive-oauth-token`.
+   (`403 DISALLOWED_OAUTH_SCOPES`) — one token can never serve both. This is why
+   there are two secrets (`health-oauth-token`, `drive-oauth-token`) and two
+   profiles in `src/auth.py`. Never "simplify" them into one token.
 9. **Google Photos API cannot read your library** (since Mar 2025) and **iCloud has
    no server API** — that's why photos are POSTed directly to our endpoint.
 10. The sheet's **European locale renders decimals with commas** — every Sheets
     read must use `valueRenderOption="UNFORMATTED_VALUE"`, or `float("7,8")`
     silently zeroes the numbers. Avoid locale-sensitive formulas; charts and
     stats are written via the API instead.
-11. **Read ranges must be wide enough for the schema.** `daily_summary` is already
-    40 columns; an `A1:Z` read silently truncates the header, so a column past the
-    cut looks "missing" and its writes land nowhere. Reads go to `BZ`.
+11. **Read ranges must be wide enough for the schema.** `daily_summary` is 78
+    columns; an `A1:Z` read silently truncates the header, so a column past the cut
+    looks "missing" and its writes land nowhere. `sheets.READ_LAST_COL` is derived
+    from `DAILY_HEADERS` — keep it that way, don't hard-code a letter.
 12. A day is the **local civil day** (Europe/Lisbon), never the UTC day. Never
-    `[:10]` a UTC timestamp to get it.
+    `[:10]` a UTC timestamp to get it. Sleep intervals ship **no civil time** at
+    all — only `startTime` + `startUtcOffset` — so the local day must be derived
+    (a 23:03Z bedtime is already tomorrow in Lisbon).
+
+### Google Health API specifics (all verified against the live API, 2026-07-16)
+
+13. **`dataPoints.list` takes a `filter` expression, not `startTime`/`endTime`.**
+    Four shapes: `{t}.date` (daily summaries), `{t}.sample_time.civil_time`,
+    `{t}.interval.civil_start_time`, and **`sleep.interval.civil_end_time`** for
+    sleep. The path is kebab-case, the filter field is snake_case. A wrong filter
+    is a flat 400 — the old client caught that and retried *unbounded*.
+14. **`dailyRollUp` caps its range**: **14 days** for `total-calories`,
+    `heart-rate`, `active-minutes` and `calories-in-heart-rate-zone`; 90 for the
+    rest. Over the cap is a 400. `google_health.daily_rollup` chunks automatically
+    — a 7-day window hides this, so only a real backfill would ever expose it.
+15. **Don't send `pageSize` to `dailyRollUp`.** It 400s on values the docs call
+    legal (100 rejected for a 9-day range; 10 accepted). The 1440 default already
+    dwarfs one-point-per-day. `sleep`/`exercise` cap `list` at **25**.
+16. **Numbers arrive as JSON strings** (`"525"`, `"4151"`), durations as `"10620s"`,
+    and — the nasty one — **an uncomputable metric comes back as the string
+    `"NaN"`**. `float("NaN")` succeeds, so it passes every naive type check and
+    lands as a literal NaN in the sheet (which strict JSON can't even serialise).
+    `biometrics._num` rejects non-finite values for this reason.
+    `baselineTemperatureCelsius` is `"NaN"` until 30 days of history exist, so
+    `skin_temp_dev` stays blank until mid-August 2026 — that's expected, not a bug.
+17. Some types have **no `list` endpoint at all** (`floors`: *"List is not
+    supported… use reconcile, rollup, dailyRollup"*), and **`total-calories` exists
+    only as a rollup**. Check the discovery doc
+    (`curl 'https://health.googleapis.com/$discovery/rest?version=v4'`) rather than
+    the HTML docs — it is authoritative, machine-readable and complete.
 
 ## 9. Open TODOs
 
-1. **Fitbit Air biometrics** (steps, sleep stages, HRV, SpO2, resting HR) — the
-   Google Health API, new dataTypes, scopes `activity_and_fitness.readonly` +
-   `sleep.readonly`. Requires a fresh consent and a **new, health-only secret**
-   (see gotcha 8 — do not add the scopes to `drive-oauth-token`).
-2. Rotate the OAuth **client secret** (it was once pasted in chat).
-3. Optional: archive scale screenshots to Drive as a provenance/bronze layer. They
+1. Rotate the OAuth **client secret** (it was once pasted in chat).
+2. Optional: archive scale screenshots to Drive as a provenance/bronze layer. They
    are deliberately *not* archived today — the transcribed numbers are the data,
    and the screenshot is still in the camera roll.
+3. Optional: `ecg` + `irn` scopes, if the Air ever turns out to have the sensors.
+4. `skin_temp_dev`, `azm_*` and `vo2_max` fill in as history accumulates — no code
+   change needed, just don't mistake the blanks for a bug before then.

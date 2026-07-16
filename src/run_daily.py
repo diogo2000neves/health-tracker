@@ -1,16 +1,22 @@
-"""Cloud entry point: roll the day's meals up into the per-day health model.
+"""Cloud entry point: refresh the per-day health model.
 
 Each run (Cloud Run Job, triggered ~07:00 Europe/Lisbon):
 
-  1. Rolls meals logged in the ``meals`` tab into ``daily_summary`` nutrition
+  1. Pulls **Fitbit Air biometrics** from the Google Health API — sleep (stages,
+     efficiency, naps kept apart), overnight recovery (resting HR, HRV, SpO2,
+     respiration, skin temperature) and activity (steps, distance, calories out,
+     active/zone minutes, heart-rate range) — and merges them per civil day.
+  2. Rolls meals logged in the ``meals`` tab into ``daily_summary`` nutrition
      totals per day; non-food shots and failed analyses are ignored.
-  2. Refreshes the ``dashboard`` tab's stat cells (best-effort).
+  3. Refreshes the ``dashboard`` tab's stat cells (best-effort).
+
+07:00 is deliberate: it is after the night has been scored and synced, so the
+night that just ended lands on its own wake-day row the same morning.
 
 Body composition is **not** collected here. It arrives through the ingest service
 the moment the user screenshots their smart-scale app (see ingest/main.py) and is
 written straight into ``daily_summary``'s body columns, keyed on the reading's own
-date. This job's merge-upsert only ever fills the nutrition columns, so those
-readings are never clobbered.
+date. Each source fills only the columns it owns, so nothing clobbers anything.
 
 Nutrition uses a **waking-day** grain: a meal counts toward the day that started
 at ``NUTRITION_DAY_CUTOFF_HOUR`` (05:00 local by default), so a dessert eaten at
@@ -22,25 +28,30 @@ rule is precisely why this job is still on a timer at all — a finished day has
 be totalled *after* it finishes.
 
 Only the trailing ``HEALTH_RECONCILE_DAYS`` days are re-rolled, so a late
-correction to an old meal still lands. Set it to 0 for a full re-roll from source.
+correction to an old meal — or a night Fitbit re-scores after the fact — still
+lands. Set it to 0 for a full re-roll from source.
 
-Readiness columns (sleep/HRV/SpO2/skin-temp/steps/active-mins) are left blank
-here; the Fitbit biometrics step fills them through the same merge-upsert.
-
-Writes the Sheet with the runtime service account (ADC, Sheets scope). No user
-OAuth token, no health scopes — this job talks to nothing but the Sheet.
+Reads HEALTH_OAUTH_TOKEN (Secret Manager; **health scopes only** — the API 403s on
+a token that also carries Drive) for the biometrics; writes the Sheet with the
+runtime service account (ADC, Sheets scope).
 """
 from __future__ import annotations
 
 import json
 import os
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import google.auth
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
 
+from src.biometrics import biometric_days, daily_activity, daily_recovery, daily_sleep
+from src.google_health import (
+    DAILY_TYPES, ROLLUP_TYPES, SLEEP, GoogleHealthClient,
+)
 from src.sheets import (
     DAILY_HEADERS, DAILY_TAB, DASHBOARD_FIRST_ROW, DASHBOARD_STATS, DASHBOARD_TAB,
     MEALS_TAB, SheetClient, TIER1_NUTRIENTS,
@@ -103,6 +114,50 @@ def _is_true(value: Any) -> bool:
     """A daily boolean flag (e.g. bowel_movement) reads back as Python True from an
     UNFORMATTED_VALUE fetch, but tolerate the string form too."""
     return value is True or str(value).strip().upper() == "TRUE"
+
+
+# -- Fitbit Air biometrics -----------------------------------------------------
+def load_health_credentials() -> Credentials:
+    """The health-only user token. Health data needs *user* consent, so a service
+    account can't read it. This token must carry no Drive scope (see src/auth.py)."""
+    raw = os.environ.get("HEALTH_OAUTH_TOKEN")
+    if raw:
+        info = json.loads(raw)
+    else:
+        from src.auth import token_file  # local fallback for manual runs
+
+        info = json.loads(token_file("health").read_text())
+    creds = Credentials.from_authorized_user_info(info)
+    creds.refresh(Request())
+    return creds
+
+
+def fetch_biometrics(client: GoogleHealthClient, start: str,
+                     end: str) -> Dict[str, Dict[str, Any]]:
+    """Every biometric column for [start, end), as date -> columns.
+
+    Sleep and the daily-* summaries come from `list`; movement/energy come from
+    `dailyRollUp`, which aggregates server-side over civil days (and is the only
+    route to `total-calories`). A data type the tracker never produced just comes
+    back empty and its columns stay blank.
+    """
+    sleep_points = client.list_data_points(SLEEP, family="sleep", start=start, end=end)
+    recovery_points = {
+        data_type: client.list_data_points(data_type, family="daily",
+                                           start=start, end=end)
+        for data_type in DAILY_TYPES
+    }
+    first, last = date.fromisoformat(start), date.fromisoformat(end)
+    activity_points = {
+        data_type: client.daily_rollup(data_type, first, last)
+        for data_type in ROLLUP_TYPES
+    }
+    return biometric_days(
+        daily_sleep(sleep_points),
+        daily_recovery(recovery_points),
+        daily_activity(activity_points),
+        start=start,
+    )
 
 
 # -- nutrition roll-up ---------------------------------------------------------
@@ -170,10 +225,26 @@ def daily_nutrition(meals: List[Dict[str, Any]], start: Optional[str],
     return out
 
 
-def build_daily_rows(nutrition: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """One merge-row per day. Nutrition columns only — every other column belongs
-    to another source and `upsert_daily` leaves the ones we omit untouched."""
-    return [{"date": day, **nutrition[day]} for day in sorted(nutrition)]
+def build_daily_rows(*sources: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Fold independent per-day column groups (biometrics, nutrition) into ONE
+    merge-row per date.
+
+    Exactly one row per date is the contract `upsert_daily` relies on: it merges
+    every row against the same pre-read grid, so two rows for one date would make
+    the second overwrite the first's columns with stale values (or append the day
+    twice if it's new). Columns absent here are left to their owners — the scale
+    screenshot and /feel write their own.
+    """
+    days: set = set()
+    for source in sources:
+        days |= set(source)
+    rows: List[Dict[str, Any]] = []
+    for day in sorted(days):
+        row: Dict[str, Any] = {"date": day}
+        for source in sources:
+            row.update(source.get(day, {}))
+        rows.append(row)
+    return rows
 
 
 # -- dashboard -----------------------------------------------------------------
@@ -200,6 +271,15 @@ def refresh_dashboard(sheet: SheetClient) -> None:
             return ""
         return round(sum(_num(r.get(col)) for r in logged) / len(logged))
 
+    def avgd7(col: str) -> Any:
+        """Mean over the last 7 calendar days that actually carry this column.
+        Biometrics land every day the tracker is worn — independently of whether
+        meals were logged — so averaging them over the nutrition window would
+        divide by the wrong days."""
+        vals = [_num(r.get(col)) for r in rows
+                if str(r.get("date", "")) >= week_ago and r.get(col) not in (None, "")]
+        return round(sum(vals) / len(vals)) if vals else ""
+
     def count7(col: str) -> int:
         """How many of the last 7 calendar days carry TRUE in `col` (bowel_movement).
         Counts by date, not by row, so gap days don't distort the tally."""
@@ -209,6 +289,7 @@ def refresh_dashboard(sheet: SheetClient) -> None:
     reduce = {
         "latest": latest,
         "avg7": avg7,
+        "avgd7": avgd7,
         "days7": lambda _col: len(logged),
         "count7": count7,
         "now": lambda _col: datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -241,13 +322,32 @@ def main() -> None:
             "— run `python -m src.maintenance` to migrate it, then re-run this job."
         )
 
-    meals = sheet.read_rows(MEALS_TAB)
-    # The nutrition day still under way (local now shifted back by the cutoff) is
-    # excluded, so only completed days are totalled.
     tz = ZoneInfo(os.environ.get("HEALTH_TZ", "Europe/Lisbon"))
+    today = datetime.now(tz).date()
+
+    # 1. Fitbit Air biometrics. Never fatal: a token/API problem must not also cost
+    #    us the nutrition roll-up, which needs nothing but the Sheet.
+    biometrics: Dict[str, Dict[str, Any]] = {}
+    bio_note = "skipped (no window)"
+    if start:
+        try:
+            client = GoogleHealthClient(load_health_credentials())
+            # end is exclusive and tomorrow, so today's partial day is included —
+            # steps so far today are real, unlike a partial nutrition total.
+            biometrics = fetch_biometrics(client, start,
+                                          (today + timedelta(days=1)).isoformat())
+            bio_note = f"{len(biometrics)} day(s)"
+        except Exception as err:
+            bio_note = f"FAILED ({err})"
+            print(f"biometrics: {bio_note}")
+
+    # 2. Nutrition. The day still under way (local now shifted back by the cutoff)
+    #    is excluded, so only completed days are totalled.
+    meals = sheet.read_rows(MEALS_TAB)
     in_progress = (datetime.now(tz) - timedelta(hours=DAY_CUTOFF_HOUR)).date().isoformat()
     nutrition = daily_nutrition(meals, start, DAY_CUTOFF_HOUR, in_progress)
-    daily_result = sheet.upsert_daily(build_daily_rows(nutrition))
+
+    daily_result = sheet.upsert_daily(build_daily_rows(biometrics, nutrition))
 
     # Unconditional, so the tab self-heals: rows arrive in submission order, and a
     # backfilled scale screenshot appends a day that belongs above the ones already
@@ -265,8 +365,8 @@ def main() -> None:
         dashboard_note = f"skipped ({err})"
 
     print(
-        f"window>={start or 'ALL'}: read {len(meals)} meal rows -> "
-        f"{len(nutrition)} nutrition day(s); daily_summary updated "
+        f"window>={start or 'ALL'}: biometrics {bio_note}; read {len(meals)} "
+        f"meal rows -> {len(nutrition)} nutrition day(s); daily_summary updated "
         f"{daily_result['updated']}, appended {daily_result['appended']}, "
         f"{sort_note}; dashboard {dashboard_note} "
         f"(spreadsheet {spreadsheet_id}, project {project})."

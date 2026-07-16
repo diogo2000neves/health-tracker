@@ -1,7 +1,8 @@
 """Unit tests for sheet schema constants and helpers."""
+from src.biometrics import BIOMETRIC_COLUMNS
 from src.sheets import (
     BODY_METRICS, DAILY_HEADERS, DASHBOARD_FIRST_ROW, DASHBOARD_STATS,
-    TIER1_NUTRIENTS, col_letter,
+    READ_LAST_COL, TIER1_NUTRIENTS, col_letter,
 )
 
 
@@ -31,13 +32,41 @@ def test_bowel_movement_is_a_self_reported_daily_flag():
     assert DAILY_HEADERS[-1] == "updated_at"  # still last
 
 
+def test_every_biometric_column_is_in_the_schema():
+    for col in BIOMETRIC_COLUMNS:
+        assert col in DAILY_HEADERS, col
+    # one contiguous block, so maintenance can insert into it cleanly
+    positions = [DAILY_HEADERS.index(c) for c in BIOMETRIC_COLUMNS]
+    assert positions == list(range(positions[0], positions[0] + len(BIOMETRIC_COLUMNS)))
+
+
+def test_there_is_no_sleep_score_column():
+    # Fitbit's 0-100 score is proprietary and appears nowhere in the Google Health
+    # API (verified field-by-field). A column for it could only ever stay blank —
+    # sleep_efficiency_pct is the honest, derivable stand-in.
+    assert "sleep_score" not in DAILY_HEADERS
+    assert "sleep_efficiency_pct" in DAILY_HEADERS
+
+
+def test_read_range_covers_the_whole_schema_with_headroom():
+    # daily_summary silently outgrew A:Z once; a short read truncates the header so
+    # columns past the cut look "missing" and their writes land nowhere.
+    def index(letters):
+        n = 0
+        for ch in letters:
+            n = n * 26 + (ord(ch) - ord("A") + 1)
+        return n - 1
+    assert index(READ_LAST_COL) >= len(DAILY_HEADERS) - 1 + 20
+
+
 def test_tier1_nutrients_have_daily_columns():
     assert len(TIER1_NUTRIENTS) == 15
     for n in TIER1_NUTRIENTS:
         assert f"total_{n}" in DAILY_HEADERS
-    # nutrient totals sit within the nutrition block, before activity/body
+    # nutrient totals sit inside the nutrition block: after the macros they extend,
+    # and before the body-composition block
     i = DAILY_HEADERS.index
-    assert i("total_fat_g") < i("total_fiber_g") < i("total_active_mins")
+    assert i("total_fat_g") < i("total_fiber_g") < i("weight_kg")
 
 
 def test_every_scale_metric_has_a_column():
@@ -60,8 +89,8 @@ def test_dashboard_stats_reference_real_columns():
     # them from this one list; a column that doesn't exist would render blank
     # forever, and a mismatched length would slide every number up a row.
     for _label, col, kind in DASHBOARD_STATS:
-        assert kind in {"latest", "avg7", "count7", "days7", "now"}
-        if kind in {"latest", "avg7", "count7"}:
+        assert kind in {"latest", "avg7", "avgd7", "count7", "days7", "now"}
+        if kind in {"latest", "avg7", "avgd7", "count7"}:
             assert col in DAILY_HEADERS, col
         else:
             assert col == ""

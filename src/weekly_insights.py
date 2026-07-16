@@ -29,12 +29,25 @@ WINDOW_DAYS = 35
 # analysis: muscle vs fat vs water is what says whether the intake is working.
 CSV_COLUMNS = [
     "date",
+    # intake
     "total_cals_in", "total_protein_g", "total_carbs_g", "total_fat_g",
     "total_fiber_g", "total_sugar_g", "total_saturated_fat_g", "total_sodium_mg",
+    # body composition
     "weight_kg", "bmi", "body_fat_pct", "subcutaneous_fat_pct", "visceral_fat",
     "body_water_pct", "muscle_mass_kg", "bone_mass_kg", "lean_mass_kg",
     "bmr_kcal", "metabolic_age",
-    "subjective_feel", "bowel_movement", "sleep_score", "steps",
+    # sleep
+    "sleep_mins", "sleep_efficiency_pct", "sleep_deep_mins", "sleep_rem_mins",
+    "sleep_light_mins", "sleep_latency_mins", "sleep_awakenings", "nap_mins",
+    "sleep_start", "sleep_end",
+    # overnight recovery
+    "resting_hr_bpm", "hrv_ms", "spo2_pct", "respiratory_rate_brpm",
+    "skin_temp_dev",
+    # activity / expenditure
+    "steps", "distance_km", "total_cals_out", "active_cals",
+    "total_active_mins", "sedentary_mins", "hr_avg_bpm", "hr_max_bpm",
+    # self-reported
+    "subjective_feel", "bowel_movement",
 ]
 
 PROMPT_TEMPLATE = """You are a precise, no-nonsense personal health-data analyst.
@@ -43,15 +56,24 @@ are blank — metrics not yet collected; treat blanks as missing, not zero).
 
 {csv}
 
-Write your analysis as 4-6 short markdown bullets, in this spirit:
+Write your analysis as 5-7 short markdown bullets, in this spirit:
 - Body-composition trend vs intake — cite actual numbers. Weight alone is noise;
   read muscle mass, lean mass and body fat % together against calories and
   protein, and say whether the change is muscle, fat or water.
-- Any notable pattern, correlation or anomaly worth my attention. `bowel_movement`
-  is TRUE on days I had one (blank = none logged); note regularity and any link to
-  fibre, hydration or intake if the data supports it — don't over-read sparse data.
+- **Energy balance**: `total_cals_in` vs `total_cals_out` (measured expenditure,
+  not an estimate). State the actual surplus/deficit and whether the body-
+  composition trend is consistent with it.
+- **Sleep and recovery**: `sleep_efficiency_pct` (asleep/in-bed) plus deep and REM
+  minutes, read against `resting_hr_bpm`, `hrv_ms` and `skin_temp_dev` — a rising
+  resting HR, falling HRV or a positive temperature deviation is the classic
+  under-recovery signature. Note any link to late/large meals or alcohol.
+- Any other notable pattern, correlation or anomaly. `bowel_movement` is TRUE on
+  days I had one (blank = none logged); note regularity and any link to fibre or
+  intake if the data supports it — don't over-read sparse data.
 - Data gaps that most limit the analysis (be specific: which metric, how often).
 - End with ONE concrete, specific action for next week.
+There is deliberately no sleep score — it does not exist in the source API. Do not
+ask for one; reason from efficiency, stages and the recovery metrics instead.
 No preamble, no disclaimers, no generic health advice — only what the data shows."""
 
 

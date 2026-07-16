@@ -39,10 +39,12 @@ Health Tracker/
 │   ├── main.py             # Cloud Run service: POST /ingest, /process, /feel
 │   └── requirements.txt
 ├── src/
-│   ├── auth.py             # Drive OAuth flow + token refresh (local, one-off)
-│   ├── authenticate.py     # one-time login: python -m src.authenticate
+│   ├── auth.py             # OAuth: two profiles (health / drive), never merged
+│   ├── authenticate.py     # one-time login: python -m src.authenticate health|drive
+│   ├── google_health.py    # Google Health API v4 client (list + dailyRollUp)
+│   ├── biometrics.py       # Fitbit payloads → daily columns (pure, unit-tested)
 │   ├── sheets.py           # schema + merge-upsert Sheet client
-│   ├── run_daily.py        # daily job: nutrition roll-up + dashboard
+│   ├── run_daily.py        # daily job: biometrics + nutrition roll-up + dashboard
 │   ├── weekly_insights.py  # weekly job: Gemini trend summary → `insights` tab
 │   └── maintenance.py      # idempotent schema/dashboard sync (run after schema changes)
 └── tests/                  # unit tests — the CI deploy gate
@@ -91,13 +93,27 @@ Health Tracker/
 
 ## Jobs
 
-- **`health-tracker-daily`** (07:00 Europe/Lisbon) — rolls the `meals` tab up into
-  `daily_summary`'s nutrition columns and refreshes the dashboard. It exists
-  because nutrition uses a **waking-day** grain (05:00 cutoff, so a midnight
-  dessert counts as yesterday) and a day is only totalled once it is *over*.
-  It holds no OAuth token and calls no external API.
+- **`health-tracker-daily`** (07:00 Europe/Lisbon) — pulls **Fitbit Air
+  biometrics** from the Google Health API (~40 columns/day: sleep stages and
+  efficiency, resting HR, HRV, SpO2, respiration, skin temperature, steps,
+  distance, calories out, active/zone minutes, heart-rate range) and rolls the
+  `meals` tab up into `daily_summary`'s nutrition columns, then refreshes the
+  dashboard. 07:00 is late enough that last night is scored and synced, and past
+  the 05:00 nutrition cutoff so yesterday can be totalled.
 - **`health-tracker-weekly`** (Sun 20:00) — Gemini reads the last five weeks and
   appends a trend analysis to the `insights` tab.
+
+### What the tracker gives you (and what it can't)
+
+The Air syncs by itself — nothing to open, nothing to tap. **There is no sleep
+score**: Fitbit's 0-100 number is proprietary and appears nowhere in the Google
+Health API. What lands instead is the data it's computed *from* —
+`sleep_efficiency_pct` (asleep ÷ in-bed), deep/REM/light minutes, latency,
+awakenings — plus resting HR, HRV and skin-temperature deviation. Naps are tracked
+separately (`nap_mins`) so an afternoon nap can't corrupt the night.
+
+`total_cals_out` is the one to notice: paired with `total_cals_in`, it gives real
+measured **energy balance**.
 
 ## Tests
 
@@ -130,13 +146,18 @@ pip install -r requirements.txt
 
 ## Auth (one-off)
 
-The only user credential in the system is a Drive token — the ingest service
-uploads meal photos into your own Drive, because a service account has no Drive
-storage quota of its own. Everything else runs as a service account.
+Two user tokens, which **must never be merged** — the Google Health API rejects any
+token that also carries a Drive scope (`403 DISALLOWED_OAUTH_SCOPES`). Everything
+else runs as a service account.
 
 ```bash
-python -m src.authenticate   # opens a browser; scope: drive.file
-gcloud secrets versions add drive-oauth-token --data-file=credentials/token.json
+# Fitbit biometrics (daily job) — sleep + health metrics + activity, read-only
+python -m src.authenticate health
+gcloud secrets versions add health-oauth-token --data-file=credentials/token_health.json
+
+# Meal-photo upload (ingest) — drive.file only; a service account has no Drive quota
+python -m src.authenticate drive
+gcloud secrets versions add drive-oauth-token --data-file=credentials/token_drive.json
 ```
 
 Your OAuth app must be **In production** (not "Testing"), or the refresh token
