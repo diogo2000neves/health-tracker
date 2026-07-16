@@ -845,3 +845,104 @@ def test_text_router_offers_the_bowel_classification():
     assert "cocó" in r                 # multilingual — the user writes Portuguese
     # a food note is explicitly kept as a meal even if it mentions the bathroom
     assert "in passing" in r
+
+
+# -- the read API (what the iOS app talks to) ----------------------------------
+_DAILY_GRID = [
+    ["date", "subjective_feel", "bowel_movement", "sleep_mins", "hrv_ms",
+     "steps", "weight_kg", "total_cals_in", "updated_at"],
+    ["2026-07-15", 7, "TRUE", 470, 75.2, 4151, 70.0, 2000, "x"],
+    ["2026-07-16", "", "", 525, 73.1, 866, "", 1800, "x"],
+]
+
+
+def _api(monkeypatch, grid=None):
+    monkeypatch.setattr(ingest, "_read_tab", lambda tab: grid or _DAILY_GRID)
+    monkeypatch.setenv("INGEST_TOKEN", "t")
+    monkeypatch.setenv("HEALTH_SPREADSHEET_ID", "sid")
+    return ingest.app.test_client()
+
+
+_HDR = {"X-Auth-Token": "t"}
+
+
+def test_daily_requires_the_token():
+    assert ingest.app.test_client().get("/daily").status_code == 401
+    assert ingest.app.test_client().get("/schema").status_code == 401
+
+
+def test_daily_returns_days_nested_by_block(monkeypatch):
+    r = _api(monkeypatch).get("/daily?from=2026-07-15&to=2026-07-16", headers=_HDR)
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["count"] == 2
+    day = body["days"][0]
+    assert day["date"] == "2026-07-15"
+    # blocks are the natural shape of the domain — and of the generated Swift
+    assert day["sleep"]["sleep_mins"] == 470
+    assert day["recovery"]["hrv_ms"] == 75.2
+    assert day["activity"]["steps"] == 4151
+    assert day["self_report"]["subjective_feel"] == 7
+
+
+def test_blank_cells_become_null_not_zero(monkeypatch):
+    # A day with no weigh-in has NO body composition. A 0 there is a lie the app
+    # would happily chart as a 69 kg weight loss.
+    body = _api(monkeypatch).get("/daily?from=2026-07-16&to=2026-07-16",
+                                 headers=_HDR).get_json()
+    day = body["days"][0]
+    assert day["body"]["weight_kg"] is None
+    assert day["self_report"]["subjective_feel"] is None
+    assert day["sleep"]["sleep_mins"] == 525          # present values survive
+
+
+def test_values_are_typed_from_the_schema(monkeypatch):
+    day = _api(monkeypatch).get("/daily?from=2026-07-15&to=2026-07-15",
+                                headers=_HDR).get_json()["days"][0]
+    assert day["self_report"]["bowel_movement"] is True    # "TRUE" -> bool
+    assert isinstance(day["sleep"]["sleep_mins"], int)     # integer dtype
+    assert isinstance(day["recovery"]["hrv_ms"], float)    # number dtype
+
+
+def test_the_app_can_ask_for_only_the_blocks_it_draws(monkeypatch):
+    body = _api(monkeypatch).get("/daily?blocks=sleep,recovery", headers=_HDR).get_json()
+    assert body["blocks"] == ["sleep", "recovery"]
+    day = body["days"][0]
+    assert "sleep" in day and "recovery" in day
+    assert "nutrition" not in day and "activity" not in day
+
+
+def test_unknown_block_is_rejected_with_the_valid_list(monkeypatch):
+    r = _api(monkeypatch).get("/daily?blocks=sleep,bogus", headers=_HDR)
+    assert r.status_code == 400
+    assert "bogus" in str(r.get_json()["error"])
+    assert "sleep" in r.get_json()["known"]
+
+
+def test_tier1_trims_to_the_headline_metrics(monkeypatch):
+    day = _api(monkeypatch).get("/daily?tier=1&blocks=recovery",
+                                headers=_HDR).get_json()["days"][0]
+    assert "hrv_ms" in day["recovery"]                 # tier 1
+    assert "hrv_entropy" not in day["recovery"]        # tier 2
+
+
+def test_bad_dates_are_rejected(monkeypatch):
+    r = _api(monkeypatch).get("/daily?from=15-07-2026", headers=_HDR)
+    assert r.status_code == 400
+
+
+def test_date_range_filters(monkeypatch):
+    body = _api(monkeypatch).get("/daily?from=2026-07-16&to=2026-07-16",
+                                 headers=_HDR).get_json()
+    assert body["count"] == 1 and body["days"][0]["date"] == "2026-07-16"
+
+
+def test_schema_endpoint_teaches_a_client_the_causal_rule(monkeypatch):
+    body = _api(monkeypatch).get("/schema", headers=_HDR).get_json()
+    cols = {c["name"]: c for c in body["columns"]}
+    assert cols["sleep_mins"]["causal_role"] == "outcome"
+    assert "night that ended" in cols["sleep_mins"]["measures_when"]
+    assert cols["total_cals_in"]["causal_role"] == "input"
+    assert cols["resting_hr_bpm"]["direction"] == "down_good"
+    assert cols["weight_kg"]["unit"] == "kg"
+    assert {b["name"] for b in body["blocks"]} >= {"sleep", "recovery", "body"}

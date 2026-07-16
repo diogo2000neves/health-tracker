@@ -48,13 +48,17 @@ import google.auth
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
+from src.analysis import (
+    BASELINE_HEADERS, analysis_headers, analysis_legend, analysis_rows,
+    baseline_rows,
+)
 from src.biometrics import biometric_days, daily_activity, daily_recovery, daily_sleep
 from src.google_health import (
     DAILY_TYPES, ROLLUP_TYPES, SLEEP, GoogleHealthClient,
 )
 from src.sheets import (
-    DAILY_HEADERS, DAILY_TAB, DASHBOARD_FIRST_ROW, DASHBOARD_STATS, DASHBOARD_TAB,
-    MEALS_TAB, SheetClient, TIER1_NUTRIENTS,
+    ANALYSIS_TAB, BASELINES_TAB, DAILY_HEADERS, DAILY_TAB, DASHBOARD_FIRST_ROW,
+    DASHBOARD_STATS, DASHBOARD_TAB, MEALS_TAB, SheetClient, TIER1_NUTRIENTS,
 )
 
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
@@ -225,6 +229,20 @@ def daily_nutrition(meals: List[Dict[str, Any]], start: Optional[str],
     return out
 
 
+def _with_energy_balance(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Derive `energy_balance_kcal` = intake - expenditure when both sides exist.
+
+    Stored rather than left to the reader because it is the headline number of the
+    whole system, and because the sheet is meant to stand alone for AI analysis.
+    Positive = surplus. Blank when either side is missing — a one-sided balance is
+    not a small balance, it's an unknown one."""
+    cals_in, cals_out = _num(row.get("total_cals_in")), _num(row.get("total_cals_out"))
+    if row.get("total_cals_in") not in (None, "") and \
+            row.get("total_cals_out") not in (None, ""):
+        row["energy_balance_kcal"] = round(cals_in - cals_out)
+    return row
+
+
 def build_daily_rows(*sources: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Fold independent per-day column groups (biometrics, nutrition) into ONE
     merge-row per date.
@@ -243,8 +261,27 @@ def build_daily_rows(*sources: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]
         row: Dict[str, Any] = {"date": day}
         for source in sources:
             row.update(source.get(day, {}))
-        rows.append(row)
+        rows.append(_with_energy_balance(row))
     return rows
+
+
+# -- derived views --------------------------------------------------------------
+def rebuild_views(sheet: SheetClient) -> Dict[str, int]:
+    """Regenerate the `analysis` and `baselines` tabs from daily_summary.
+
+    Wholesale replacement, not incremental: these are pure functions of the
+    observations, so rebuilding is both simpler and drift-proof. A stale derived
+    row is worse than no row — it looks like data.
+    """
+    rows = sorted(sheet.read_rows(DAILY_TAB), key=lambda r: str(r.get("date", "")))
+
+    aligned = analysis_rows(rows)
+    sheet.replace_tab(ANALYSIS_TAB,
+                      [analysis_legend(), analysis_headers()] + aligned)
+
+    baselines = baseline_rows(rows)
+    sheet.replace_tab(BASELINES_TAB, [BASELINE_HEADERS] + baselines)
+    return {"analysis": len(aligned), "baselines": len(baselines)}
 
 
 # -- dashboard -----------------------------------------------------------------
@@ -358,6 +395,15 @@ def main() -> None:
     except Exception as err:  # ordering is cosmetic — never fail the data run
         sort_note = f"sort skipped ({err})"
 
+    # Derived views, rebuilt wholesale from the observations we just wrote. All
+    # three are cosmetic in the sense that the source of truth is daily_summary —
+    # so none of them may fail the data run.
+    views_note = "rebuilt"
+    try:
+        rebuild_views(sheet)
+    except Exception as err:
+        views_note = f"skipped ({err})"
+
     dashboard_note = "refreshed"
     try:
         refresh_dashboard(sheet)
@@ -368,7 +414,7 @@ def main() -> None:
         f"window>={start or 'ALL'}: biometrics {bio_note}; read {len(meals)} "
         f"meal rows -> {len(nutrition)} nutrition day(s); daily_summary updated "
         f"{daily_result['updated']}, appended {daily_result['appended']}, "
-        f"{sort_note}; dashboard {dashboard_note} "
+        f"{sort_note}; views {views_note}; dashboard {dashboard_note} "
         f"(spreadsheet {spreadsheet_id}, project {project})."
     )
 

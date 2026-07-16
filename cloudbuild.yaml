@@ -44,9 +44,11 @@ steps:
            '--image', '${_AR}/health-tracker-daily:$COMMIT_SHA', '--region', '${_REGION}']
 
   # --- ingest service ---
+  # Context is the repo root (not `ingest`) so the image can COPY the shared
+  # schema/ registry that both targets depend on.
   - id: build-ingest
     name: gcr.io/cloud-builders/docker
-    args: ['build', '-f', 'ingest/Dockerfile', '-t', '${_AR}/health-tracker-ingest:$COMMIT_SHA', 'ingest']
+    args: ['build', '-f', 'ingest/Dockerfile', '-t', '${_AR}/health-tracker-ingest:$COMMIT_SHA', '.']
   - id: push-ingest
     name: gcr.io/cloud-builders/docker
     args: ['push', '${_AR}/health-tracker-ingest:$COMMIT_SHA']

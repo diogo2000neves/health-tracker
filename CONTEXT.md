@@ -151,6 +151,57 @@ log, never a scale reading (there's no screen to OCR), so `analyze_text` runs wi
 Cloud Tasks retry just re-sets TRUE). Keyed on the **local day the note was sent**,
 like `/feel` — not the waking-day grain nutrition uses.
 
+## 2b. Data architecture (read this before changing the schema)
+
+**`schema/registry.py` is the single source of truth.** Every column declares its
+unit, dtype, source, direction, plausible range, description and — the important
+one — its **causal window**. From it are generated: the sheet's header row and
+column order, the `schema` tab, the OCR plausibility bands the ingest service
+validates against, the causal alignment of the `analysis` tab, the iOS app's JSON
+and Swift types, and the SQL DDL. It is pure stdlib and copied into **both**
+container images (they can't import each other — which is exactly why the column
+list used to be hand-mirrored and able to drift). Change a column there, run
+`python -m src.maintenance`, done.
+
+### Why `daily_summary` stays one wide table
+Every column is **1:1 with `date`**. Splitting it per category would be *vertical
+partitioning*, not normalisation — it removes no repeating group and no transitive
+dependency, so it buys a mandatory JOIN and gains nothing. `daily_summary` already
+**is** the fact table; `meals` is the event-grain table, with JSON exactly where
+cardinality genuinely varies (`items`). Measured, not assumed:
+* a **whole year** of the wide table is ~31k tokens of CSV — it fits any context
+  window, so "an AI can't read 79 columns" is false;
+* the same data as JSON costs **5.3x** the tokens (it repeats every key on every
+  row), so JSON columns would make AI reading *worse*, not better;
+* 10 years ≈ **69 MB** — 2.8% of the Sheets cell cap. Scale is not a concern.
+
+79 columns is a *presentation* problem, solved in `src/presentation.py` with
+collapsible column groups, frozen panes and per-unit formats — not a modelling one.
+
+### The causal rule (the subtle one)
+A row is an **observation of a date, not a causal unit**:
+
+| on row N | actually happened |
+|---|---|
+| `sleep_*`, recovery | the night that **ended** on the morning of N |
+| `weight_kg` & body | measured **that morning**, fasted |
+| nutrition, activity | **during** day N — after both of the above |
+
+So the food on row N is eaten *after* the sleep on row N. Correlating them on the
+same row asks *"did tomorrow's dinner affect last night's sleep?"* — backwards in
+time. Storage stays honest (each value stamped when measured); the fix lives in
+`src/analysis.py`, which pairs **inputs from day N with outcomes from day N+1**
+into the `analysis` tab, driven entirely by the registry's `causal` field. The
+weekly AI reads that tab, never the raw one.
+
+### The derived tabs (rebuilt every run, never edited)
+* **`analysis`** — the causally aligned view. Correlate here.
+* **`baselines`** — 28-day mean/SD/z per metric. An absolute value is
+  uninterpretable (73 ms HRV is excellent for one person, a warning for another);
+  against a personal baseline it becomes a sentence.
+* **`schema`** — the data dictionary, in the sheet next to the numbers.
+* **`dashboard`** — stat cells + charts.
+
 ## 3. Architecture
 
 ```

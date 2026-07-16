@@ -15,6 +15,9 @@ import google.auth
 from google import genai
 from google.genai import types
 
+from src.analysis import (
+    BASELINE_HEADERS, analysis_headers, analysis_rows, baseline_rows,
+)
 from src.sheets import DAILY_TAB, INSIGHTS_TAB, SheetClient
 
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
@@ -23,38 +26,32 @@ INSIGHTS_HEADERS = ["week_ending", "insights", "model", "updated_at"]
 DEFAULT_MODELS = "gemini-3.5-flash,gemini-3-flash-preview,gemini-3.1-flash-lite"
 WINDOW_DAYS = 35
 
-# Only columns with signal today; blank cells are expected and fine (body columns
-# are filled only on days the user weighed in, readiness columns not at all yet).
-# The full body-composition block is here because it's the whole point of the
-# analysis: muscle vs fat vs water is what says whether the intake is working.
-CSV_COLUMNS = [
-    "date",
-    # intake
-    "total_cals_in", "total_protein_g", "total_carbs_g", "total_fat_g",
-    "total_fiber_g", "total_sugar_g", "total_saturated_fat_g", "total_sodium_mg",
-    # body composition
-    "weight_kg", "bmi", "body_fat_pct", "subcutaneous_fat_pct", "visceral_fat",
-    "body_water_pct", "muscle_mass_kg", "bone_mass_kg", "lean_mass_kg",
-    "bmr_kcal", "metabolic_age",
-    # sleep
-    "sleep_mins", "sleep_efficiency_pct", "sleep_deep_mins", "sleep_rem_mins",
-    "sleep_light_mins", "sleep_latency_mins", "sleep_awakenings", "nap_mins",
-    "sleep_start", "sleep_end",
-    # overnight recovery
-    "resting_hr_bpm", "hrv_ms", "spo2_pct", "respiratory_rate_brpm",
-    "skin_temp_dev",
-    # activity / expenditure
-    "steps", "distance_km", "total_cals_out", "active_cals",
-    "total_active_mins", "sedentary_mins", "hr_avg_bpm", "hr_max_bpm",
-    # self-reported
-    "subjective_feel", "bowel_movement",
-]
+# There is no hand-picked column list any more: the analysis view decides what the
+# model sees, and it derives that from the registry's causal fields. A curated list
+# here would be a third place for the schema to drift.
 
 PROMPT_TEMPLATE = """You are a precise, no-nonsense personal health-data analyst.
-Below is a CSV of my daily health tracking for the last {days} rows (some cells
-are blank — metrics not yet collected; treat blanks as missing, not zero).
+
+Below are two CSVs of my personal health tracking. Blank means NOT MEASURED —
+never treat a blank as zero.
+
+=== 1. CAUSALLY ALIGNED DATA (last {days} days) ===
+Each row pairs what I DID on `date` with what my body did AFTERWARDS: every column
+ending `_next` is read from the FOLLOWING day's record. This is deliberate. My
+sleep on a given date happened the night BEFORE that date, and my morning weight
+was measured before I ate that day — so correlating intake against same-date sleep
+or weight in a raw table asks whether tomorrow's dinner affected last night's
+sleep. Use these `_next` pairings for every cause-and-effect claim you make.
 
 {csv}
+
+=== 2. WHAT IS NORMAL FOR ME (trailing 28 days) ===
+Absolute values mean little across people: an HRV of 73 ms is excellent for one
+person and a warning for another. Judge every reading against MY baseline below —
+`latest_z` is standard deviations from my own mean, and `direction` says which way
+is good for that metric.
+
+{baselines}
 
 Write your analysis as 5-7 short markdown bullets, in this spirit:
 - Body-composition trend vs intake — cite actual numbers. Weight alone is noise;
@@ -63,10 +60,11 @@ Write your analysis as 5-7 short markdown bullets, in this spirit:
 - **Energy balance**: `total_cals_in` vs `total_cals_out` (measured expenditure,
   not an estimate). State the actual surplus/deficit and whether the body-
   composition trend is consistent with it.
-- **Sleep and recovery**: `sleep_efficiency_pct` (asleep/in-bed) plus deep and REM
-  minutes, read against `resting_hr_bpm`, `hrv_ms` and `skin_temp_dev` — a rising
-  resting HR, falling HRV or a positive temperature deviation is the classic
-  under-recovery signature. Note any link to late/large meals or alcohol.
+- **Sleep and recovery**: `sleep_efficiency_pct_next` (asleep/in-bed) plus deep and
+  REM minutes, read against `resting_hr_bpm_next`, `hrv_ms_next` and
+  `skin_temp_dev_next` — a rising resting HR, falling HRV or a positive temperature
+  deviation is the classic under-recovery signature. Say which of MY days' intake
+  preceded the bad nights.
 - Any other notable pattern, correlation or anomaly. `bowel_movement` is TRUE on
   days I had one (blank = none logged); note regularity and any link to fibre or
   intake if the data supports it — don't over-read sparse data.
@@ -77,17 +75,19 @@ ask for one; reason from efficiency, stages and the recovery metrics instead.
 No preamble, no disclaimers, no generic health advice — only what the data shows."""
 
 
-def _to_csv(rows: List[Dict[str, Any]]) -> str:
-    lines = [",".join(CSV_COLUMNS)]
+def _to_csv(header: List[str], rows: List[List[Any]]) -> str:
+    """CSV, not JSON: for a fixed-schema numeric table JSON costs ~5x the tokens
+    (it repeats every key on every row) and buys nothing a header row doesn't."""
+    lines = [",".join(str(h) for h in header)]
     for row in rows:
-        lines.append(",".join(str(row.get(c, "") if row.get(c) is not None else "")
-                              for c in CSV_COLUMNS))
+        lines.append(",".join("" if v is None else str(v) for v in row))
     return "\n".join(lines)
 
 
-def generate(csv: str, days: int, api_key: str, models: List[str]) -> Dict[str, str]:
+def generate(csv: str, baselines: str, days: int, api_key: str,
+             models: List[str]) -> Dict[str, str]:
     client = genai.Client(api_key=api_key)
-    prompt = PROMPT_TEMPLATE.format(days=days, csv=csv)
+    prompt = PROMPT_TEMPLATE.format(days=days, csv=csv, baselines=baselines)
     last_err: Exception | None = None
     for model in models:
         try:
@@ -114,13 +114,25 @@ def main() -> None:
     creds, project = google.auth.default(scopes=[SHEETS_SCOPE])
     sheet = SheetClient(creds, spreadsheet_id)
 
-    rows = sorted(sheet.read_rows(DAILY_TAB), key=lambda r: str(r.get("date", "")))
-    rows = rows[-WINDOW_DAYS:]
-    if not rows:
+    daily = sorted(sheet.read_rows(DAILY_TAB), key=lambda r: str(r.get("date", "")))
+    daily = daily[-WINDOW_DAYS:]
+    if not daily:
         print("no daily_summary data yet — skipping")
         return
 
-    result = generate(_to_csv(rows), len(rows), api_key, models)
+    # Analyse the causally aligned view, never the raw observations: on the raw
+    # table a day's intake sits beside the night that preceded it, so any
+    # correlation drawn from it runs backwards in time. Built here rather than read
+    # from the tab so the weekly job doesn't depend on the daily job having run.
+    aligned = analysis_rows(daily)
+    baselines = baseline_rows(daily, today=datetime.now(tz).date())
+
+    result = generate(
+        _to_csv(analysis_headers(), aligned),
+        _to_csv(BASELINE_HEADERS, baselines),
+        len(aligned), api_key, models,
+    )
+    rows = aligned
 
     sheet.ensure_tab(INSIGHTS_TAB, INSIGHTS_HEADERS)
     sheet.append_row(INSIGHTS_TAB, [

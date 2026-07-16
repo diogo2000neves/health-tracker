@@ -91,6 +91,26 @@ Health Tracker/
 - `POST /feel` — `{"score": 1-10[, "date": "YYYY-MM-DD"]}` → writes
   `subjective_feel` on that day's `daily_summary` row (`{"score": null}` clears).
 
+- `GET /daily?from=&to=&blocks=&tier=` — **the iOS app's read endpoint.** Days as
+  JSON nested by block (`sleep`, `recovery`, `activity`, `nutrition`, `body`,
+  `self_report`), defaulting to the last 30 days. `?blocks=sleep,recovery` fetches
+  only the screen you're drawing; `?tier=1` trims to headline metrics. A blank cell
+  comes back as `null`, never `0` — "not measured" is not "zero".
+
+- `GET /schema` — the data dictionary as JSON: every column's unit, type, source,
+  direction and **when it was measured**. Lets a client (or an agent) discover the
+  data without shipping a copy of this repo.
+
+The app talks to *this service*, never to Google. That's deliberate: reading Sheets
+directly would need Google credentials inside the app bundle, and anything shipped
+in an iOS binary is extractable. The service account stays server-side; the app
+holds only a rotatable token. It also means storage can change later without
+touching a line of Swift.
+
+```bash
+python -m src.schema_export swift > HealthTypes.swift   # Codable structs, generated
+```
+
 ## Jobs
 
 - **`health-tracker-daily`** (07:00 Europe/Lisbon) — pulls **Fitbit Air
@@ -125,15 +145,46 @@ ships and production keeps the previous version.
 
 ## Schema changes
 
-`daily_summary` is written by position, so **never reorder or rename a column**.
-To add one: put it in `src.sheets.DAILY_HEADERS`, then run
+**`schema/registry.py` is the single source of truth.** Add a `Column` there —
+with its unit, source, direction, causal window and description — then run
 
 ```bash
 python -m src.maintenance
 ```
 
-which inserts it *in place* so existing rows stay aligned. The daily job refuses to
-run against a stale sheet rather than writing through it.
+which realigns the sheet *by header name* (so adding, removing and reordering are
+all safe), rewrites the `schema` tab, and reapplies the presentation. It refuses to
+drop a column that still holds data. The daily job refuses to run against a stale
+sheet rather than writing through it.
+
+Everything downstream regenerates from that one definition: the header row, the
+data dictionary, the OCR plausibility bands, the causal alignment, the app's JSON
+and Swift types.
+
+## The tabs
+
+| tab | what it is |
+|---|---|
+| `daily_summary` | **the source of truth.** One row per local day, 79 columns, grouped into collapsible blocks. Every column is 1:1 with `date`. |
+| `meals` | one row per meal; per-ingredient breakdown in `items` JSON |
+| `templates` | meals weighed on a real scale — measured, not estimated |
+| `analysis` | **derived, rebuilt every run.** Causally aligned: each day's inputs beside the *next* day's outcomes. Correlate here — see below. |
+| `baselines` | **derived.** 28-day mean/SD/z per metric: what's normal *for you* |
+| `schema` | **derived.** The data dictionary — what every column means |
+| `dashboard` | stat cells + charts |
+| `insights` | weekly AI trend summaries |
+
+### Why `analysis` exists
+
+A `daily_summary` row is an *observation of a date*, not a causal unit. The sleep
+on row N happened the night **before** N; the weight was measured that morning,
+**before** you ate that day. So correlating `total_cals_in` against
+`sleep_efficiency_pct` on the same row asks whether *tomorrow's* dinner affected
+*last night's* sleep — backwards in time.
+
+`analysis` fixes that: inputs from day N, outcomes (suffixed `_next`) from day N+1.
+It's rebuilt from scratch every run, so it can't drift. **Correlate on `analysis`,
+read facts from `daily_summary`.**
 
 ## Install
 

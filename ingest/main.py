@@ -73,7 +73,8 @@ import re
 import socket
 import ssl
 import time
-from datetime import datetime
+import math
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -85,6 +86,11 @@ from google.auth.transport.requests import Request as AuthRequest
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+
+from schema.registry import (
+    BLOCK_LABELS, BLOCKS, CAUSAL_LABELS, DAILY_COLUMNS, daily_headers, names_in,
+    ocr_ranges,
+)
 
 app = Flask(__name__)
 # Headroom for a few photos in one meal log while staying under Cloud Run's
@@ -124,33 +130,35 @@ TEMPLATE_CONFIDENCE = 0.95
 # Rows excluded from all totals (kept in sync with src/run_daily.py NON_MEALS).
 NON_MEALS = {"not food", "analysis failed"}
 
-# The ten metrics the smart scale computes, each a daily_summary column (mirror of
-# src/sheets.py BODY_METRICS — the ingest service is a separate image and can't
-# import src; tests/test_ingest asserts they stay in step).
+# The ten metrics the smart scale computes, each with a plausibility band for a
+# human body — read straight from the shared schema registry, which both container
+# images carry. (These used to be hand-mirrored here and in src/sheets.py, with
+# only a test holding them together.)
 #
-# The pair is a plausibility band for a human body. Reading digits off a phone
-# screen is the one place a model can be confidently, silently wrong — a misplaced
-# decimal turns 70.05 kg into 7005 kg and poisons every chart and trend downstream.
-# Anything outside its band is a misread, not a body, so it is dropped rather than
-# written. Bands are deliberately wide: they exist to catch OCR nonsense, not to
-# police what a body may be.
-BODY_METRICS: Dict[str, Tuple[float, float]] = {
-    "weight_kg": (20, 300),
-    "bmi": (8, 70),
-    "body_fat_pct": (2, 70),
-    "subcutaneous_fat_pct": (1, 60),
-    "visceral_fat": (1, 60),        # an index, not a unit
-    "body_water_pct": (20, 85),
-    "muscle_mass_kg": (10, 150),
-    "bone_mass_kg": (0.5, 10),
-    "bmr_kcal": (600, 5000),
-    "metabolic_age": (5, 120),      # years
-}
+# Reading digits off a phone screen is the one place a model can be confidently,
+# silently wrong — a misplaced decimal turns 70.05 kg into 7005 kg and poisons
+# every chart and trend downstream. Anything outside its band is a misread, not a
+# body, so it is dropped rather than written. Bands are deliberately wide: they
+# exist to catch OCR nonsense, not to police what a body may be.
+BODY_METRICS: Dict[str, Tuple[float, float]] = ocr_ranges()
 
 # A plain text note ("fiz cocó", "I just pooped") sets this TRUE on the day's
 # daily_summary row — the whole feature is one boolean. The user goes at most once
 # a day, so yes/no is enough; the note itself is not stored anywhere.
 BOWEL_COLUMN = "bowel_movement"
+
+
+def _col_letter_for(index: int) -> str:
+    letters = ""
+    index += 1
+    while index:
+        index, rem = divmod(index - 1, 26)
+        letters = chr(ord("A") + rem) + letters
+    return letters
+
+
+# Read ranges are derived from the schema with headroom, never hard-coded.
+_READ_LAST_COL = _col_letter_for(len(daily_headers()) + 40)
 
 # Strongest model first (accuracy over speed — response time isn't critical).
 # These are the strongest models available on the FREE tier; Pro models require
@@ -1167,11 +1175,12 @@ def download_photos(refs: List[Dict[str, str]]) -> List[Tuple[bytes, str]]:
 
 # -- Sheets --------------------------------------------------------------------
 def _read_tab(tab: str) -> List[List[Any]]:
-    # Through BZ (78 columns): daily_summary is already 40 wide and grows every time
-    # a metric is added, and a short range would silently truncate the header — so
-    # a column past the cut would look "missing" and its writes would land nowhere.
+    # Width is derived from the schema, never hard-coded: `A1:BZ` was exactly 78
+    # columns and the registry is already 79, so this read had one column of
+    # headroom left. A short range truncates the header silently — the column past
+    # the cut looks "missing" and its writes land nowhere.
     return _execute(lambda: _sheets().spreadsheets().values().get(
-        spreadsheetId=_sid(), range=f"{tab}!A1:BZ",
+        spreadsheetId=_sid(), range=f"{tab}!A1:{_READ_LAST_COL}",
         valueRenderOption="UNFORMATTED_VALUE")).get("values", [])
 
 
@@ -1967,3 +1976,125 @@ def feel():
     write_daily(day, {"subjective_feel": "" if clearing else score})
     return jsonify({"date": day,
                     "subjective_feel": None if clearing else score}), 200
+
+
+# -- read API (the iOS app) -----------------------------------------------------
+# The app never talks to Google. It talks to this service, with the same
+# X-Auth-Token the Shortcut uses. That matters for a concrete reason: reading the
+# sheet directly would require Google credentials inside the app bundle, and
+# anything shipped in an iOS binary is extractable. The service account stays here,
+# server-side, and the app holds only a token that can be rotated.
+#
+# It also means the storage can change later (SQLite, Postgres, whatever) without
+# touching a line of Swift — the API is the contract, not the spreadsheet.
+
+def _typed(column, raw: Any) -> Any:
+    """Coerce a sheet cell to the type the schema declares.
+
+    UNFORMATTED_VALUE already hands back numbers as numbers, but a blank is `""`
+    and a boolean may arrive as the string "TRUE". Clients get a real `null` for
+    missing rather than an empty string, so `if value == nil` works in Swift."""
+    if raw is None or raw == "":
+        return None
+    if column.dtype == "boolean":
+        return raw is True or str(raw).strip().upper() == "TRUE"
+    if column.dtype in ("number", "integer"):
+        try:
+            number = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(number):
+            return None
+        return int(number) if column.dtype == "integer" else number
+    return str(raw)
+
+
+def _day_document(row: Dict[str, Any], blocks: List[str]) -> Dict[str, Any]:
+    """One day as nested JSON, grouped by block.
+
+    Nested rather than flat because the blocks are the natural shape of the domain
+    (and of the Swift structs generated from the same registry): a sleep view asks
+    for `.sleep`, not for twelve loose keys it has to know the names of.
+    """
+    out: Dict[str, Any] = {"date": row.get("date")}
+    for block in blocks:
+        if block in ("key", "meta"):
+            continue
+        values = {c.name: _typed(c, row.get(c.name))
+                  for c in DAILY_COLUMNS if c.block == block}
+        # Keep the block even when empty, so the shape is stable for a decoder;
+        # an all-null block honestly says "not measured that day".
+        out[block] = values
+    return out
+
+
+@app.get("/schema")
+def schema():
+    """The data dictionary, machine-readable.
+
+    Served next to the data so a client — or an agent — can discover what every
+    field means, its unit, and *when it was measured*, without shipping a copy of
+    this repo. `measures_when` is the one that stops naive correlation: sleep on a
+    date happened the night before it.
+    """
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    return jsonify({
+        "blocks": [{"name": b, "label": BLOCK_LABELS[b]} for b in BLOCKS
+                   if b not in ("key", "meta")],
+        "columns": [{
+            "name": c.name, "block": c.block, "type": c.dtype, "unit": c.unit,
+            "source": c.source, "measures_when": CAUSAL_LABELS[c.causal],
+            "causal_role": c.role, "direction": c.direction, "tier": c.tier,
+            "min": (c.range[0] if c.range else None),
+            "max": (c.range[1] if c.range else None),
+            "description": c.description,
+        } for c in DAILY_COLUMNS],
+    }), 200
+
+
+@app.get("/daily")
+def daily():
+    """Days from daily_summary as nested JSON.
+
+    `?from=&to=`   inclusive ISO dates (default: the last 30 days)
+    `?blocks=`     comma-separated subset, e.g. `sleep,recovery` — so the app
+                   fetches only the screen it is drawing
+    `?tier=1`      headline metrics only
+
+    A year of this is ~390 KB (~50 KB gzipped), which is why no database is
+    involved: the whole history fits in a phone's memory several times over.
+    """
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    today = datetime.now(_tz()).date()
+    start = request.args.get("from") or (today - timedelta(days=30)).isoformat()
+    end = request.args.get("to") or today.isoformat()
+    for value in (start, end):
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            return jsonify({"error": "from/to must be YYYY-MM-DD"}), 400
+
+    wanted = [b for b in BLOCKS if b not in ("key", "meta")]
+    if request.args.get("blocks"):
+        asked = [b.strip() for b in request.args["blocks"].split(",") if b.strip()]
+        unknown = [b for b in asked if b not in wanted]
+        if unknown:
+            return jsonify({"error": f"unknown block(s) {unknown}",
+                            "known": wanted}), 400
+        wanted = asked
+
+    values = _read_tab(DAILY_TAB)
+    rows = _rows_as_dicts(values)
+    days = [_day_document(r, wanted) for r in rows
+            if start <= str(r.get("date", "")) <= end]
+    days.sort(key=lambda d: str(d.get("date")))
+
+    if request.args.get("tier") == "1":
+        tier1 = {c.name for c in DAILY_COLUMNS if c.tier == 1}
+        for day in days:
+            for block in wanted:
+                day[block] = {k: v for k, v in day[block].items() if k in tier1}
+
+    return jsonify({"from": start, "to": end, "count": len(days),
+                    "blocks": wanted, "days": days}), 200

@@ -20,9 +20,13 @@ from typing import Any, Dict, List, Tuple
 import google.auth
 from googleapiclient.discovery import build
 
+from src.presentation import (
+    SCHEMA_HEADERS, collapse_requests, format_requests, header_note_requests,
+    schema_legend, schema_rows,
+)
 from src.sheets import (
     DAILY_HEADERS, DAILY_TAB, DASHBOARD_FIRST_ROW, DASHBOARD_STATS, DASHBOARD_TAB,
-    INSIGHTS_TAB, MEALS_TAB, READ_LAST_COL, col_letter,
+    INSIGHTS_TAB, MEALS_TAB, READ_LAST_COL, SCHEMA_TAB, col_letter,
 )
 
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
@@ -285,7 +289,54 @@ def main() -> None:
     ).execute()
     print("templates: header in sync")
 
+    # 5. schema tab — the data dictionary, regenerated from the registry.
+    print(_sync_schema_tab(svc, sid, sheets))
+
+    # 6. presentation: frozen panes, collapsible blocks, units, header notes.
+    print(_apply_presentation(svc, sid, sheets[DAILY_TAB]["properties"]["sheetId"]))
+
     print(f"maintenance done (spreadsheet {sid}, project {project}).")
+
+
+def _sync_schema_tab(svc, sid: str, sheets: Dict[str, Any]) -> str:
+    """(Re)write the `schema` tab: what every column means, in the sheet itself.
+
+    Kept in the spreadsheet rather than only in the repo so that anything reading
+    the data — an AI agent, the iOS app, future me — gets the dictionary in the
+    same place as the numbers, with no second system to go look up."""
+    if SCHEMA_TAB not in sheets:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=sid,
+            body={"requests": [{"addSheet": {"properties": {"title": SCHEMA_TAB}}}]},
+        ).execute()
+    body = [schema_legend(), SCHEMA_HEADERS] + schema_rows()
+    svc.spreadsheets().values().clear(spreadsheetId=sid, range=SCHEMA_TAB).execute()
+    svc.spreadsheets().values().update(
+        spreadsheetId=sid, range=f"{SCHEMA_TAB}!A1",
+        valueInputOption="RAW", body={"values": body},
+    ).execute()
+    return f"schema: documented {len(schema_rows())} column(s)"
+
+
+def _apply_presentation(svc, sid: str, daily_id: int) -> str:
+    """Formatting only — never touches a value, so it is always safe to re-run.
+
+    Groups are created, then collapsed in a second pass (a group must exist before
+    it can be collapsed). Re-running adds no duplicate groups: Sheets merges an
+    identical range into the existing group."""
+    try:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=sid,
+            body={"requests": format_requests(daily_id)
+                  + header_note_requests(daily_id)},
+        ).execute()
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=sid, body={"requests": collapse_requests(daily_id)},
+        ).execute()
+        return ("presentation: frozen panes, collapsible blocks, number formats "
+                "and header notes applied")
+    except Exception as err:  # cosmetic — never fail maintenance
+        return f"presentation: skipped ({err})"
 
 
 if __name__ == "__main__":

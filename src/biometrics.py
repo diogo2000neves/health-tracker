@@ -29,31 +29,14 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-# -- column groups (documentation + the dashboard/insights read these) ---------
-# Sleep, from the `sleep` sessions of the night that ENDED on this date.
-SLEEP_COLUMNS = [
-    "sleep_start", "sleep_end", "time_in_bed_mins", "sleep_mins",
-    "sleep_efficiency_pct", "sleep_latency_mins", "sleep_awake_mins",
-    "sleep_deep_mins", "sleep_rem_mins", "sleep_light_mins", "sleep_awakenings",
-    "nap_mins",
-]
+from schema.registry import names_in
 
-# Overnight recovery, one value per day straight from the daily-* summaries.
-RECOVERY_COLUMNS = [
-    "resting_hr_bpm", "hrv_ms", "hrv_deep_sleep_ms", "hrv_entropy",
-    "non_rem_hr_bpm", "spo2_pct", "spo2_lower_pct", "spo2_upper_pct",
-    "respiratory_rate_brpm", "skin_temp_c", "skin_temp_dev",
-]
-
-# Movement and energy, aggregated per civil day by dailyRollUp.
-ACTIVITY_COLUMNS = [
-    "steps", "distance_km", "total_cals_out", "active_cals",
-    "total_active_mins", "active_mins_light", "active_mins_moderate",
-    "active_mins_vigorous", "azm_fat_burn_mins", "azm_cardio_mins",
-    "azm_peak_mins", "sedentary_mins", "hr_min_bpm", "hr_avg_bpm", "hr_max_bpm",
-    "mins_hr_light", "mins_hr_moderate", "mins_hr_vigorous", "mins_hr_peak",
-    "swim_strokes",
-]
+# -- column groups -------------------------------------------------------------
+# Read from the registry rather than restated here, so this module physically
+# cannot fill a column the schema doesn't declare (or miss one it does).
+SLEEP_COLUMNS = names_in("sleep")          # night that ENDED on this date
+RECOVERY_COLUMNS = names_in("recovery")    # overnight daily-* summaries
+ACTIVITY_COLUMNS = names_in("activity")    # per civil day, via dailyRollUp
 
 BIOMETRIC_COLUMNS = SLEEP_COLUMNS + RECOVERY_COLUMNS + ACTIVITY_COLUMNS
 

@@ -26,71 +26,35 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from googleapiclient.discovery import build
 
-from src.biometrics import BIOMETRIC_COLUMNS
+from schema.registry import daily_headers, names_in, ocr_ranges
 
 DAILY_TAB = "daily_summary"
 MEALS_TAB = "meals"
 DASHBOARD_TAB = "dashboard"
 INSIGHTS_TAB = "insights"
+SCHEMA_TAB = "schema"
+ANALYSIS_TAB = "analysis"
+BASELINES_TAB = "baselines"
 
-# Tier-1 micronutrients that also roll up into daily_summary as `total_<key>`
-# columns — the high-value, more-reliably-estimated ones. The full nutrient set
-# is stored per-ingredient in the meals `items` JSON (owned by ingest/main.py);
-# these are just the subset that additionally gets daily totals. Keys carry their
-# unit suffix (_g / _mg / _ug) so they map cleanly to a future relational schema.
+# The schema now lives in ONE place: schema/registry.py, which declares every
+# column's unit, source, causal window, direction, plausible range and description.
+# These names are re-exported for readability at the call sites; nothing here
+# defines the schema any more. Add or change a column in the registry, then run
+# `python -m src.maintenance` to migrate the sheet to match.
+DAILY_HEADERS: List[str] = daily_headers()
+
+# The ten metrics OCR'd from the scale screenshot. The ingest service reads the
+# same list (with its plausibility bands) straight from the registry, so the two
+# can no longer drift apart the way the old hand-mirrored copies could.
+BODY_METRICS: List[str] = [n for n in ocr_ranges()]
+
+# Micronutrients that get a daily total column (`total_<key>`). The full ~36
+# nutrient set lives per-ingredient in the meals `items` JSON; this is the
+# high-value subset that additionally rolls up.
 TIER1_NUTRIENTS: List[str] = [
-    "fiber_g", "sugar_g", "saturated_fat_g", "sodium_mg", "potassium_mg",
-    "calcium_mg", "iron_mg", "magnesium_mg", "zinc_mg",
-    "vitamin_c_mg", "vitamin_d_ug", "vitamin_b12_ug", "vitamin_a_ug",
-    "folate_ug", "omega3_g",
-]
-
-# Body composition, read straight off the smart scale app's result screen (the
-# user screenshots it and the ingest service OCRs every value with Gemini). These
-# are the ten metrics the scale actually computes from bioimpedance — the Google
-# Health API only ever exposed the first three, which is why we stopped using it.
-# Order = the order they appear on the app screen.
-#
-# Mirrored in ingest/main.py BODY_METRICS, which owns the plausibility ranges and
-# is a separate container image that can't import this module. `tests/test_sheets`
-# asserts the two stay in step.
-BODY_METRICS: List[str] = [
-    "weight_kg", "bmi", "body_fat_pct", "subcutaneous_fat_pct", "visceral_fat",
-    "body_water_pct", "muscle_mass_kg", "bone_mass_kg", "bmr_kcal",
-    "metabolic_age",
-]
-
-# Parent schema, grouped by source so a reader can see who owns what:
-#   self-report -> the /feel endpoint and a plain note (ingest service)
-#   sleep / recovery / activity -> Fitbit Air via the Google Health API (daily job)
-#   nutrition -> the meals roll-up (daily job)
-#   body -> the scale screenshot (ingest service)
-# `updated_at` stays last as bookkeeping.
-#
-# Derived-but-stored columns (the sheet must stay self-contained for AI analysis):
-# `lean_mass_kg` = weight_kg x (1 - body_fat_pct/100); `sleep_efficiency_pct` =
-# asleep / in-bed; `skin_temp_dev` = nightly - 30-day baseline.
-#
-# There is deliberately **no `sleep_score`**: Fitbit's 0-100 score is proprietary
-# and appears nowhere in the Google Health API (checked field-by-field against
-# discovery rev 20260715 — the Sleep message has interval/type/metadata/summary/
-# stages only). The components it is computed from *are* here, which is strictly
-# more information. Don't re-add the column expecting the API to fill it.
-#
-# Schema changes must go through src/maintenance.py so existing rows are realigned
-# in place, never clobbered.
-DAILY_HEADERS: List[str] = [
-    "date",
-    # self-reported
-    "subjective_feel", "bowel_movement",
-    # sleep + recovery + activity (Fitbit Air)
-    *BIOMETRIC_COLUMNS,
-    # nutrition roll-up (meals)
-    "total_cals_in", "total_protein_g", "total_carbs_g", "total_fat_g",
-    *[f"total_{n}" for n in TIER1_NUTRIENTS],
-    # body composition (scale screenshot)
-    *BODY_METRICS, "lean_mass_kg", "body_measured_at",
-    "updated_at",
+    n[len("total_"):] for n in names_in("nutrition")
+    if n.startswith("total_") and n not in
+    ("total_cals_in", "total_protein_g", "total_carbs_g", "total_fat_g")
 ]
 
 # The dashboard tab's stat block, in order from cell B3: (label, source column,
@@ -263,6 +227,26 @@ class SheetClient:
             valueInputOption="USER_ENTERED" if user_entered else "RAW",
             body={"values": values},
         ).execute()
+
+    def replace_tab(self, tab: str, values: List[List[Any]]) -> None:
+        """Overwrite a tab wholesale (creating it if absent).
+
+        Only for **derived** tabs — `analysis`, `baselines` — which are pure
+        functions of daily_summary and rebuilt every run. Never point this at a
+        tab that holds observations."""
+        if tab not in self.tab_titles():
+            self.svc.spreadsheets().batchUpdate(
+                spreadsheetId=self.sid,
+                body={"requests": [{"addSheet": {"properties": {"title": tab}}}]},
+            ).execute()
+            self._titles = None
+        self.svc.spreadsheets().values().clear(
+            spreadsheetId=self.sid, range=tab).execute()
+        if values:
+            self.svc.spreadsheets().values().update(
+                spreadsheetId=self.sid, range=f"{tab}!A1",
+                valueInputOption="RAW", body={"values": values},
+            ).execute()
 
     def append_row(self, tab: str, row: List[Any]) -> None:
         self.svc.spreadsheets().values().append(
