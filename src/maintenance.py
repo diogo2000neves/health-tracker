@@ -15,14 +15,14 @@ re-run: every step is a no-op when already applied.
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import google.auth
 from googleapiclient.discovery import build
 
 from src.sheets import (
     DAILY_HEADERS, DAILY_TAB, DASHBOARD_FIRST_ROW, DASHBOARD_STATS, DASHBOARD_TAB,
-    INSIGHTS_TAB, MEALS_TAB, col_letter,
+    INSIGHTS_TAB, MEALS_TAB, READ_LAST_COL, col_letter,
 )
 
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
@@ -54,31 +54,61 @@ DASHBOARD_LABELS = [["HEALTH DASHBOARD"], [""]] + [
 assert len(DASHBOARD_LABELS) == DASHBOARD_FIRST_ROW - 1 + len(DASHBOARD_STATS)
 
 
-def _sync_daily_columns(svc, sid: str, daily_id: int) -> str:
-    """Insert any column DAILY_HEADERS defines that the sheet lacks (in place)."""
-    header = (
+def _sync_daily_columns(svc, sid: str, daily_id: int) -> Tuple[str, bool]:
+    """Realign daily_summary to DAILY_HEADERS **by header name**, preserving every
+    row's data. Returns (message, changed).
+
+    Rebuilds the tab rather than inserting columns in place, because that is the
+    only approach that survives all three kinds of schema change at once: adding a
+    column, dropping one, and *reordering*. (The old insert-only version wrote the
+    new header over row 1 at the end, which silently re-labelled every value when
+    the order differed — the exact corruption the "never reorder" rule existed to
+    dodge.)
+
+    Refuses to drop a column that still holds data: losing history to a schema edit
+    must be a deliberate act, not a side effect of running maintenance.
+    """
+    values = (
         svc.spreadsheets().values()
-        .get(spreadsheetId=sid, range=f"{DAILY_TAB}!1:1")
-        .execute().get("values", [[]])
-    )[0]
-    missing = [h for h in DAILY_HEADERS if h not in header]
-    if not missing:
-        return "daily_summary: header already in sync"
-    for name in missing:
-        target = DAILY_HEADERS.index(name)
-        svc.spreadsheets().batchUpdate(
-            spreadsheetId=sid,
-            body={"requests": [{"insertDimension": {
-                "range": {"sheetId": daily_id, "dimension": "COLUMNS",
-                          "startIndex": target, "endIndex": target + 1},
-                "inheritFromBefore": False,
-            }}]},
+        .get(spreadsheetId=sid, range=f"{DAILY_TAB}!A1:{READ_LAST_COL}",
+             valueRenderOption="UNFORMATTED_VALUE")
+        .execute().get("values", [])
+    )
+    if not values:
+        svc.spreadsheets().values().update(
+            spreadsheetId=sid, range=f"{DAILY_TAB}!A1",
+            valueInputOption="RAW", body={"values": [DAILY_HEADERS]},
         ).execute()
+        return "daily_summary: empty — header written", True
+
+    header = values[0]
+    if header == DAILY_HEADERS:
+        return "daily_summary: header already in sync", False
+
+    rows = [dict(zip(header, row)) for row in values[1:]]
+    dropped = [h for h in header if h and h not in DAILY_HEADERS]
+    for name in dropped:
+        holding = [r[name] for r in rows if str(r.get(name, "")).strip() != ""]
+        if holding:
+            raise RuntimeError(
+                f"refusing to drop {DAILY_TAB} column {name!r}: it still holds "
+                f"{len(holding)} value(s), e.g. {holding[:3]}. Migrate the data "
+                "first, then remove the column from DAILY_HEADERS."
+            )
+
+    body = [DAILY_HEADERS] + [
+        [("" if r.get(h) is None else r.get(h, "")) for h in DAILY_HEADERS]
+        for r in rows
+    ]
+    svc.spreadsheets().values().clear(
+        spreadsheetId=sid, range=f"{DAILY_TAB}!A1:{READ_LAST_COL}").execute()
     svc.spreadsheets().values().update(
         spreadsheetId=sid, range=f"{DAILY_TAB}!A1",
-        valueInputOption="RAW", body={"values": [DAILY_HEADERS]},
-    ).execute()
-    return f"daily_summary: inserted column(s) {missing}"
+        valueInputOption="RAW", body={"values": body}).execute()
+
+    added = [h for h in DAILY_HEADERS if h not in header]
+    return (f"daily_summary: realigned {len(rows)} row(s) to {len(DAILY_HEADERS)} "
+            f"columns (+{len(added)} added, -{len(dropped)} dropped: {dropped})"), True
 
 
 def _sync_meals_columns(svc, sid: str) -> str:
@@ -169,7 +199,23 @@ def main() -> None:
     sheets = {s["properties"]["title"]: s for s in meta.get("sheets", [])}
 
     # 1. daily_summary column alignment.
-    print(_sync_daily_columns(svc, sid, sheets[DAILY_TAB]["properties"]["sheetId"]))
+    message, layout_changed = _sync_daily_columns(
+        svc, sid, sheets[DAILY_TAB]["properties"]["sheetId"])
+    print(message)
+
+    # Charts source their series by column *index*, so a realigned layout leaves
+    # them silently plotting whatever now sits at the old positions. Drop them and
+    # let step 2 rebuild from the current DAILY_HEADERS.
+    if layout_changed:
+        existing = [c["chartId"] for c in sheets.get(DASHBOARD_TAB, {}).get("charts", [])]
+        if existing:
+            svc.spreadsheets().batchUpdate(
+                spreadsheetId=sid,
+                body={"requests": [{"deleteEmbeddedObject": {"objectId": cid}}
+                                   for cid in existing]},
+            ).execute()
+            sheets[DASHBOARD_TAB]["charts"] = []
+            print(f"dashboard: dropped {len(existing)} stale chart(s) for rebuild")
 
     # 1b. meals column alignment (drop notes, add model, ...).
     if MEALS_TAB in sheets:
