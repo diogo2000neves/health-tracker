@@ -33,7 +33,6 @@ MEALS_TAB = "meals"
 DASHBOARD_TAB = "dashboard"
 INSIGHTS_TAB = "insights"
 SCHEMA_TAB = "schema"
-ANALYSIS_TAB = "analysis"
 BASELINES_TAB = "baselines"
 
 # The schema now lives in ONE place: schema/registry.py, which declares every

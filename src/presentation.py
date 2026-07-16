@@ -69,9 +69,9 @@ def schema_legend() -> List[str]:
         "do not edit by hand. `measures_when` is the important column: a row is an "
         "observation of a date, NOT a causal unit. Sleep and recovery on row N "
         "happened the night BEFORE N; food and activity happened during N, after "
-        "both. To correlate cause with effect, use the `analysis` tab, which pairs "
-        "each day's inputs with the next day's outcomes. `baselines` says what is "
-        "normal for this person — a raw value alone is not interpretable."
+        "both. To correlate cause with effect, pair each day's inputs with the "
+        "next day's outcomes. `baselines` says what is normal for this person — "
+        "a raw value alone is not interpretable."
     ]
 
 

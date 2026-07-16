@@ -49,7 +49,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
 from src.analysis import (
-    BASELINE_HEADERS, analysis_headers, analysis_legend, analysis_rows,
+    BASELINE_HEADERS,
     baseline_rows,
 )
 from src.biometrics import biometric_days, daily_activity, daily_recovery, daily_sleep
@@ -57,7 +57,7 @@ from src.google_health import (
     DAILY_TYPES, ROLLUP_TYPES, SLEEP, GoogleHealthClient,
 )
 from src.sheets import (
-    ANALYSIS_TAB, BASELINES_TAB, DAILY_HEADERS, DAILY_TAB, DASHBOARD_FIRST_ROW,
+    BASELINES_TAB, DAILY_HEADERS, DAILY_TAB, DASHBOARD_FIRST_ROW,
     DASHBOARD_STATS, DASHBOARD_TAB, MEALS_TAB, SheetClient, TIER1_NUTRIENTS,
 )
 
@@ -275,13 +275,9 @@ def rebuild_views(sheet: SheetClient) -> Dict[str, int]:
     """
     rows = sorted(sheet.read_rows(DAILY_TAB), key=lambda r: str(r.get("date", "")))
 
-    aligned = analysis_rows(rows)
-    sheet.replace_tab(ANALYSIS_TAB,
-                      [analysis_legend(), analysis_headers()] + aligned)
-
     baselines = baseline_rows(rows)
     sheet.replace_tab(BASELINES_TAB, [BASELINE_HEADERS] + baselines)
-    return {"analysis": len(aligned), "baselines": len(baselines)}
+    return {"baselines": len(baselines)}
 
 
 # -- dashboard -----------------------------------------------------------------

@@ -217,6 +217,15 @@ def main() -> None:
     ).execute()
     sheets = {s["properties"]["title"]: s for s in meta.get("sheets", [])}
 
+    # Delete obsolete analysis tab if present.
+    if "analysis" in sheets:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=sid,
+            body={"requests": [{"deleteSheet": {"sheetId": sheets["analysis"]["properties"]["sheetId"]}}]},
+        ).execute()
+        print("analysis: obsolete tab deleted")
+        del sheets["analysis"]
+
     # 1. daily_summary column alignment.
     message, layout_changed = _sync_daily_columns(
         svc, sid, sheets[DAILY_TAB]["properties"]["sheetId"])
