@@ -134,16 +134,8 @@ DAILY_COLUMNS: List[Column] = [
                        "plain text note. Digestion lags intake by roughly a day."),
 
     # -- sleep (night that ENDED on this date) ---------------------------------
-    Column("sleep_start", "sleep", "time", "HH:MM", "fitbit", NIGHT_ENDING,
-           NEUTRAL, tier=2,
-           description="Local clock time I fell asleep (usually the previous "
-                       "evening). Consistency of this time matters more than its value."),
-    Column("sleep_end", "sleep", "time", "HH:MM", "fitbit", NIGHT_ENDING,
-           NEUTRAL, tier=2,
-           description="Local clock time I woke on this morning."),
-    Column("time_in_bed_mins", "sleep", "integer", "min", "fitbit", NIGHT_ENDING,
-           NEUTRAL, tier=2, range=(0, 1000),
-           description="Total sleep period: asleep + awake time in bed."),
+    # Headline metric first: each block's first column stays visible when the block
+    # is collapsed in the sheet, so it is the one you see at a glance.
     Column("sleep_mins", "sleep", "integer", "min", "fitbit", NIGHT_ENDING,
            UP_GOOD, tier=1, range=(0, 1000),
            description="Minutes actually asleep. The headline sleep number."),
@@ -152,13 +144,6 @@ DAILY_COLUMNS: List[Column] = [
            description="sleep_mins / time_in_bed_mins. Above ~90% is good. This is "
                        "the honest stand-in for Fitbit's proprietary sleep score, "
                        "which the Google Health API does not expose at all."),
-    Column("sleep_latency_mins", "sleep", "integer", "min", "fitbit", NIGHT_ENDING,
-           DOWN_GOOD, tier=2, range=(0, 300),
-           description="Minutes taken to fall asleep. Long latency often follows a "
-                       "late or heavy meal, caffeine, or a stressful day."),
-    Column("sleep_awake_mins", "sleep", "integer", "min", "fitbit", NIGHT_ENDING,
-           DOWN_GOOD, tier=2, range=(0, 500),
-           description="Minutes awake during the sleep period (fragmentation)."),
     Column("sleep_deep_mins", "sleep", "integer", "min", "fitbit", NIGHT_ENDING,
            UP_GOOD, tier=1, range=(0, 400),
            description="Deep (slow-wave) sleep. Physical restoration; suppressed by "
@@ -167,13 +152,30 @@ DAILY_COLUMNS: List[Column] = [
            UP_GOOD, tier=1, range=(0, 400),
            description="REM sleep. Cognitive/emotional consolidation. Typically "
                        "20-25% of the night."),
+    Column("time_in_bed_mins", "sleep", "integer", "min", "fitbit", NIGHT_ENDING,
+           NEUTRAL, tier=2, range=(0, 1000),
+           description="Total sleep period: asleep + awake time in bed."),
     Column("sleep_light_mins", "sleep", "integer", "min", "fitbit", NIGHT_ENDING,
            NEUTRAL, tier=2, range=(0, 700),
            description="Light sleep. The bulk of the night; not itself a quality "
                        "signal."),
+    Column("sleep_awake_mins", "sleep", "integer", "min", "fitbit", NIGHT_ENDING,
+           DOWN_GOOD, tier=2, range=(0, 500),
+           description="Minutes awake during the sleep period (fragmentation)."),
+    Column("sleep_latency_mins", "sleep", "integer", "min", "fitbit", NIGHT_ENDING,
+           DOWN_GOOD, tier=2, range=(0, 300),
+           description="Minutes taken to fall asleep. Long latency often follows a "
+                       "late or heavy meal, caffeine, or a stressful day."),
     Column("sleep_awakenings", "sleep", "integer", "count", "fitbit", NIGHT_ENDING,
            DOWN_GOOD, tier=2, range=(0, 60),
            description="Number of distinct awake episodes during the night."),
+    Column("sleep_start", "sleep", "time", "HH:MM", "fitbit", NIGHT_ENDING,
+           NEUTRAL, tier=2,
+           description="Local clock time I fell asleep (usually the previous "
+                       "evening). Consistency of this time matters more than its value."),
+    Column("sleep_end", "sleep", "time", "HH:MM", "fitbit", NIGHT_ENDING,
+           NEUTRAL, tier=2,
+           description="Local clock time I woke on this morning."),
     Column("nap_mins", "sleep", "integer", "min", "fitbit", DAY_OF, NEUTRAL,
            tier=2, range=(0, 600),
            description="Daytime sleep, kept deliberately apart from the night "

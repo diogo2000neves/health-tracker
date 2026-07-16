@@ -80,6 +80,32 @@ def _grid_range(sheet_id: int, start: int, end: int) -> Dict[str, Any]:
             "startIndex": start, "endIndex": end}
 
 
+def block_groups() -> List[Dict[str, Any]]:
+    """The collapsible column range for each block: [name, start, end).
+
+    Each group deliberately **skips its block's first column**, for two reasons:
+
+    1. Sheets *merges adjacent groups at the same depth*. Grouping B:C and D:O
+       side by side silently produces one group spanning B:O — collapse-all or
+       nothing, which is useless. Leaving one ungrouped column between them keeps
+       them distinct.
+    2. That skipped column becomes the block's anchor: it stays visible when the
+       block is folded, so a fully collapsed sheet still reads
+       `date | feel | sleep_mins | resting_hr | steps | energy_balance | weight`.
+       The registry orders each block headline-first for exactly this.
+
+    Blocks of fewer than 3 columns aren't worth a group (you'd hide one column).
+    """
+    out: List[Dict[str, Any]] = []
+    index = 0
+    for block in _block_order():
+        span = len(columns_in(block))
+        if block not in ("key", "meta") and span >= 3:
+            out.append({"block": block, "start": index + 1, "end": index + span})
+        index += span
+    return out
+
+
 def format_requests(daily_id: int) -> List[Dict[str, Any]]:
     """batchUpdate requests that make the daily_summary tab readable.
 
@@ -108,16 +134,9 @@ def format_requests(daily_id: int) -> List[Dict[str, Any]]:
         }},
     ]
 
-    # Collapsible group per block. `key` and `meta` are single columns either side
-    # of the data and aren't worth grouping.
-    index = 0
-    for block in _block_order():
-        cols = columns_in(block)
-        span = len(cols)
-        if block not in ("key", "meta") and span > 1:
-            requests.append({"addDimensionGroup": {
-                "range": _grid_range(daily_id, index, index + span)}})
-        index += span
+    for group in block_groups():
+        requests.append({"addDimensionGroup": {
+            "range": _grid_range(daily_id, group["start"], group["end"])}})
 
     # Number formats, driven by each column's declared unit.
     for i, col in enumerate(DAILY_COLUMNS):
@@ -133,24 +152,29 @@ def format_requests(daily_id: int) -> List[Dict[str, Any]]:
     return requests
 
 
+def clear_group_requests(daily_id: int,
+                         existing: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Drop the groups already on the sheet so they can be rebuilt cleanly.
+
+    Needed because groups are positional: after a schema reorder the old ranges
+    span the wrong columns, and because Sheets silently merges adjacent groups,
+    a stale run can leave one giant group that no new request will match."""
+    return [{"deleteDimensionGroup": {"range": _grid_range(
+        daily_id, g["range"]["startIndex"], g["range"]["endIndex"])}}
+        for g in existing]
+
+
 def collapse_requests(daily_id: int) -> List[Dict[str, Any]]:
-    """Collapse every block group by default, so the tab opens on `date` plus a row
-    of neat little `+` buttons instead of a wall of 79 columns. Applied separately
-    because a group must exist before it can be collapsed."""
-    out: List[Dict[str, Any]] = []
-    index = 0
-    for block in _block_order():
-        span = len(columns_in(block))
-        if block not in ("key", "meta") and span > 1:
-            out.append({"updateDimensionGroup": {
-                "dimensionGroup": {
-                    "range": _grid_range(daily_id, index, index + span),
-                    "depth": 1, "collapsed": True,
-                },
-                "fields": "collapsed",
-            }})
-        index += span
-    return out
+    """Collapse every block by default: the tab then opens on ~7 headline columns
+    plus a `+` per block, instead of a wall of 79. Applied in a second pass because
+    a group must exist before it can be collapsed."""
+    return [{"updateDimensionGroup": {
+        "dimensionGroup": {
+            "range": _grid_range(daily_id, g["start"], g["end"]),
+            "depth": 1, "collapsed": True,
+        },
+        "fields": "collapsed",
+    }} for g in block_groups()]
 
 
 def _block_order() -> List[str]:

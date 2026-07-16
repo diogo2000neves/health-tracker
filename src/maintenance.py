@@ -21,8 +21,8 @@ import google.auth
 from googleapiclient.discovery import build
 
 from src.presentation import (
-    SCHEMA_HEADERS, collapse_requests, format_requests, header_note_requests,
-    schema_legend, schema_rows,
+    SCHEMA_HEADERS, block_groups, clear_group_requests, collapse_requests,
+    format_requests, header_note_requests, schema_legend, schema_rows,
 )
 from src.sheets import (
     DAILY_HEADERS, DAILY_TAB, DASHBOARD_FIRST_ROW, DASHBOARD_STATS, DASHBOARD_TAB,
@@ -321,10 +321,26 @@ def _sync_schema_tab(svc, sid: str, sheets: Dict[str, Any]) -> str:
 def _apply_presentation(svc, sid: str, daily_id: int) -> str:
     """Formatting only — never touches a value, so it is always safe to re-run.
 
-    Groups are created, then collapsed in a second pass (a group must exist before
-    it can be collapsed). Re-running adds no duplicate groups: Sheets merges an
-    identical range into the existing group."""
+    Three passes, in this order for real reasons: existing groups are deleted first
+    (they're positional, so a schema reorder leaves them spanning the wrong
+    columns), then rebuilt, then collapsed — a group must exist before it can be
+    collapsed, and it must be created in its own batch to be visible to the next.
+    """
     try:
+        meta = svc.spreadsheets().get(
+            spreadsheetId=sid,
+            fields="sheets(properties(sheetId),columnGroups(range,depth))",
+        ).execute()
+        existing: List[Dict[str, Any]] = []
+        for sheet in meta.get("sheets", []):
+            if sheet["properties"]["sheetId"] == daily_id:
+                existing = sheet.get("columnGroups", [])
+        if existing:
+            svc.spreadsheets().batchUpdate(
+                spreadsheetId=sid,
+                body={"requests": clear_group_requests(daily_id, existing)},
+            ).execute()
+
         svc.spreadsheets().batchUpdate(
             spreadsheetId=sid,
             body={"requests": format_requests(daily_id)
@@ -333,8 +349,9 @@ def _apply_presentation(svc, sid: str, daily_id: int) -> str:
         svc.spreadsheets().batchUpdate(
             spreadsheetId=sid, body={"requests": collapse_requests(daily_id)},
         ).execute()
-        return ("presentation: frozen panes, collapsible blocks, number formats "
-                "and header notes applied")
+        return (f"presentation: {len(block_groups())} collapsible block(s) "
+                f"(replaced {len(existing)}), frozen panes, number formats, "
+                "header notes")
     except Exception as err:  # cosmetic — never fail maintenance
         return f"presentation: skipped ({err})"
 
