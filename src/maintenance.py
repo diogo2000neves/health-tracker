@@ -223,6 +223,26 @@ def _column_groups(svc, sid: str, daily_id: int) -> List[Dict[str, Any]]:
     return []
 
 
+def _hidden_columns(svc, sid: str, daily_id: int) -> set:
+    """Indices of columns the sheet is currently hiding.
+
+    `hiddenByUser` belongs to the column, not to any group, so it survives the
+    group that hid it. Read back explicitly — a correct set of groups over
+    still-hidden columns looks exactly like a broken sheet.
+    """
+    meta = svc.spreadsheets().get(
+        spreadsheetId=sid,
+        fields="sheets(properties(sheetId),data(columnMetadata(hiddenByUser)))",
+    ).execute()
+    for sheet in meta.get("sheets", []):
+        if sheet["properties"]["sheetId"] != daily_id:
+            continue
+        data = sheet.get("data") or [{}]
+        columns = data[0].get("columnMetadata") or []
+        return {i for i, c in enumerate(columns) if c.get("hiddenByUser")}
+    return set()
+
+
 def _flatten_groups(svc, sid: str, daily_id: int) -> int:
     """Remove EVERY column group, re-reading until the sheet agrees none are left.
 
@@ -316,9 +336,20 @@ def _apply_presentation(svc, sid: str, daily_id: int) -> str:
             return (f"presentation: BROKEN — wanted {len(want)} groups, the sheet "
                     f"has {len(final)}. Ranges: "
                     f"{[(g.get('range', {}).get('startIndex', 0), g.get('range', {}).get('endIndex')) for g in final]}")
-        return (f"presentation: {len(want)} collapsible block(s) verified on the "
-                f"sheet (removed {removed} stale), frozen panes, number formats, "
-                "header notes")
+
+        # Groups being right is not the same as the sheet LOOKING right: hidden-ness
+        # is a column property that outlives the group that caused it. Check what is
+        # actually visible, which is what the user sees.
+        hidden = _hidden_columns(svc, sid, daily_id)
+        grouped = {i for g in want for i in range(g["start"], g["end"])}
+        anchors = [i for i in range(len(DAILY_HEADERS)) if i not in grouped]
+        stuck = [DAILY_HEADERS[i] for i in anchors if i in hidden]
+        if stuck:
+            return (f"presentation: BROKEN — {len(stuck)} anchor column(s) still "
+                    f"hidden despite no group covering them: {stuck}")
+        return (f"presentation: {len(want)} collapsible block(s) verified "
+                f"(removed {removed} stale); visible when collapsed: "
+                f"{[DAILY_HEADERS[i] for i in anchors]}")
     except Exception as err:  # cosmetic — must never fail the data migration
         return f"presentation: FAILED ({err})"
 

@@ -153,3 +153,24 @@ def test_clear_requests_target_every_group_it_is_given():
     assert spans == [(3, 14), (15, 25), (3, 78)]
     assert all(r["deleteDimensionGroup"]["range"]["dimension"] == "COLUMNS"
                for r in reqs)
+
+
+def test_columns_are_unhidden_before_groups_are_rebuilt():
+    # The bug that made the sheet LOOK like one giant block even once the groups
+    # were correct: collapsing a group hides its columns, but `hiddenByUser` is a
+    # property of the COLUMN and outlives the group. Stale groups that spanned the
+    # wrong columns left the new anchors hidden forever. Every rebuild must first
+    # un-hide the whole range; the collapse pass then re-hides only what's grouped.
+    reqs = format_requests(7)
+    unhide = [r for r in reqs if "updateDimensionProperties" in r]
+    assert len(unhide) == 1, "the un-hide request is missing"
+    req = unhide[0]["updateDimensionProperties"]
+    assert req["properties"]["hiddenByUser"] is False
+    assert req["fields"] == "hiddenByUser"
+    assert req["range"]["dimension"] == "COLUMNS"
+    assert req["range"]["startIndex"] == 0
+    assert req["range"]["endIndex"] == len(DAILY_COLUMNS)   # the whole table
+    # and it must come before any group is created, or it would un-hide the
+    # collapse we just asked for
+    first_group = next(i for i, r in enumerate(reqs) if "addDimensionGroup" in r)
+    assert reqs.index(unhide[0]) < first_group

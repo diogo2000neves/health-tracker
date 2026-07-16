@@ -117,6 +117,19 @@ def format_requests(daily_id: int) -> List[Dict[str, Any]]:
     * a bold header and banded rows.
     """
     requests: List[Dict[str, Any]] = [
+        # Un-hide everything FIRST. Collapsing a group hides its columns, but
+        # `hiddenByUser` is a property of the column, not of the group — deleting
+        # the group leaves them hidden. So a stale group that spanned the wrong
+        # columns keeps them invisible forever, even once correct groups are
+        # rebuilt around them. That is what made the sheet look like one giant
+        # block: the groups were right, the columns were just still hidden.
+        # Collapsing (a separate pass) re-hides only what's actually grouped.
+        {"updateDimensionProperties": {
+            "range": {"sheetId": daily_id, "dimension": "COLUMNS",
+                      "startIndex": 0, "endIndex": len(DAILY_COLUMNS)},
+            "properties": {"hiddenByUser": False},
+            "fields": "hiddenByUser",
+        }},
         {"updateSheetProperties": {
             "properties": {"sheetId": daily_id,
                            "gridProperties": {"frozenRowCount": 1,
