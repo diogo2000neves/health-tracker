@@ -8,7 +8,6 @@ Each run (Cloud Run Job, triggered ~07:00 Europe/Lisbon):
      active/zone minutes, heart-rate range) — and merges them per civil day.
   2. Rolls meals logged in the ``meals`` tab into ``daily_summary`` nutrition
      totals per day; non-food shots and failed analyses are ignored.
-  3. Refreshes the ``dashboard`` tab's stat cells (best-effort).
 
 07:00 is deliberate: it is after the night has been scored and synced, so the
 night that just ended lands on its own wake-day row the same morning.
@@ -57,8 +56,7 @@ from src.google_health import (
     DAILY_TYPES, ROLLUP_TYPES, SLEEP, GoogleHealthClient,
 )
 from src.sheets import (
-    BASELINES_TAB, DAILY_HEADERS, DAILY_TAB, DASHBOARD_FIRST_ROW,
-    DASHBOARD_STATS, DASHBOARD_TAB, MEALS_TAB, SheetClient, TIER1_NUTRIENTS,
+    BASELINES_TAB, DAILY_HEADERS, DAILY_TAB, MEALS_TAB, SheetClient, TIER1_NUTRIENTS,
 )
 
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
@@ -280,56 +278,6 @@ def rebuild_views(sheet: SheetClient) -> Dict[str, int]:
     return {"baselines": len(baselines)}
 
 
-# -- dashboard -----------------------------------------------------------------
-def refresh_dashboard(sheet: SheetClient) -> None:
-    """Rewrite the dashboard's stat column from DASHBOARD_STATS (maintenance.py
-    writes the matching labels beside them). No-op if the tab is absent."""
-    if DASHBOARD_TAB not in sheet.tab_titles():
-        return
-    rows = sorted(sheet.read_rows(DAILY_TAB), key=lambda r: str(r.get("date", "")))
-    logged = [r for r in rows if _num(r.get("total_cals_in")) > 0][-7:]
-    week_ago = (datetime.now(timezone.utc).date() - timedelta(days=6)).isoformat()
-
-    def latest(col: str) -> Any:
-        """The most recent non-empty reading — body columns are only filled on days
-        the user actually weighed in, so the last *row* is usually blank."""
-        for row in reversed(rows):
-            value = row.get(col)
-            if value not in (None, ""):
-                return value
-        return ""
-
-    def avg7(col: str) -> Any:
-        if not logged:
-            return ""
-        return round(sum(_num(r.get(col)) for r in logged) / len(logged))
-
-    def avgd7(col: str) -> Any:
-        """Mean over the last 7 calendar days that actually carry this column.
-        Biometrics land every day the tracker is worn — independently of whether
-        meals were logged — so averaging them over the nutrition window would
-        divide by the wrong days."""
-        vals = [_num(r.get(col)) for r in rows
-                if str(r.get("date", "")) >= week_ago and r.get(col) not in (None, "")]
-        return round(sum(vals) / len(vals)) if vals else ""
-
-    def count7(col: str) -> int:
-        """How many of the last 7 calendar days carry TRUE in `col` (bowel_movement).
-        Counts by date, not by row, so gap days don't distort the tally."""
-        return sum(1 for r in rows
-                   if str(r.get("date", "")) >= week_ago and _is_true(r.get(col)))
-
-    reduce = {
-        "latest": latest,
-        "avg7": avg7,
-        "avgd7": avgd7,
-        "days7": lambda _col: len(logged),
-        "count7": count7,
-        "now": lambda _col: datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }
-    stats = [[reduce[kind](col)] for _label, col, kind in DASHBOARD_STATS]
-    sheet.write_values(DASHBOARD_TAB, f"B{DASHBOARD_FIRST_ROW}", stats)
-
 
 # -- entry point ----------------------------------------------------------------
 def main() -> None:
@@ -400,17 +348,11 @@ def main() -> None:
     except Exception as err:
         views_note = f"skipped ({err})"
 
-    dashboard_note = "refreshed"
-    try:
-        refresh_dashboard(sheet)
-    except Exception as err:  # stats are cosmetic — never fail the data run
-        dashboard_note = f"skipped ({err})"
-
     print(
         f"window>={start or 'ALL'}: biometrics {bio_note}; read {len(meals)} "
         f"meal rows -> {len(nutrition)} nutrition day(s); daily_summary updated "
         f"{daily_result['updated']}, appended {daily_result['appended']}, "
-        f"{sort_note}; views {views_note}; dashboard {dashboard_note} "
+        f"{sort_note}; views {views_note} "
         f"(spreadsheet {spreadsheet_id}, project {project})."
     )
 

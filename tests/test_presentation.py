@@ -40,8 +40,8 @@ def test_a_collapsed_sheet_still_shows_the_headlines():
     grouped = {i for g in block_groups() for i in range(g["start"], g["end"])}
     visible = [headers[i] for i in range(len(headers)) if i not in grouped]
     assert visible == [
-        "date", "subjective_feel", "bowel_movement", "sleep_mins",
-        "resting_hr_bpm", "steps", "energy_balance_kcal", "weight_kg",
+        "date", "bowel_movement", "sleep_mins",
+        "resting_hr_bpm", "total_cals_out", "energy_balance_kcal", "weight_kg",
         "updated_at",
     ]
     from schema.registry import BY_NAME

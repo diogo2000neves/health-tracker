@@ -122,11 +122,6 @@ DAILY_COLUMNS: List[Column] = [
                        "per day, and the join key for every source."),
 
     # -- self-reported ---------------------------------------------------------
-    Column("subjective_feel", "self_report", "number", "1-10", "user", DAY_OF,
-           UP_GOOD, tier=1, range=(1, 10), precision=1,
-           description="How I felt on this day, 1-10, logged via POST /feel. The "
-                       "only wholly subjective signal; useful as ground truth for "
-                       "whether the objective recovery metrics match lived experience."),
     Column("bowel_movement", "self_report", "boolean", "", "user", DAY_OF,
            NEUTRAL, tier=2,
            description="TRUE if I had a bowel movement on this day; blank means "
@@ -233,18 +228,18 @@ DAILY_COLUMNS: List[Column] = [
                        "history to build the baseline from."),
 
     # -- activity & energy -----------------------------------------------------
-    Column("steps", "activity", "integer", "count", "fitbit", CALENDAR_DAY,
-           UP_GOOD, tier=1, range=(0, 100000),
-           description="Total steps taken on this calendar day."),
-    Column("distance_km", "activity", "number", "km", "fitbit", CALENDAR_DAY,
-           UP_GOOD, tier=2, range=(0, 200), precision=2,
-           description="Distance covered on this calendar day."),
     Column("total_cals_out", "activity", "integer", "kcal", "fitbit", CALENDAR_DAY,
            NEUTRAL, tier=1, range=(500, 10000),
            description="Total energy expenditure: basal metabolism plus all "
                        "activity. Measured, not estimated. Pair with total_cals_in "
                        "for true energy balance — this is the number the whole "
                        "system exists to produce."),
+    Column("steps", "activity", "integer", "count", "fitbit", CALENDAR_DAY,
+           UP_GOOD, tier=1, range=(0, 100000),
+           description="Total steps taken on this calendar day."),
+    Column("distance_km", "activity", "number", "km", "fitbit", CALENDAR_DAY,
+           UP_GOOD, tier=2, range=(0, 200), precision=2,
+           description="Distance covered on this calendar day."),
     Column("active_cals", "activity", "integer", "kcal", "fitbit", CALENDAR_DAY,
            UP_GOOD, tier=2, range=(0, 8000),
            description="Energy burned above basal metabolism (the movement part of "

@@ -30,8 +30,6 @@ from schema.registry import daily_headers, names_in, ocr_ranges
 
 DAILY_TAB = "daily_summary"
 MEALS_TAB = "meals"
-DASHBOARD_TAB = "dashboard"
-INSIGHTS_TAB = "insights"
 SCHEMA_TAB = "schema"
 BASELINES_TAB = "baselines"
 
@@ -56,52 +54,7 @@ TIER1_NUTRIENTS: List[str] = [
     ("total_cals_in", "total_protein_g", "total_carbs_g", "total_fat_g")
 ]
 
-# The dashboard tab's stat block, in order from cell B3: (label, source column,
-# how to reduce it). maintenance.py writes the labels in column A and run_daily.py
-# writes the values in column B — they read this one list so the two can never
-# drift out of alignment.
-#   latest — the most recent non-empty value in that column
-#   avg7   — mean over the last 7 days that have nutrition logged
-#   avgd7  — mean over the last 7 *calendar* days that have this column filled
-#            (biometrics arrive every day the tracker is worn, independently of
-#            whether meals were logged, so they must not use the nutrition window)
-#   days7  — how many nutrition-logged days exist
-#   count7 — how many of the last 7 calendar days have TRUE in that column
-#   now    — the refresh timestamp
-DASHBOARD_STATS: List[tuple] = [
-    ("Latest weight (kg)", "weight_kg", "latest"),
-    ("Latest BMI", "bmi", "latest"),
-    ("Latest body fat (%)", "body_fat_pct", "latest"),
-    ("Latest subcutaneous fat (%)", "subcutaneous_fat_pct", "latest"),
-    ("Latest visceral fat", "visceral_fat", "latest"),
-    ("Latest body water (%)", "body_water_pct", "latest"),
-    ("Latest muscle mass (kg)", "muscle_mass_kg", "latest"),
-    ("Latest bone mass (kg)", "bone_mass_kg", "latest"),
-    ("Latest lean mass (kg)", "lean_mass_kg", "latest"),
-    ("Latest BMR (kcal)", "bmr_kcal", "latest"),
-    ("Latest metabolic age", "metabolic_age", "latest"),
-    ("Last weigh-in", "body_measured_at", "latest"),
-    ("Avg kcal in (last 7 logged days)", "total_cals_in", "avg7"),
-    ("Avg protein g (7d)", "total_protein_g", "avg7"),
-    ("Avg carbs g (7d)", "total_carbs_g", "avg7"),
-    ("Avg fat g (7d)", "total_fat_g", "avg7"),
-    ("Nutrition days in window", "", "days7"),
-    ("Bowel movements (last 7 days)", "bowel_movement", "count7"),
-    # Fitbit Air. `latest` skips blanks, so these show the last night actually
-    # recorded rather than going empty on a day the tracker wasn't worn.
-    ("Last night asleep (mins)", "sleep_mins", "latest"),
-    ("Last night efficiency (%)", "sleep_efficiency_pct", "latest"),
-    ("Last night deep (mins)", "sleep_deep_mins", "latest"),
-    ("Last night REM (mins)", "sleep_rem_mins", "latest"),
-    ("Latest resting HR (bpm)", "resting_hr_bpm", "latest"),
-    ("Latest HRV (ms)", "hrv_ms", "latest"),
-    ("Latest SpO2 (%)", "spo2_pct", "latest"),
-    ("Latest skin temp dev (C)", "skin_temp_dev", "latest"),
-    ("Avg steps (7d)", "steps", "avgd7"),
-    ("Avg calories out (7d)", "total_cals_out", "avgd7"),
-    ("Stats updated (UTC)", "", "now"),
-]
-DASHBOARD_FIRST_ROW = 3  # the stat values start at B3, under the title
+
 
 # Merge-upsert keys this column; everything else in a row is left to its owner.
 _DAILY_KEY = "date"

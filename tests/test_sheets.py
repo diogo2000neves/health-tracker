@@ -1,8 +1,7 @@
 """Unit tests for sheet schema constants and helpers."""
 from src.biometrics import BIOMETRIC_COLUMNS
 from src.sheets import (
-    BODY_METRICS, DAILY_HEADERS, DASHBOARD_FIRST_ROW, DASHBOARD_STATS,
-    READ_LAST_COL, TIER1_NUTRIENTS, col_letter,
+    BODY_METRICS, DAILY_HEADERS, READ_LAST_COL, TIER1_NUTRIENTS, col_letter,
 )
 
 
@@ -24,11 +23,10 @@ def test_daily_schema_shape():
 
 
 def test_bowel_movement_is_a_self_reported_daily_flag():
-    # a TRUE/blank marker that sits next to subjective_feel — both are things the
-    # user self-reports about a day, not sensor data.
+    # a TRUE/blank marker that is self-reported about a day, not sensor data.
     assert "bowel_movement" in DAILY_HEADERS
     i = DAILY_HEADERS.index
-    assert i("bowel_movement") == i("subjective_feel") + 1
+    assert i("bowel_movement") == i("date") + 1
     assert DAILY_HEADERS[-1] == "updated_at"  # still last
 
 
@@ -84,20 +82,3 @@ def test_every_scale_metric_has_a_column():
     assert i("metabolic_age") < i("lean_mass_kg") < i("body_measured_at")
 
 
-def test_dashboard_stats_reference_real_columns():
-    # maintenance.py writes the labels and run_daily.py writes the values beside
-    # them from this one list; a column that doesn't exist would render blank
-    # forever, and a mismatched length would slide every number up a row.
-    for _label, col, kind in DASHBOARD_STATS:
-        assert kind in {"latest", "avg7", "avgd7", "count7", "days7", "now"}
-        if kind in {"latest", "avg7", "avgd7", "count7"}:
-            assert col in DAILY_HEADERS, col
-        else:
-            assert col == ""
-    # the bowel-movement tally is surfaced (the point of the feature)
-    assert ("Bowel movements (last 7 days)", "bowel_movement", "count7") in DASHBOARD_STATS
-    assert DASHBOARD_FIRST_ROW == 3
-    # every metric the scale gives us is surfaced, not just weight
-    shown = {col for _label, col, _kind in DASHBOARD_STATS}
-    for metric in BODY_METRICS:
-        assert metric in shown

@@ -1,7 +1,6 @@
 # Cloud Build pipeline — on push to main: run the unit tests, then build and
 # deploy every Cloud Run target:
 #   * health-tracker-daily   (Job)     from ./Dockerfile
-#   * health-tracker-weekly  (Job)     same image, different entrypoint args
 #   * health-tracker-ingest  (Service) from ./ingest/Dockerfile
 #
 # The test step is the deploy gate: a failing test stops the build before any
@@ -25,7 +24,7 @@ steps:
       - pip install -q -r requirements.txt -r ingest/requirements.txt pytest
         && python -m pytest tests -q
 
-  # --- daily + weekly jobs (shared image) ---
+  # --- daily job ---
   - id: build-daily
     name: gcr.io/cloud-builders/docker
     args: ['build', '-f', 'Dockerfile', '-t', '${_AR}/health-tracker-daily:$COMMIT_SHA', '.']
@@ -36,11 +35,6 @@ steps:
     name: gcr.io/google.com/cloudsdktool/cloud-sdk
     entrypoint: gcloud
     args: ['run', 'jobs', 'update', 'health-tracker-daily',
-           '--image', '${_AR}/health-tracker-daily:$COMMIT_SHA', '--region', '${_REGION}']
-  - id: deploy-weekly
-    name: gcr.io/google.com/cloudsdktool/cloud-sdk
-    entrypoint: gcloud
-    args: ['run', 'jobs', 'update', 'health-tracker-weekly',
            '--image', '${_AR}/health-tracker-daily:$COMMIT_SHA', '--region', '${_REGION}']
 
   # --- ingest service ---

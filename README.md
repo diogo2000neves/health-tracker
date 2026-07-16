@@ -18,13 +18,13 @@ Google Sheet you own — one row per day, nutrition against physique.
               nutrition (AI)        metrics (AI OCR)
                           │                │
                           ▼                ▼
-                   Google Sheet ── daily_summary (one row/day)
+                    Google Sheet ── daily_summary (one row/day)
                           ▲
-             nightly roll-up + weekly AI trend summary
+                   nightly roll-up
 ```
 
 There is no scheduled *sync* of anything. Data lands the moment you send it; the
-two Cloud Run **Jobs** only derive from what's already in the Sheet.
+one Cloud Run **Job** only derives from what's already in the Sheet.
 
 ## Layout
 
@@ -44,8 +44,7 @@ Health Tracker/
 │   ├── google_health.py    # Google Health API v4 client (list + dailyRollUp)
 │   ├── biometrics.py       # Fitbit payloads → daily columns (pure, unit-tested)
 │   ├── sheets.py           # schema + merge-upsert Sheet client
-│   ├── run_daily.py        # daily job: biometrics + nutrition roll-up + dashboard
-│   ├── weekly_insights.py  # weekly job: Gemini trend summary → `insights` tab
+│   ├── run_daily.py        # daily job: biometrics + nutrition roll-up
 │   └── maintenance.py      # idempotent schema/dashboard sync (run after schema changes)
 └── tests/                  # unit tests — the CI deploy gate
 ```
@@ -88,9 +87,6 @@ Health Tracker/
   describing food is estimated as a meal. Nothing from the note is stored; the whole
   feature is one boolean.
 
-- `POST /feel` — `{"score": 1-10[, "date": "YYYY-MM-DD"]}` → writes
-  `subjective_feel` on that day's `daily_summary` row (`{"score": null}` clears).
-
 - `GET /daily?from=&to=&blocks=&tier=` — **the iOS app's read endpoint.** Days as
   JSON nested by block (`sleep`, `recovery`, `activity`, `nutrition`, `body`,
   `self_report`), defaulting to the last 30 days. `?blocks=sleep,recovery` fetches
@@ -117,11 +113,9 @@ python -m src.schema_export swift > HealthTypes.swift   # Codable structs, gener
   biometrics** from the Google Health API (~40 columns/day: sleep stages and
   efficiency, resting HR, HRV, SpO2, respiration, skin temperature, steps,
   distance, calories out, active/zone minutes, heart-rate range) and rolls the
-  `meals` tab up into `daily_summary`'s nutrition columns, then refreshes the
-  dashboard. 07:00 is late enough that last night is scored and synced, and past
-  the 05:00 nutrition cutoff so yesterday can be totalled.
-- **`health-tracker-weekly`** (Sun 20:00) — Gemini reads the last five weeks and
-  appends a trend analysis to the `insights` tab.
+  `meals` tab up into `daily_summary`'s nutrition columns. 07:00 is late enough
+  that last night is scored and synced, and past the 05:00 nutrition cutoff so
+  yesterday can be totalled.
 
 ### What the tracker gives you (and what it can't)
 
@@ -171,8 +165,6 @@ and Swift types.
 | `analysis` | **derived, rebuilt every run.** Causally aligned: each day's inputs beside the *next* day's outcomes. Correlate here — see below. |
 | `baselines` | **derived.** 28-day mean/SD/z per metric: what's normal *for you* |
 | `schema` | **derived.** The data dictionary — what every column means |
-| `dashboard` | stat cells + charts |
-| `insights` | weekly AI trend summaries |
 
 ### Why `analysis` exists
 
@@ -225,7 +217,6 @@ Pushing to `main` auto-builds and redeploys all three Cloud Run targets via Clou
 Build (`cloudbuild.yaml`, trigger `health-tracker-deploy` in `europe-west1`):
 
 - `health-tracker-daily` (Job) — built from `./Dockerfile`
-- `health-tracker-weekly` (Job) — same image, different entrypoint
 - `health-tracker-ingest` (Service) — built from `./ingest/Dockerfile`
 
 Images are tagged with the commit SHA; deploys swap only the image, so each

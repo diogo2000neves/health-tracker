@@ -116,14 +116,6 @@ def test_day_totals_skips_non_meals_and_zero_rows():
     }
 
 
-def test_parse_score_bounds():
-    assert ingest._parse_score(7) == 7.0
-    assert ingest._parse_score("7.5") == 7.5
-    for bad in (0, 11, "high", None):
-        with pytest.raises((TypeError, ValueError)):
-            ingest._parse_score(bad)
-
-
 def test_authorized_uses_constant_time_compare(monkeypatch):
     class Req:
         def __init__(self, token):
@@ -849,10 +841,10 @@ def test_text_router_offers_the_bowel_classification():
 
 # -- the read API (what the iOS app talks to) ----------------------------------
 _DAILY_GRID = [
-    ["date", "subjective_feel", "bowel_movement", "sleep_mins", "hrv_ms",
+    ["date", "bowel_movement", "sleep_mins", "hrv_ms",
      "steps", "weight_kg", "total_cals_in", "updated_at"],
-    ["2026-07-15", 7, "TRUE", 470, 75.2, 4151, 70.0, 2000, "x"],
-    ["2026-07-16", "", "", 525, 73.1, 866, "", 1800, "x"],
+    ["2026-07-15", "TRUE", 470, 75.2, 4151, 70.0, 2000, "x"],
+    ["2026-07-16", "", 525, 73.1, 866, "", 1800, "x"],
 ]
 
 
@@ -882,7 +874,7 @@ def test_daily_returns_days_nested_by_block(monkeypatch):
     assert day["sleep"]["sleep_mins"] == 470
     assert day["recovery"]["hrv_ms"] == 75.2
     assert day["activity"]["steps"] == 4151
-    assert day["self_report"]["subjective_feel"] == 7
+    assert day["self_report"]["bowel_movement"] is True
 
 
 def test_blank_cells_become_null_not_zero(monkeypatch):
@@ -892,7 +884,7 @@ def test_blank_cells_become_null_not_zero(monkeypatch):
                                  headers=_HDR).get_json()
     day = body["days"][0]
     assert day["body"]["weight_kg"] is None
-    assert day["self_report"]["subjective_feel"] is None
+    assert day["self_report"]["bowel_movement"] is None
     assert day["sleep"]["sleep_mins"] == 525          # present values survive
 
 

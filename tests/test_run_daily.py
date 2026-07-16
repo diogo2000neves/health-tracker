@@ -7,11 +7,9 @@ import json
 from datetime import date, timedelta
 
 from src.run_daily import (
-    _is_true, build_daily_rows, daily_nutrition, nutrition_day, refresh_dashboard,
-    window_start,
+    _is_true, build_daily_rows, daily_nutrition, nutrition_day, window_start,
 )
-from src.sheets import DAILY_TAB, DASHBOARD_STATS, DASHBOARD_TAB
-
+from src.sheets import DAILY_TAB
 
 # -- nutrition rollup -------------------------------------------------------------
 def test_daily_nutrition_sums_and_excludes_noise():
@@ -140,41 +138,6 @@ def test_is_true_reads_the_boolean_flag():
     for falsy in (False, "", None, "FALSE", 0):
         assert not _is_true(falsy)
 
-
-class _FakeSheet:
-    """Minimal stand-in for SheetClient: serves rows, captures the stat write."""
-    def __init__(self, rows):
-        self._rows = rows
-        self.written = None
-
-    def tab_titles(self):
-        return {DAILY_TAB, DASHBOARD_TAB}
-
-    def read_rows(self, _tab):
-        return list(self._rows)
-
-    def write_values(self, tab, a1, values):
-        self.written = (tab, a1, values)
-
-
-def test_dashboard_counts_bowel_movements_in_the_last_7_days():
-    today = date.today()
-    day = lambda d: (today - timedelta(days=d)).isoformat()
-    rows = [
-        {"date": day(10), "bowel_movement": True, "total_cals_in": 2000},  # too old
-        {"date": day(3), "bowel_movement": True, "total_cals_in": 2000},   # counts
-        {"date": day(1), "bowel_movement": "TRUE", "total_cals_in": 2000}, # counts
-        {"date": day(0), "bowel_movement": "", "total_cals_in": 2000},     # blank
-    ]
-    sheet = _FakeSheet(rows)
-    refresh_dashboard(sheet)
-
-    tab, a1, values = sheet.written
-    assert (tab, a1) == (DASHBOARD_TAB, "B3")
-    flat = [v[0] for v in values]
-    bowel_i = next(i for i, (_l, c, _k) in enumerate(DASHBOARD_STATS)
-                   if c == "bowel_movement")
-    assert flat[bowel_i] == 2  # only the two within the trailing 7 days
 
 
 # -- window -----------------------------------------------------------------------

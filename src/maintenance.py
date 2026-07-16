@@ -5,9 +5,6 @@
 * daily_summary — realigns the physical sheet to DAILY_HEADERS when a new
   column was added mid-table (inserts the column so existing data shifts
   correctly instead of being re-labelled under the wrong header).
-* dashboard — creates the tab, stat labels and embedded charts (charts are
-  API-defined, deliberately avoiding locale-sensitive formulas).
-* insights — creates the tab the weekly AI summary appends to.
 
 Runs as the Cloud Run runtime service account (ADC, Sheets scope). Safe to
 re-run: every step is a no-op when already applied.
@@ -25,37 +22,23 @@ from src.presentation import (
     format_requests, header_note_requests, schema_legend, schema_rows,
 )
 from src.sheets import (
-    DAILY_HEADERS, DAILY_TAB, DASHBOARD_FIRST_ROW, DASHBOARD_STATS, DASHBOARD_TAB,
-    INSIGHTS_TAB, MEALS_TAB, READ_LAST_COL, SCHEMA_TAB, col_letter,
+    DAILY_HEADERS, DAILY_TAB, MEALS_TAB, READ_LAST_COL, SCHEMA_TAB, col_letter,
 )
 
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 
-INSIGHTS_HEADERS = ["week_ending", "insights", "model", "updated_at"]
-
-# Target meals layout (mirror of ingest/main.py MEALS_HEADERS — kept here because
-# maintenance runs in the daily image and can't import the standalone ingest).
 MEALS_HEADERS = [
     "datetime", "foods", "items", "calories",
     "protein_g", "carbs_g", "fat_g", "confidence", "model", "photo_url",
     "portion_g", "image_sha", "note", "template",
 ]
 
-# Measured, reusable meals (mirror of ingest/main.py TEMPLATES_HEADERS).
 TEMPLATES_TAB = "templates"
 TEMPLATES_HEADERS = [
     "name", "description", "items", "portion_g",
     "calories", "protein_g", "carbs_g", "fat_g", "created_at", "updated_at",
 ]
 
-# Column A: the title, a spacer, then one label per stat. run_daily.refresh_dashboard
-# writes the values beside them in column B from the SAME list, so labels and
-# numbers can't drift apart when a metric is added. (DASHBOARD_FIRST_ROW == 3 is
-# the two header rows below.)
-DASHBOARD_LABELS = [["HEALTH DASHBOARD"], [""]] + [
-    [label] for label, _col, _kind in DASHBOARD_STATS
-]
-assert len(DASHBOARD_LABELS) == DASHBOARD_FIRST_ROW - 1 + len(DASHBOARD_STATS)
 
 
 def _sync_daily_columns(svc, sid: str, daily_id: int) -> Tuple[str, bool]:
@@ -143,68 +126,6 @@ def _sync_meals_columns(svc, sid: str) -> str:
     return f"meals: realigned {len(rows)} row(s) to {len(MEALS_HEADERS)} columns"
 
 
-def _chart_requests(dashboard_id: int, daily_id: int) -> List[Dict[str, Any]]:
-    """Two embedded charts sourcing daily_summary (open-ended row ranges)."""
-    def col(idx: int) -> Dict[str, Any]:
-        return {"sheetId": daily_id, "startRowIndex": 0,
-                "startColumnIndex": idx, "endColumnIndex": idx + 1}
-
-    def anchor(row: int) -> Dict[str, Any]:
-        return {"overlayPosition": {
-            "anchorCell": {"sheetId": dashboard_id, "rowIndex": row, "columnIndex": 3},
-            "widthPixels": 860, "heightPixels": 320,
-        }}
-
-    def index(name: str) -> int:
-        return DAILY_HEADERS.index(name)
-
-    def series(name: str) -> Dict[str, Any]:
-        return {"series": {"sourceRange": {"sources": [col(index(name))]}},
-                "targetAxis": "LEFT_AXIS"}
-
-    domain = [{"domain": {"sourceRange": {"sources": [col(index("date"))]}}}]
-
-    line = {"addChart": {"chart": {
-        "spec": {
-            "title": "Weight & lean mass (kg)",
-            "basicChart": {
-                "chartType": "LINE", "legendPosition": "BOTTOM_LEGEND",
-                "headerCount": 1, "domains": domain,
-                "series": [series("weight_kg"), series("lean_mass_kg")],
-            },
-        },
-        "position": anchor(1),
-    }}}
-    # Both sides of the energy balance on one chart: intake (meals) against
-    # measured expenditure (Fitbit). The gap between the two lines is the whole
-    # point of the system — a surplus or deficit you can actually see, rather than
-    # a guess from weight alone.
-    energy = {"addChart": {"chart": {
-        "spec": {
-            "title": "Energy balance (kcal/day): in vs out",
-            "basicChart": {
-                "chartType": "COLUMN", "legendPosition": "BOTTOM_LEGEND",
-                "headerCount": 1, "domains": domain,
-                "series": [series("total_cals_in"), series("total_cals_out")],
-            },
-        },
-        "position": anchor(18),
-    }}}
-    # Sleep quality over time: the honest stand-in for the score the API doesn't
-    # expose — how much of the night was actually spent restoring.
-    sleep = {"addChart": {"chart": {
-        "spec": {
-            "title": "Sleep: deep & REM (mins)",
-            "basicChart": {
-                "chartType": "COLUMN", "legendPosition": "BOTTOM_LEGEND",
-                "headerCount": 1, "domains": domain,
-                "series": [series("sleep_deep_mins"), series("sleep_rem_mins")],
-            },
-        },
-        "position": anchor(35),
-    }}}
-    return [line, energy, sleep]
-
 
 def main() -> None:
     sid = os.environ["HEALTH_SPREADSHEET_ID"]
@@ -217,14 +138,15 @@ def main() -> None:
     ).execute()
     sheets = {s["properties"]["title"]: s for s in meta.get("sheets", [])}
 
-    # Delete obsolete analysis tab if present.
-    if "analysis" in sheets:
-        svc.spreadsheets().batchUpdate(
-            spreadsheetId=sid,
-            body={"requests": [{"deleteSheet": {"sheetId": sheets["analysis"]["properties"]["sheetId"]}}]},
-        ).execute()
-        print("analysis: obsolete tab deleted")
-        del sheets["analysis"]
+    # Delete obsolete tabs if present.
+    for obsolete in ["analysis", "dashboard", "insights"]:
+        if obsolete in sheets:
+            svc.spreadsheets().batchUpdate(
+                spreadsheetId=sid,
+                body={"requests": [{"deleteSheet": {"sheetId": sheets[obsolete]["properties"]["sheetId"]}}]},
+            ).execute()
+            print(f"{obsolete}: obsolete tab deleted")
+            del sheets[obsolete]
 
     # 1. daily_summary column alignment.
     message, layout_changed = _sync_daily_columns(
@@ -235,55 +157,7 @@ def main() -> None:
     if MEALS_TAB in sheets:
         print(_sync_meals_columns(svc, sid))
 
-    # 2. dashboard tab + labels + charts.
-    if DASHBOARD_TAB not in sheets:
-        svc.spreadsheets().batchUpdate(
-            spreadsheetId=sid,
-            body={"requests": [{"addSheet": {"properties": {"title": DASHBOARD_TAB}}}]},
-        ).execute()
-        meta = svc.spreadsheets().get(
-            spreadsheetId=sid,
-            fields="sheets(properties(sheetId,title),charts(chartId))",
-        ).execute()
-        sheets = {s["properties"]["title"]: s for s in meta.get("sheets", [])}
-        print("dashboard: tab created")
-    svc.spreadsheets().values().update(
-        spreadsheetId=sid, range=f"{DASHBOARD_TAB}!A1",
-        valueInputOption="RAW", body={"values": DASHBOARD_LABELS},
-    ).execute()
-    # Charts are rebuilt whenever they can't be trusted: a realigned layout leaves
-    # them plotting whatever moved into the old column indices, and a changed chart
-    # count means the set itself was edited. Otherwise they're left alone, so the
-    # user can drag/resize them without maintenance undoing it.
-    wanted = _chart_requests(sheets[DASHBOARD_TAB]["properties"]["sheetId"],
-                             sheets[DAILY_TAB]["properties"]["sheetId"])
-    existing = [c["chartId"] for c in sheets[DASHBOARD_TAB].get("charts", [])]
-    if layout_changed or len(existing) != len(wanted):
-        try:
-            requests = [{"deleteEmbeddedObject": {"objectId": cid}} for cid in existing]
-            svc.spreadsheets().batchUpdate(
-                spreadsheetId=sid, body={"requests": requests + wanted}).execute()
-            why = "layout moved" if layout_changed else "chart set changed"
-            print(f"dashboard: rebuilt {len(wanted)} chart(s) ({why}, "
-                  f"replaced {len(existing)})")
-        except Exception as err:  # charts are cosmetic — never fail maintenance
-            print(f"dashboard: chart rebuild skipped ({err})")
-    else:
-        print(f"dashboard: {len(existing)} chart(s) already in sync")
 
-    # 3. insights tab.
-    if INSIGHTS_TAB not in sheets:
-        svc.spreadsheets().batchUpdate(
-            spreadsheetId=sid,
-            body={"requests": [{"addSheet": {"properties": {"title": INSIGHTS_TAB}}}]},
-        ).execute()
-        svc.spreadsheets().values().update(
-            spreadsheetId=sid, range=f"{INSIGHTS_TAB}!A1",
-            valueInputOption="RAW", body={"values": [INSIGHTS_HEADERS]},
-        ).execute()
-        print("insights: tab created")
-    else:
-        print("insights: tab already present")
 
     # 4. templates tab (measured, reusable meals; written by the ingest service).
     if TEMPLATES_TAB not in sheets:

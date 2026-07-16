@@ -47,8 +47,8 @@ a mix:
   fails, the photos are archived and a zeroed "analysis failed" row keeps the
   audit trail — a meal is never silently lost.
 
-POST /feel (X-Auth-Token) — {"score": 1-10[, "date": "YYYY-MM-DD"]} merges
-  into daily_summary.subjective_feel ({"score": null} clears a mislog).
+POST /ingest (X-Auth-Token) — **a bowel-movement note.** "fiz cocó", "I just pooped" -> sets
+  `daily_summary.bowel_movement` = TRUE for the day.
 
 Auth model:
   * Gemini -> AI Studio key (billing-free project => free tier).
@@ -906,14 +906,6 @@ def _meal_row_index(values: List[List[Any]], image_sha: str) -> Optional[int]:
     return None
 
 
-def _parse_score(raw: Any) -> float:
-    """Validate a subjective-feel score (1-10, halves allowed)."""
-    score = round(float(raw), 1)
-    if not 1 <= score <= 10:
-        raise ValueError(f"score {score} outside 1-10")
-    return score
-
-
 def _sha12(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:12]
 
@@ -1496,8 +1488,8 @@ def write_daily(day: str, values: Dict[str, Any]) -> None:
     that day is new.
 
     Only the given columns are touched, which is what lets three independent writers
-    share one row: the scale screenshot owns the body columns, /feel owns
-    subjective_feel, and the daily job owns the nutrition roll-up. Re-sending a
+    share one row: the scale screenshot owns the body columns, and the daily
+    job owns the nutrition roll-up. Re-sending a
     reading for a day simply overwrites its own columns again.
 
     Raises if a column is missing rather than guessing at a position — a stale sheet
@@ -1952,30 +1944,6 @@ def process():
     nut = _resolve_templates(nut, note, when, templates)
     return _finalize(nut, photo_url, when, image_sha, note, text_only, todays)
 
-
-@app.post("/feel")
-def feel():
-    """Log the day's subjective readiness score into daily_summary."""
-    if not _authorized(request):
-        return jsonify({"error": "unauthorized"}), 401
-
-    data = request.get_json(silent=True) or {}
-    clearing = "score" in data and data["score"] is None
-    if not clearing:
-        raw = data.get("score", request.args.get("score"))
-        try:
-            score = _parse_score(raw)
-        except (TypeError, ValueError):
-            return jsonify({"error": "score must be a number from 1 to 10"}), 400
-
-    day = str(data.get("date") or request.args.get("date")
-              or datetime.now(_tz()).date().isoformat())
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
-        return jsonify({"error": "date must be YYYY-MM-DD"}), 400
-
-    write_daily(day, {"subjective_feel": "" if clearing else score})
-    return jsonify({"date": day,
-                    "subjective_feel": None if clearing else score}), 200
 
 
 # -- read API (the iOS app) -----------------------------------------------------

@@ -149,7 +149,7 @@ a real meal log is never swallowed. A text note can only ever be a meal or a bow
 log, never a scale reading (there's no screen to OCR), so `analyze_text` runs with
 `allow_bowel=True, allow_body=False`. Setting the flag is idempotent (a re-send or a
 Cloud Tasks retry just re-sets TRUE). Keyed on the **local day the note was sent**,
-like `/feel` — not the waking-day grain nutrition uses.
+not the waking-day grain nutrition uses.
 
 ## 2b. Data architecture (read this before changing the schema)
 
@@ -191,8 +191,7 @@ So the food on row N is eaten *after* the sleep on row N. Correlating them on th
 same row asks *"did tomorrow's dinner affect last night's sleep?"* — backwards in
 time. Storage stays honest (each value stamped when measured); the fix lives in
 `src/analysis.py`, which pairs **inputs from day N with outcomes from day N+1**
-into the `analysis` tab, driven entirely by the registry's `causal` field. The
-weekly AI reads that tab, never the raw one.
+into the `analysis` tab, driven entirely by the registry's `causal` field.
 
 ### The derived tabs (rebuilt every run, never edited)
 * **`analysis`** — the causally aligned view. Correlate here.
@@ -200,7 +199,6 @@ weekly AI reads that tab, never the raw one.
   uninterpretable (73 ms HRV is excellent for one person, a warning for another);
   against a personal baseline it becomes a sentence.
 * **`schema`** — the data dictionary, in the sheet next to the numbers.
-* **`dashboard`** — stat cells + charts.
 
 ## 3. Architecture
 
@@ -210,20 +208,20 @@ weekly AI reads that tab, never the raw one.
               │                    nutrition + physique + self-report)            │
               │ `meals`         : one row/photo (per-ingredient `items` JSON)     │
               │ `templates`     : measured, reusable meals                        │
-              │ `dashboard`     : stat cells + embedded charts                    │
-              │ `insights`      : weekly AI trend summaries                       │
               └────────────────────────────────────────────────────────────────────┘
-                     ▲                    ▲                       ▲
-  Cloud Scheduler    │   Cloud Scheduler  │                       │
-  (07:00 Lisbon) ─► JOB   (Sun 20:00) ─► JOB              SERVICE ◄── iPhone Shortcut
-       health-tracker-daily   health-tracker-weekly   health-tracker-ingest
-               │                      │                    │  │   (POST /ingest — a meal
-    Google Health API           Gemini API        Gemini API │    photo, a scale
-    (Fitbit Air: sleep,         (insights)      (nutrition + │    screenshot, or a text
-     recovery, activity)                         body OCR +  │    note that's a meal or
-               │                                note router)  │    a bowel log; the model
-    + rolls `meals` up into                                   │    routes it. POST /feel)
-      the nutrition columns                          Google Drive (meal photos only)
+                     ▲                                            ▲
+  Cloud Scheduler    │                                            │
+  (07:00 Lisbon) ─► JOB                                   SERVICE ◄── iPhone Shortcut
+       health-tracker-daily                           health-tracker-ingest
+               │                                           │  │   (POST /ingest — a meal
+    Google Health API                                      │  │    photo, a scale
+    (Fitbit Air: sleep,                                    │  │    screenshot, or a text
+     recovery, activity)                                   │  │    note that's a meal or
+               │                                           │  │    a bowel log; the model
+    + rolls `meals` up into                                │  │    routes it.)
+      the nutrition columns                                │  │
+                                                           │  │
+                                              Google Drive (meal photos only)
 ```
 
 - **Job vs Service:** the Service is a *push* endpoint that waits for the phone —
@@ -291,9 +289,8 @@ token is read-only across `sleep`, `health_metrics_and_measurements` and
 - **`daily_summary`** (78 columns), grouped by **who owns each block** — the
   merge-upsert means a source only ever writes its own columns:
   - `date`
-  - **self-report** (ingest): `subjective_feel`, `bowel_movement`
+  - **self-report** (ingest): `bowel_movement`
   - **sleep** (Fitbit, wake-day): `sleep_start, sleep_end, time_in_bed_mins,
-    sleep_mins, sleep_efficiency_pct, sleep_latency_mins, sleep_awake_mins,
     sleep_deep_mins, sleep_rem_mins, sleep_light_mins, sleep_awakenings, nap_mins`
   - **recovery** (Fitbit): `resting_hr_bpm, hrv_ms, hrv_deep_sleep_ms, hrv_entropy,
     non_rem_hr_bpm, spo2_pct, spo2_lower_pct, spo2_upper_pct,
@@ -325,7 +322,7 @@ token is read-only across `sleep`, `health_metrics_and_measurements` and
   baseline · `lean_mass_kg` = weight × (1 − fat%).
   - **Merge-upsert keyed on `date`** — each source fills only its own columns
     (scale screenshot → body, meals roll-up → nutrition, Fitbit → sleep/recovery/
-    activity, /feel → subjective_feel, a bowel note → bowel_movement). Never
+    activity, a bowel note → bowel_movement). Never
     overwrites a column it doesn't own.
     - ⚠️ **Exactly one row per date may reach `upsert_daily`.** It merges every
       row against the *same* pre-read grid snapshot, so two rows for one date make
