@@ -218,20 +218,6 @@ def main() -> None:
         svc, sid, sheets[DAILY_TAB]["properties"]["sheetId"])
     print(message)
 
-    # Charts source their series by column *index*, so a realigned layout leaves
-    # them silently plotting whatever now sits at the old positions. Drop them and
-    # let step 2 rebuild from the current DAILY_HEADERS.
-    if layout_changed:
-        existing = [c["chartId"] for c in sheets.get(DASHBOARD_TAB, {}).get("charts", [])]
-        if existing:
-            svc.spreadsheets().batchUpdate(
-                spreadsheetId=sid,
-                body={"requests": [{"deleteEmbeddedObject": {"objectId": cid}}
-                                   for cid in existing]},
-            ).execute()
-            sheets[DASHBOARD_TAB]["charts"] = []
-            print(f"dashboard: dropped {len(existing)} stale chart(s) for rebuild")
-
     # 1b. meals column alignment (drop notes, add model, ...).
     if MEALS_TAB in sheets:
         print(_sync_meals_columns(svc, sid))
@@ -252,20 +238,25 @@ def main() -> None:
         spreadsheetId=sid, range=f"{DASHBOARD_TAB}!A1",
         valueInputOption="RAW", body={"values": DASHBOARD_LABELS},
     ).execute()
-    if not sheets[DASHBOARD_TAB].get("charts"):
+    # Charts are rebuilt whenever they can't be trusted: a realigned layout leaves
+    # them plotting whatever moved into the old column indices, and a changed chart
+    # count means the set itself was edited. Otherwise they're left alone, so the
+    # user can drag/resize them without maintenance undoing it.
+    wanted = _chart_requests(sheets[DASHBOARD_TAB]["properties"]["sheetId"],
+                             sheets[DAILY_TAB]["properties"]["sheetId"])
+    existing = [c["chartId"] for c in sheets[DASHBOARD_TAB].get("charts", [])]
+    if layout_changed or len(existing) != len(wanted):
         try:
+            requests = [{"deleteEmbeddedObject": {"objectId": cid}} for cid in existing]
             svc.spreadsheets().batchUpdate(
-                spreadsheetId=sid,
-                body={"requests": _chart_requests(
-                    sheets[DASHBOARD_TAB]["properties"]["sheetId"],
-                    sheets[DAILY_TAB]["properties"]["sheetId"],
-                )},
-            ).execute()
-            print("dashboard: charts created")
+                spreadsheetId=sid, body={"requests": requests + wanted}).execute()
+            why = "layout moved" if layout_changed else "chart set changed"
+            print(f"dashboard: rebuilt {len(wanted)} chart(s) ({why}, "
+                  f"replaced {len(existing)})")
         except Exception as err:  # charts are cosmetic — never fail maintenance
-            print(f"dashboard: chart creation skipped ({err})")
+            print(f"dashboard: chart rebuild skipped ({err})")
     else:
-        print("dashboard: charts already present")
+        print(f"dashboard: {len(existing)} chart(s) already in sync")
 
     # 3. insights tab.
     if INSIGHTS_TAB not in sheets:
