@@ -210,8 +210,8 @@ into the `analysis` tab, driven entirely by the registry's `causal` field.
               │ `templates`     : measured, reusable meals                        │
               └────────────────────────────────────────────────────────────────────┘
                      ▲                                            ▲
-  Cloud Scheduler    │                                            │
-  (07:00 Lisbon) ─► JOB                                   SERVICE ◄── iPhone Shortcut
+  Cloud Scheduler    │        weigh-in wakes the job ──┐          │
+  (11:00 backstop) ─► JOB ◄────────────────────────────┘  SERVICE ◄── iPhone Shortcut
        health-tracker-daily                           health-tracker-ingest
                │                                           │  │   (POST /ingest — a meal
     Google Health API                                      │  │    photo, a scale
@@ -227,19 +227,81 @@ into the `analysis` tab, driven entirely by the registry's `causal` field.
 - **Job vs Service:** the Service is a *push* endpoint that waits for the phone —
   meals, body composition and self-reports enter there, on one button. The daily
   Job *pulls* what a worn tracker syncs on its own. All scale to zero.
-- **Why the daily job runs at 07:00**, two reasons: nutrition uses a **waking-day**
-  grain and a day is only totalled once it is *over* (see below); and by then the
-  night that just ended has been scored and synced, so it lands on its own wake-day
-  row the same morning.
-- **Meal ingestion is hybrid (reliability):** `/ingest` does a quick single-model
-  pass for **instant macros** when Gemini is fast; if it's slow/unavailable, it
-  archives the photos and enqueues a **Cloud Tasks** job (queue `meal-ingest`,
-  europe-west1) that retries `/process` with backoff for ~15 min until the row
-  lands (`202 Queued` to the phone meanwhile). This is what makes insertion
-  ~99.9% — a transient Gemini 504 no longer loses or blocks a meal. On the final
-  retry the worker writes an "analysis failed" stub so nothing is ever lost.
-  Model chain is **flash-lite first** (fast/reliable), stronger flash models
-  follow for the worker's thorough pass.
+- **The weigh-in triggers the sync — a clock can't.** The scale screenshot sent on
+  waking is a semantic *"I am awake"* event, and the only reliable one this system
+  gets: it proves the night is over AND scored AND that the watch synced (the app
+  had to be open to screenshot it). `ingest/main.py:_trigger_daily_sync` kicks the
+  Cloud Run Job on any body reading dated **today**; a backfilled screenshot is not
+  a wake signal and only writes its own row.
+  This replaced a 07:00 cron that claimed to run "after the night has been scored".
+  It didn't — **the user wakes ~08:30, so 07:00 ran while they were still asleep**.
+  Every night's sleep therefore missed its own row and only appeared ~24 h later,
+  when the next morning's run re-rolled it inside `HEALTH_RECONCILE_DAYS`. Sleep was
+  silently a day late, *always*.
+  A cron remains at **11:00** as a backstop for days with no weigh-in (idempotent —
+  a no-op re-roll on a normal day). It sits far from wake-up on purpose:
+  `upsert_daily` is read-modify-write against a grid snapshot, so two overlapping
+  executions would both miss a new date and **append it twice**. The trigger also
+  refuses to start if an execution is already in flight.
+- **Each family becomes final at a different moment** — this is the shape of the
+  whole daily job, and conflating them is what put half a day's calories on a day
+  still under way:
+  | block | final when | written for today? |
+  |---|---|---|
+  | sleep, recovery | you **wake** | **yes** — sleep is keyed on the wake-day |
+  | activity | **midnight** | no — `fetch_biometrics(activity_end=today)` |
+  | nutrition | the **05:00** cutoff | no — `daily_nutrition(in_progress_day=…)` |
+  | body/weight | the screenshot | yes — written by ingest itself |
+  So a row grows in three steps: this morning it holds last night's sleep, recovery
+  and the weigh-in; tomorrow's weigh-in closes it with activity and nutrition.
+- **Meal ingestion is ack-then-analyse (reliability + accuracy):** `/ingest`
+  analyses **nothing**. It de-dupes, archives the photos, enqueues a **Cloud
+  Tasks** job (queue `meal-ingest`, europe-west1) and returns `202` in a couple of
+  seconds. All analysis is on `/process`. Two facts forced this: the iPhone
+  Shortcut fails the whole log if the HTTP call is slow, and the model worth
+  waiting for (`gemini-3.5-flash`) is exactly the one that's frequently
+  overloaded. They can't be reconciled on one request, so the request no longer
+  tries.
+- **The queue's retry window is a patience budget** (`_worker_kwargs`): for the
+  first 6 of its 8 attempts the worker calls **only `gemini-3.5-flash`**, retrying
+  it within the attempt and then 5xx-ing so Cloud Tasks re-runs it after a backoff
+  — ~30 shots at the best model over ~11 min before anything weaker may answer.
+  Walking the chain on every attempt would defeat the ordering: attempt 1 would
+  answer with flash-lite seconds after a 3.5-flash hiccup and the patience would
+  go unused. Only the **last 2** attempts walk the full chain (one shot per model —
+  a flash-lite row beats a stub), and only the final one writes the "analysis
+  failed" stub. Insertion stays ~99.9%; a Gemini outage can neither lose a meal nor
+  time the phone out.
+  ⚠️ `TASKS_MAX_ATTEMPTS` (code) **must not exceed** the queue's `maxAttempts` (8):
+  the worker is what ends the loop, and if the queue gives up first the task is
+  dropped silently with no stub and no row.
+- **429 ≠ 503, and this is deliberate** (`_retry_same_model`): a **503** is
+  Google's capacity — their side, it clears, so we wait on the same model. A
+  **429** is *our* quota (free tier ~10 req/min, few-hundred/day, counted **per
+  project**, RPD resets midnight PT): another call cannot succeed, so we end that
+  model's turn immediately. On a held-out attempt that means 5xx → the queue waits
+  5–120s (the actual cure for a rolling-window 429); on a chain-walking attempt it
+  means the next model, which has its **own quota bucket**. Classification is on
+  `APIError.code`, **not** on `str(err)` — the stringified error embeds the details
+  JSON and a quota error's details carry numbers like `400` as values, which the
+  old substring sniff misread as a permanent 400.
+- **Backoff numbers are set by our request rate, not by outage length.** Measured
+  across the full 8-attempt window: the old `min(2**n, 10)` peaked at **10 calls
+  in a rolling minute** — i.e. it would answer Google's 503s with self-inflicted
+  429s. `base=3, cap=30s, +jitter` peaks at **~6/min** and still lands ~30 shots
+  over ~11 min. Long waits are Cloud Tasks' job (its backoff is free — no instance
+  held); in-attempt retries are the expensive ones. Jitter only ever *adds* delay,
+  so it can't raise the rate. Don't "optimise" these back down.
+- **SDK retries are pinned OFF** (`HttpRetryOptions(attempts=1)` in `_gen_config`).
+  That's already google-genai 1.47's implicit default (`retry_options=None` →
+  `stop_after_attempt(1)`), but Google's own docs claim the SDK retries 4× by
+  default — if a version ever makes that true, its retries would run *inside*
+  `generate_content` where our deadline can't see them (5 × (60s timeout + up to
+  60s backoff) ≫ the 180s request timeout → 504 with no stub). We own retry.
+  Cost of the change: the Shortcut's reply is an acknowledgement, not the macros
+  (read those from the sheet / iOS app), and scale screenshots now land unused in
+  the Drive meals folder — `/ingest` must archive every image before Gemini has
+  classified it.
 - **CI/CD:** pushing to `main` on GitHub runs `cloudbuild.yaml` — unit tests
   gate the build, then all three targets are rebuilt and redeployed (images
   tagged with the commit SHA; env vars/secrets preserved). Trigger:
@@ -278,8 +340,10 @@ token is read-only across `sleep`, `health_metrics_and_measurements` and
 | GCP project | `health-tracker-501322` (billing enabled) |
 | Cloud Run Job | `health-tracker-daily` (europe-west1) |
 | Cloud Run Service | `health-tracker-ingest` (europe-west1, public URL, gated by `X-Auth-Token` header) |
-| Scheduler | `health-tracker-daily-trigger` — `0 7 * * *` Europe/Lisbon (nutrition roll-up only) |
-| Cloud Tasks queue | `meal-ingest` (europe-west1) — background meal analysis, 8 attempts / ~15 min backoff; SA has `cloudtasks.enqueuer` |
+| Scheduler | `health-tracker-daily-trigger` — `0 11 * * *` Europe/Lisbon. **Backstop only**: the real trigger is the weigh-in (`_trigger_daily_sync`). Was `0 7 * * *`, which fired while the user was still asleep |
+| Job trigger IAM | ingest + job share SA `health-tracker-job@…`, which already holds `roles/run.invoker` on the job (grants `run.jobs.run`) — no IAM change was needed |
+| Cloud Tasks queue | `meal-ingest` (europe-west1) — **all** meal analysis. 8 attempts, 5s→120s backoff, 900s maxRetryDuration, 1 concurrent dispatch; SA has `cloudtasks.enqueuer`. Raising patience = raise `maxAttempts` here **first**, then `TASKS_MAX_ATTEMPTS` |
+| Ingest request timeout | 180s (Cloud Run). Budget: `GEMINI_DEADLINE_S` 105 + one `GEMINI_TIMEOUT_MS` 60s call + ~5s of sheet writes ≈ 170s |
 | Sheet ID | `1JQWYkSgzU3F4mqR7BRE8wfoBif0xLU7uBM0iwHwxNAk` |
 | Drive photo folder | `1i0wYuIzcD7ifs_wVQVdsUpI26vGmJdfP` ("Health Tracker Meals", owned by user) |
 | Secrets (Secret Manager) | `health-oauth-token` (health scopes only), `drive-oauth-token` (drive.file only), `ingest-token`, `gemini-api-key` |

@@ -7,9 +7,59 @@ import json
 from datetime import date, timedelta
 
 from src.run_daily import (
-    _is_true, build_daily_rows, daily_nutrition, nutrition_day, window_start,
+    _is_true, build_daily_rows, daily_nutrition, fetch_biometrics, nutrition_day,
+    window_start,
 )
 from src.sheets import DAILY_TAB
+
+
+# -- what is final when (the wake-day vs civil-day split) -------------------------
+class _FakeHealth:
+    """Records the windows fetch_biometrics asks each family for."""
+
+    def __init__(self):
+        self.list_windows = {}
+        self.rollup_windows = {}
+
+    def list_data_points(self, data_type, *, family="daily", start=None, end=None):
+        self.list_windows[data_type] = (start, end)
+        return []
+
+    def daily_rollup(self, data_type, start, end):
+        self.rollup_windows[data_type] = (start.isoformat(), end.isoformat())
+        return []
+
+
+def test_activity_stops_at_today_while_sleep_runs_through_it():
+    # The bug this encodes: one shared window put a HALF-DAY's calories on a day
+    # still under way (903 kcal at 11:00 reads exactly like a finished day), while
+    # sleep — which IS final once you wake — was fine to fetch for today.
+    client = _FakeHealth()
+    fetch_biometrics(client, "2026-07-10", "2026-07-18", activity_end="2026-07-17")
+
+    # sleep + recovery run through tomorrow, so the night that just ended lands on
+    # today's row
+    assert client.list_windows["sleep"] == ("2026-07-10", "2026-07-18")
+    assert client.list_windows["daily-resting-heart-rate"] == ("2026-07-10",
+                                                               "2026-07-18")
+    # activity stops at today (exclusive) — today's partial day is never asked for
+    assert client.rollup_windows["total-calories"] == ("2026-07-10", "2026-07-17")
+    assert client.rollup_windows["steps"] == ("2026-07-10", "2026-07-17")
+
+
+def test_activity_end_defaults_to_end_for_plain_backfills():
+    client = _FakeHealth()
+    fetch_biometrics(client, "2026-07-10", "2026-07-17")
+    assert client.rollup_windows["total-calories"] == ("2026-07-10", "2026-07-17")
+
+
+def test_no_rollup_is_requested_when_no_civil_day_has_finished_yet():
+    # start == activity_end would be an empty (or inverted) range; the API 400s on
+    # some of those, and there is nothing to ask for anyway.
+    client = _FakeHealth()
+    fetch_biometrics(client, "2026-07-17", "2026-07-18", activity_end="2026-07-17")
+    assert client.rollup_windows == {}
+    assert client.list_windows["sleep"] == ("2026-07-17", "2026-07-18")
 
 # -- nutrition rollup -------------------------------------------------------------
 def test_daily_nutrition_sums_and_excludes_noise():

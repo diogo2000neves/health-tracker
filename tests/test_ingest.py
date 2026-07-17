@@ -7,6 +7,7 @@ import importlib.util
 import pathlib
 
 import pytest
+from google.genai import errors as genai_errors
 
 _PATH = pathlib.Path(__file__).resolve().parent.parent / "ingest" / "main.py"
 _spec = importlib.util.spec_from_file_location("ingest_main", _PATH)
@@ -128,33 +129,225 @@ def test_authorized_uses_constant_time_compare(monkeypatch):
     assert not ingest._authorized(Req(""))  # empty token never authorises
 
 
-def test_is_permanent_error_classification():
-    # not-found / bad-request => skip model; transient => retry same model
-    assert ingest._is_permanent(Exception("404 NOT_FOUND models/foo"))
-    assert ingest._is_permanent(Exception("400 INVALID_ARGUMENT"))
-    assert not ingest._is_permanent(Exception("503 UNAVAILABLE high demand"))
-    assert not ingest._is_permanent(Exception("429 RESOURCE_EXHAUSTED"))
+def _api_error(code, status, details=None):
+    """A real google-genai APIError, as the SDK would raise it."""
+    return genai_errors.APIError(
+        code, {"error": {"code": code, "status": status,
+                         "message": status, **(details or {})}})
 
 
-def test_default_chain_is_flash_lite_first_and_free_tier():
-    # flash-lite leads (the reliable/fast one; see 2026-07-12/13 incidents); the
-    # stronger flash models follow for the worker's thorough pass. No Pro (paid).
+def test_retry_same_model_only_for_google_side_capacity_errors():
+    # Their capacity problem: wait it out on the same model.
+    assert ingest._retry_same_model(_api_error(503, "UNAVAILABLE"))
+    assert ingest._retry_same_model(_api_error(500, "INTERNAL"))
+    assert ingest._retry_same_model(_api_error(504, "DEADLINE_EXCEEDED"))
+    # Our quota. Another call cannot succeed and only digs deeper — end the
+    # model's turn and let the queue's backoff (or another model's bucket) fix it.
+    assert not ingest._retry_same_model(_api_error(429, "RESOURCE_EXHAUSTED"))
+    # Never fixes itself.
+    assert not ingest._retry_same_model(_api_error(404, "NOT_FOUND"))
+    assert not ingest._retry_same_model(_api_error(400, "INVALID_ARGUMENT"))
+    # A bare socket/SSL error is transient — no status to read, assume capacity.
+    assert ingest._retry_same_model(ConnectionResetError("reset by peer"))
+
+
+def test_a_quota_errors_details_cannot_be_misread_as_a_permanent_400():
+    # Why we classify on .code, not on str(err): the SDK stringifies the whole
+    # details JSON, and a real quota error's details carry numbers like 400/404 as
+    # VALUES. The old substring sniff read that as a permanent 400 and skipped the
+    # model; it must be seen as the 429 it is.
+    err = _api_error(429, "RESOURCE_EXHAUSTED", {
+        "details": [{"quotaValue": "400", "quotaId": "GenerateRequestsPerDay"}]})
+    assert "400" in str(err)                       # the trap
+    assert err.code == 429
+    assert not ingest._retry_same_model(err)       # treated as quota, not as 400
+    # ...and a 503 whose details merely mention 400 must still be retried.
+    over = _api_error(503, "UNAVAILABLE", {"details": [{"retryHint": "400ms"}]})
+    assert "400" in str(over) and ingest._retry_same_model(over)
+
+
+def test_a_429_ends_the_models_turn_instead_of_hammering(monkeypatch):
+    # The free tier is ~10 req/min per PROJECT. On a held-out attempt (one model)
+    # this ends the attempt -> 5xx -> Cloud Tasks waits 5-120s, which is the actual
+    # cure for a rolling-window 429.
+    fm = _fake_genai([_api_error(429, "RESOURCE_EXHAUSTED")] * 8, monkeypatch)
+    monkeypatch.setenv("GEMINI_MODELS", "best")
+    with pytest.raises(RuntimeError):
+        ingest._run_models(["prompt"], models=["best"], retries=6)
+    assert fm.calls == ["best"]  # exactly one call, not six
+
+    # On a chain-walking attempt it moves to the next model, whose quota is a
+    # separate bucket — the one thing that CAN work while we're rate-limited.
+    fm = _fake_genai([_api_error(429, "RESOURCE_EXHAUSTED"), _GOOD_MEAL], monkeypatch)
+    nut = ingest._run_models(["prompt"], models=["best", "steady"], retries=6)
+    assert fm.calls == ["best", "steady"] and nut["model"] == "steady"
+
+
+class _FakeRunApi:
+    """Stands in for the Cloud Run Admin API."""
+
+    def __init__(self, executions=(), ok=True):
+        self.executions = list(executions)
+        self.ok = ok
+        self.runs = []
+        self.gets = []
+
+    def get(self, url, timeout=None):
+        self.gets.append(url)
+        return type("R", (), {
+            "ok": True, "status_code": 200,
+            "json": lambda _s=None: {"executions": self.executions},
+        })()
+
+    def post(self, url, json=None, timeout=None):
+        self.runs.append(url)
+        return type("R", (), {"ok": self.ok, "status_code": 200 if self.ok else 500,
+                              "text": "boom"})()
+
+
+def _wire_run_api(monkeypatch, api):
+    monkeypatch.setenv("GCP_PROJECT", "proj")
+    monkeypatch.setenv("DAILY_JOB", "health-tracker-daily")
+    monkeypatch.setenv("DAILY_JOB_LOCATION", "europe-west1")
+    monkeypatch.setattr(ingest.google.auth, "default", lambda scopes=None: (None, "proj"))
+    import google.auth.transport.requests as gart
+    monkeypatch.setattr(gart, "AuthorizedSession", lambda creds: api)
+
+
+def test_a_weigh_in_wakes_the_daily_sync(monkeypatch):
+    # The weigh-in IS the wake signal — the whole reason sleep now lands on its own
+    # day instead of ~24h late.
+    api = _FakeRunApi()
+    _wire_run_api(monkeypatch, api)
+    ingest._trigger_daily_sync("2026-07-17")
+    assert api.runs == ["https://run.googleapis.com/v2/projects/proj/locations/"
+                        "europe-west1/jobs/health-tracker-daily:run"]
+
+
+def test_a_second_weigh_in_does_not_start_a_concurrent_sync(monkeypatch):
+    # upsert_daily is read-modify-write against a grid snapshot: two overlapping
+    # runs would both miss a new date and append it TWICE.
+    api = _FakeRunApi(executions=[{"name": "x/executions/run-1"}])  # no completionTime
+    _wire_run_api(monkeypatch, api)
+    ingest._trigger_daily_sync("2026-07-17")
+    assert api.runs == []  # refused to pile on
+
+
+def test_a_finished_previous_sync_does_not_block_a_new_one(monkeypatch):
+    api = _FakeRunApi(executions=[{"name": "x/executions/run-1",
+                                   "completionTime": "2026-07-17T06:01:00Z"}])
+    _wire_run_api(monkeypatch, api)
+    ingest._trigger_daily_sync("2026-07-17")
+    assert len(api.runs) == 1
+
+
+def test_a_failed_trigger_never_breaks_the_weigh_in(monkeypatch):
+    # The weight is already written and this runs on the Cloud Tasks worker —
+    # raising would retry the task and rewrite the row. The backstop covers it.
+    _wire_run_api(monkeypatch, _FakeRunApi(ok=False))
+    ingest._trigger_daily_sync("2026-07-17")  # must not raise
+
+    monkeypatch.setattr(ingest.google.auth, "default",
+                        lambda scopes=None: (_ for _ in ()).throw(RuntimeError("no adc")))
+    ingest._trigger_daily_sync("2026-07-17")  # must not raise
+
+
+def test_backoff_is_exponential_capped_and_jittered(monkeypatch):
+    monkeypatch.delenv("GEMINI_BACKOFF_BASE", raising=False)
+    monkeypatch.delenv("GEMINI_BACKOFF_CAP_S", raising=False)
+    monkeypatch.delenv("GEMINI_BACKOFF_JITTER_S", raising=False)
+    base, cap = ingest.DEFAULT_BACKOFF_BASE, ingest.DEFAULT_BACKOFF_CAP_S
+    jit = ingest.DEFAULT_BACKOFF_JITTER_S
+
+    for n in range(1, 6):
+        waits = {ingest._backoff_s(n) for _ in range(40)}
+        floor = min(base ** n, cap)
+        # jitter only ever ADDS delay, so the measured request rate can't rise
+        assert all(floor <= w <= floor + jit for w in waits)
+        assert len(waits) > 1, "no jitter — every client retries in lockstep"
+    # capped, so one attempt can't sleep away its whole deadline
+    assert ingest._backoff_s(99) <= cap + jit
+
+
+def test_default_chain_is_best_first_and_free_tier():
+    # 3.5-flash is the model we want the numbers from; flash-lite is the steady
+    # fallback (2026-07-12/13 incidents). Nothing waits on this now, so accuracy
+    # leads. No Pro (429s on the free key).
     chain = ingest.DEFAULT_MODELS.split(",")
-    assert chain[0] == "gemini-3.1-flash-lite"
-    assert "gemini-3.5-flash" in chain
+    assert chain[0] == "gemini-3.5-flash"
+    assert chain[1] == "gemini-3.1-flash-lite"
     assert not any("pro" in m for m in chain)
 
 
-def test_quick_kwargs_is_a_single_fast_pass(monkeypatch):
-    monkeypatch.setenv("GEMINI_MODELS", "fast-lite,strong-a,strong-b")
-    kw = ingest._quick_kwargs()
-    assert kw["models"] == ["fast-lite"]   # only the first (fastest) model
-    assert kw["retries"] == 1              # one shot, no waiting on retries
-    assert kw["timeout_ms"] <= 45000 and kw["deadline_s"] <= 60  # tight budget
+def test_worker_holds_out_for_the_best_model_until_patience_runs_out(monkeypatch):
+    monkeypatch.setenv("GEMINI_MODELS", "best,steady,last-resort")
+    monkeypatch.setenv("TASKS_MAX_ATTEMPTS", "8")
+    monkeypatch.setenv("GEMINI_FALLBACK_LAST_N", "2")
+
+    # attempts 1-6 (0-based 0..5): the best model ONLY. Falling through to a
+    # weaker model here would answer with it and waste the whole retry window.
+    for attempt in range(6):
+        kw = ingest._worker_kwargs(attempt)
+        assert kw["models"] == ["best"], f"attempt {attempt} settled early"
+        assert kw["retries"] > 1  # spend the attempt on it
+
+    # attempts 7-8: out of patience — walk the chain, one shot each, so a row
+    # lands instead of the stub attempt 8 would write.
+    for attempt in (6, 7):
+        kw = ingest._worker_kwargs(attempt)
+        assert kw["models"] == ["best", "steady", "last-resort"]
+        assert kw["retries"] == 1
+
+
+def test_worker_walks_the_chain_when_there_is_only_one_attempt(monkeypatch):
+    # A queue with no retries has no patience to spend: never hold out, because
+    # this attempt is also the last one.
+    monkeypatch.setenv("GEMINI_MODELS", "best,steady")
+    monkeypatch.setenv("TASKS_MAX_ATTEMPTS", "1")
+    assert ingest._worker_kwargs(0)["models"] == ["best", "steady"]
+
+
+def test_fallback_attempt_reaches_a_weaker_model_even_when_the_best_one_hangs(
+        monkeypatch):
+    # The reason the last attempts use retries=1: with the models timing out at
+    # GEMINI_TIMEOUT_MS each, a second retry of the best model would burn the
+    # deadline and we'd never reach flash-lite — turning a row into a stub. Every
+    # call here hangs the full 60 s against a 105 s deadline.
+    clock = {"t": 0.0}
+    monkeypatch.setattr(ingest.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(ingest.time, "sleep",
+                        lambda s: clock.__setitem__("t", clock["t"] + s))
+
+    class _Hangs:
+        def generate_content(self, model, contents, config):
+            calls.append(model)
+            clock["t"] += 60.0
+            raise Exception("503 UNAVAILABLE")
+
+    calls = []
+    monkeypatch.setattr(ingest, "_genai",
+                        lambda: type("C", (), {"models": _Hangs()})())
+    monkeypatch.setenv("GEMINI_MODELS", "best,steady")
+    monkeypatch.setenv("TASKS_MAX_ATTEMPTS", "8")
+    monkeypatch.setenv("GEMINI_DEADLINE_S", "105")
+
+    with pytest.raises(RuntimeError):
+        ingest._run_models(["prompt"], **ingest._worker_kwargs(7))  # final attempt
+    assert calls == ["best", "steady"]  # not ["best", "best", ...]
+
+
+def test_analysis_budget_counts_from_the_start_of_the_request(monkeypatch):
+    # The deadline must cover the sheet reads and Drive downloads that precede
+    # analysis, or a slow read pushes the response past Cloud Run's 180 s and the
+    # final attempt 504s without ever writing its stub.
+    monkeypatch.setenv("GEMINI_DEADLINE_S", "105")
+    monkeypatch.setattr(ingest.time, "monotonic", lambda: 1000.0)
+    assert ingest._analysis_budget(970.0) == 75.0  # 30 s of I/O already spent
+    assert ingest._analysis_budget(800.0) < 0      # overrun => give up at once
 
 
 def test_run_models_respects_model_override(monkeypatch):
-    # the quick pass must call ONLY the model it's given, not the whole chain
+    # a held-out attempt must call ONLY the model it's given, not the whole chain
     fm = _fake_genai([_GOOD_MEAL], monkeypatch)
     monkeypatch.setenv("GEMINI_MODELS", "a,b,c")
     ingest._run_models(["prompt"], models=["only-this"], retries=1)

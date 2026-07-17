@@ -15,8 +15,10 @@ POST /ingest (X-Auth-Token) — a **screenshot of the smart-scale app**:
   not on when the screenshot was sent: weigh at 07:00, send at noon, it still lands
   on the right day, and re-sending an old screenshot rewrites its own historical
   row instead of today's. Sending a fresh reading for a day just replaces it.
-  Nothing is archived to Drive — the numbers *are* the data, and the screenshot is
-  still on the phone.
+  The screenshot does land in the Drive meals folder, unused: classification is
+  Gemini's job and Gemini now runs on the worker, so /ingest has to archive every
+  image before it can know this one wasn't a meal. The numbers *are* the data; the
+  file is ignored.
 
   This replaced the Google Health API, which only ever exposed weight + body fat
   (Fitbit strips the other eight on the way through) and still needed the phone app
@@ -33,19 +35,31 @@ a mix:
   Then:
   1. de-duplicates (photos -> combined image hash; text-only -> note hash) so
      double submissions don't double-log,
-  2. estimates per-ingredient nutrition with Gemini (structured JSON output),
+  2. archives every photo to the user's Google Drive (skipped when text-only),
+  3. enqueues the analysis and replies 202 in a couple of seconds.
+  Everything after that happens on /process:
+  4. estimates per-ingredient nutrition with Gemini (structured JSON output),
      reasoning across ALL images together — a nutrition label is authoritative
      for its product and is scaled to the portion on the plate. A `note` is
      authoritative context that overrides the estimate ("only ate half" halves
      portions). Text-only meals reuse the same schema but with capped confidence
      — there is no photo to measure against,
-  3. archives every photo to the user's Google Drive (skipped when text-only),
-  4. appends a row to the `meals` tab (the raw `note` is stored for provenance;
-     `photo_url` holds all archived links),
-  5. replies with the meal summary plus the day's running totals.
+  5. appends a row to the `meals` tab (the raw `note` is stored for provenance;
+     `photo_url` holds all archived links).
   Non-food inputs are logged as nothing (photos still archived). If every model
-  fails, the photos are archived and a zeroed "analysis failed" row keeps the
-  audit trail — a meal is never silently lost.
+  fails for the whole retry window, the photos are archived and a zeroed
+  "analysis failed" row keeps the audit trail — a meal is never silently lost.
+
+Why /ingest analyses nothing (the timeout rule):
+  The phone's Shortcut fails the entire log if the HTTP call is slow, and the
+  model worth waiting for is precisely the one that's often overloaded. Those two
+  facts can't be reconciled on one request, so they aren't: /ingest only archives
+  and enqueues, and the Cloud Tasks queue's retry window (8 attempts, 5->120 s
+  backoff) becomes a patience budget the worker spends on the best model — see
+  _worker_kwargs. The phone is done in seconds; the row lands when it lands,
+  typically within a minute, in the worst case ~10.
+  The cost is that the reply is an acknowledgement, not the macros: results are
+  read back from the sheet / the iOS app, not from the Shortcut's response.
 
 POST /ingest (X-Auth-Token) — **a bowel-movement note.** "fiz cocó", "I just pooped" -> sets
   `daily_summary.bowel_movement` = TRUE for the day.
@@ -69,6 +83,7 @@ import hmac
 import io
 import json
 import os
+import random
 import re
 import socket
 import ssl
@@ -81,6 +96,7 @@ from zoneinfo import ZoneInfo
 import google.auth
 from flask import Flask, jsonify, request
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 from google.auth.transport.requests import Request as AuthRequest
 from google.oauth2.credentials import Credentials
@@ -160,36 +176,75 @@ def _col_letter_for(index: int) -> str:
 # Read ranges are derived from the schema with headroom, never hard-coded.
 _READ_LAST_COL = _col_letter_for(len(daily_headers()) + 40)
 
-# Strongest model first (accuracy over speed — response time isn't critical).
-# These are the strongest models available on the FREE tier; Pro models require
-# a paid plan (429 on the free key), so they're intentionally not here. If you
-# enable billing, prepend "gemini-3.1-pro-preview" via the GEMINI_MODELS env.
-# Each model is retried GEMINI_RETRIES times (transient 503s) before falling back.
-# flash-lite leads: it's the only lite model and, across the 2026-07-12/13
-# incidents, the steady one — the bigger flash models are the ones that ran
-# numbers to tens of thousands of digits or hung ~120 s and 504'd. The
-# background worker still falls through to the stronger models for accuracy.
-DEFAULT_MODELS = "gemini-3.1-flash-lite,gemini-3.5-flash,gemini-3-flash-preview"
+# BEST model first — accuracy over speed, because nothing waits on this any more:
+# analysis happens entirely in the background worker (see /ingest), so a slow or
+# overloaded model costs patience, never a request timeout.
+# gemini-3.5-flash is the model we actually want the numbers from. flash-lite is
+# the steady fallback (across the 2026-07-12/13 incidents it was the one that
+# never hung); gemini-3-flash-preview is a last resort so an outage on both still
+# lands a real row instead of a stub.
+# Pro is deliberately NOT here, and paying for it would be a DOWNGRADE — don't
+# "upgrade" this chain without re-reading the numbers (verified 2026-07-16):
+#   * gemini-3.1-pro-preview has NO free tier at all (structural, not a quota
+#     blip): a live call 429s with "check your plan and billing details".
+#   * It is also OLDER than gemini-3.5-flash (May 2026) and LOSES to it on
+#     multimodal understanding (MMMU-Pro ~+3.1% to Flash) — which is precisely
+#     this workload: photos of food and scale screenshots. Pro leads only on
+#     text reasoning, which we don't do here.
+#   * It costs MORE ($2/$12 per 1M vs $1.50/$9) and is ~2.6x slower.
+# Enabling billing to reach it would also end the free tier on that project and
+# needs a $10 prepay — and Cloud free-trial/Welcome credits are explicitly barred
+# from the Gemini API, so it cannot be paid for with credits.
+# The chain is NOT walked top-to-bottom on every try — see _worker_kwargs: the
+# fallbacks stay locked until the queue's retry window is nearly spent.
+DEFAULT_MODELS = "gemini-3.5-flash,gemini-3.1-flash-lite,gemini-3-flash-preview"
+# Per-model retries once we're walking the chain (patience spent, get a row).
 DEFAULT_RETRIES = 3
-# Hard caps so a single request can't hang until Cloud Run's request timeout:
+# Per-attempt retries while we're still holding out for the first model.
+DEFAULT_PATIENT_RETRIES = 4
+# In-attempt backoff: min(base**n, cap) + uniform(0, jitter) seconds.
+# These numbers are set by our REQUEST RATE, not by how long an outage lasts.
+# The free tier allows roughly 10 requests/min *per project* (Google no longer
+# publishes the figure — AI Studio's dashboard is authoritative), and Cloud Tasks
+# re-runs us every 5-120 s, so in-attempt retries stack across attempts. Measured
+# over the full 8-attempt window: base=2/cap=10 peaked at 10 calls in a rolling
+# minute — i.e. we would manufacture our own 429s on top of Google's 503s.
+# base=3/cap=30 peaks at ~7 while still landing ~30 shots at the best model over
+# ~10 min. The LONG waiting is Cloud Tasks' job; ours is to not hammer.
+# Jitter follows Google's published guidance. It only ever ADDS delay, so it
+# cannot push the measured rate back up. Its value here is modest and worth being
+# honest about: we are a single client at maxConcurrentDispatches=1, so there is
+# no herd of our own to disperse — it only decorrelates us from every other client
+# retrying against the same overloaded model.
+DEFAULT_BACKOFF_BASE = 3
+DEFAULT_BACKOFF_CAP_S = 30
+DEFAULT_BACKOFF_JITTER_S = 2
+# How many attempts at the END of the queue's retry window are allowed to fall
+# back to a weaker model. Everything before them is best-model-only.
+DEFAULT_FALLBACK_LAST_N = 2
+# Hard caps so a single request can't hang until Cloud Run's request timeout
+# (180 s on health-tracker-ingest):
 #  * MAX_OUTPUT_TOKENS bounds generation — without it the model can occasionally
 #    run one number to tens of thousands of digits, taking minutes and producing
 #    unparseable JSON (the cause of the 504s on 2026-07-12);
 #  * TIMEOUT_MS is a per-call network backstop (a hung call is the 2026-07-13
 #    504 — 120 s was too long, so 60 s);
-#  * DEADLINE_S stops us starting another model attempt so late it would cross
-#    the request timeout.
+#  * DEADLINE_S stops us STARTING another model call so late it would cross the
+#    request timeout. It is measured from the start of the request (see
+#    _analysis_budget), so the worst case is DEADLINE_S + TIMEOUT_MS + the final
+#    sheet write = 105 + 60 + ~5 = ~170 s, inside the 180 s timeout.
 DEFAULT_MAX_OUTPUT_TOKENS = 8192
 DEFAULT_TIMEOUT_MS = 60000
 DEFAULT_DEADLINE_S = 105
-# The phone-facing sync attempt is deliberately short: one fast model, then hand
-# off to the background queue rather than make the phone wait / risk a 504.
-DEFAULT_SYNC_TIMEOUT_MS = 35000
-DEFAULT_SYNC_DEADLINE_S = 40
-# Keep in sync with the Cloud Tasks queue's max-attempts; on the final attempt the
-# worker writes an "analysis failed" stub so a meal is never lost even if Gemini
-# is unreachable for the whole retry window.
+# MUST NOT exceed the Cloud Tasks queue's max-attempts (`meal-ingest`: 8). The
+# worker is what ends the retry loop: on attempt TASKS_MAX_ATTEMPTS it writes an
+# "analysis failed" stub and returns 200. Set this HIGHER than the queue allows
+# and the queue drops the task first — silently, with no stub and no row.
 DEFAULT_TASKS_MAX_ATTEMPTS = 8
+
+# The Cloud Run Job a weigh-in wakes (see _trigger_daily_sync). Override with the
+# DAILY_JOB env var.
+DEFAULT_DAILY_JOB = "health-tracker-daily"
 
 # Full per-ingredient micronutrient set, stored in each item's `nutrients` map.
 # Grouped by unit (suffix _g/_mg/_ug) so values map cleanly to a future relational
@@ -628,6 +683,14 @@ def _models() -> List[str]:
     return [m.strip() for m in raw.split(",") if m.strip()]
 
 
+def _int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, str(default))))
+    except ValueError:
+        app.logger.warning("%s is not an int; using %d", name, default)
+        return default
+
+
 def _tz() -> ZoneInfo:
     return ZoneInfo(os.environ.get("HEALTH_TZ", "Europe/Lisbon"))
 
@@ -665,6 +728,60 @@ def _authorized(req) -> bool:
     expected = os.environ.get("INGEST_TOKEN", "")
     given = req.headers.get("X-Auth-Token", "")
     return bool(expected) and hmac.compare_digest(given, expected)
+
+
+def _trigger_daily_sync(day: str) -> None:
+    """Kick the daily job, because the user has just woken up.
+
+    The weigh-in IS the wake signal. A scale screenshot for TODAY means: the night
+    is over and scored, yesterday is over, and the watch has synced (the app had to
+    open for the user to screenshot it). No clock knows that — the 07:00 cron this
+    replaced fired while the user was still asleep, so sleep always landed a day
+    late. Now the row is filled minutes after waking.
+
+    Fire-and-forget and never fatal: the weight is already written, and this runs on
+    the Cloud Tasks worker, so raising here would retry the whole task and re-write
+    the row. A missed kick just means the 11:00 backstop picks it up.
+
+    Skipped when a run is already in flight: `upsert_daily` is read-modify-write
+    against a grid snapshot, so two overlapping executions would both fail to find
+    a new date and append it TWICE. Cheap to check, and it also absorbs the real
+    case of two screenshots sent back to back.
+    """
+    project = os.environ.get("GCP_PROJECT")
+    job = os.environ.get("DAILY_JOB", DEFAULT_DAILY_JOB)
+    location = os.environ.get("DAILY_JOB_LOCATION",
+                              os.environ.get("TASKS_LOCATION", "europe-west1"))
+    if not project:
+        app.logger.warning("no GCP_PROJECT; skipping daily sync trigger")
+        return
+    base = (f"https://run.googleapis.com/v2/projects/{project}/locations/"
+            f"{location}/jobs/{job}")
+    try:
+        from google.auth.transport.requests import AuthorizedSession
+
+        creds, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        session = AuthorizedSession(creds)
+
+        running = session.get(f"{base}/executions?pageSize=10", timeout=20)
+        if running.ok:
+            for execution in running.json().get("executions", []):
+                # No completionTime => still going (or never finished).
+                if not execution.get("completionTime"):
+                    app.logger.info(
+                        "daily sync already running (%s); not starting another",
+                        execution.get("name", "").rsplit("/", 1)[-1])
+                    return
+
+        resp = session.post(f"{base}:run", json={}, timeout=30)
+        if resp.ok:
+            app.logger.info("weigh-in for %s woke the daily sync", day)
+        else:
+            app.logger.warning("daily sync trigger returned %s: %s",
+                               resp.status_code, resp.text[:200])
+    except Exception:
+        app.logger.exception("daily sync trigger failed (backstop will cover it)")
 
 
 def _enqueue_process(payload: Dict[str, Any]) -> None:
@@ -911,11 +1028,49 @@ def _sha12(data: bytes) -> str:
 
 
 # -- Gemini --------------------------------------------------------------------
-def _is_permanent(err: Exception) -> bool:
-    """A not-found / bad-request error won't fix on retry — skip to the next model
-    immediately instead of burning the retry budget on it."""
-    msg = str(err)
-    return any(tok in msg for tok in ("404", "NOT_FOUND", "400", "INVALID_ARGUMENT"))
+# Google's own transient set (google.genai._api_client._RETRY_HTTP_STATUS_CODES is
+# 408, 429, 500, 502, 503, 504) MINUS 429 — see _retry_same_model for why we
+# deliberately part company with the SDK on that one code.
+_RETRY_SAME_MODEL_CODES = (408, 500, 502, 503, 504)
+
+
+def _retry_same_model(err: Exception) -> bool:
+    """Is another *immediate* call to the SAME model worth making?
+
+    503/500/502/504/408 mean Google is out of capacity. That's their side, it
+    clears on its own, and waiting it out is the entire point of the ladder.
+
+    429 is the opposite and is why we don't just reuse the SDK's retry set: it
+    means WE are over quota (free tier ~10 req/min, a few hundred/day, counted per
+    PROJECT). Another call cannot succeed and digs the hole deeper, so this model's
+    turn ends immediately. That lands correctly on both kinds of attempt: on a
+    held-out one it ends the attempt -> 5xx -> Cloud Tasks waits 5-120 s, which is
+    exactly the cure for a rolling-window 429; on a chain-walking one it moves to
+    the next model, which has its own quota bucket. Either way we stop asking
+    instead of hammering — and if it's the daily quota, only Cloud Tasks' clock or
+    another model will ever fix it.
+
+    Anything else (400/403/404) never fixes itself -> next model.
+    """
+    # Prefer the status code: str(err) embeds the error's details JSON, and a
+    # quota error's details legitimately contain numbers like 400 — which the old
+    # substring sniff read as a permanent 400.
+    if isinstance(err, genai_errors.APIError) and isinstance(err.code, int):
+        return err.code in _RETRY_SAME_MODEL_CODES
+    # Not an APIError (socket timeout, connection reset, SSL): transient, unless it
+    # carries a status we recognise in its text.
+    return not any(tok in str(err) for tok in (
+        "404", "NOT_FOUND", "400", "INVALID_ARGUMENT", "429", "RESOURCE_EXHAUSTED"))
+
+
+def _backoff_s(attempt: int) -> float:
+    """Seconds to wait before the next call to the same model: exponential, capped,
+    plus jitter (see DEFAULT_BACKOFF_* for why these numbers are what they are)."""
+    base = float(os.environ.get("GEMINI_BACKOFF_BASE", str(DEFAULT_BACKOFF_BASE)))
+    cap = float(os.environ.get("GEMINI_BACKOFF_CAP_S", str(DEFAULT_BACKOFF_CAP_S)))
+    jitter = float(os.environ.get("GEMINI_BACKOFF_JITTER_S",
+                                 str(DEFAULT_BACKOFF_JITTER_S)))
+    return min(base ** attempt, cap) + random.uniform(0, jitter)
 
 
 def _gen_config(timeout_ms: Optional[int] = None) -> "types.GenerateContentConfig":
@@ -927,7 +1082,18 @@ def _gen_config(timeout_ms: Optional[int] = None) -> "types.GenerateContentConfi
         temperature=0.1,
         max_output_tokens=int(os.environ.get(
             "GEMINI_MAX_OUTPUT_TOKENS", str(DEFAULT_MAX_OUTPUT_TOKENS))),
-        http_options=types.HttpOptions(timeout=timeout_ms),
+        # attempts=1 pins the SDK to a SINGLE HTTP call: we own retry (_run_models),
+        # because only we know the request deadline and that a 429 must not be
+        # retried. This is the SDK's current default too, but only implicitly —
+        # `retry_options=None` means "never retry", while google's own docs claim
+        # the SDK retries 4x by default. If a future version makes that true, its
+        # retries would run INSIDE generate_content, where our deadline can't see
+        # them: 5 attempts x (60 s timeout + up to 60 s of its own backoff) would
+        # sail past Cloud Run's 180 s and 504 with no stub. Pin it.
+        http_options=types.HttpOptions(
+            timeout=timeout_ms,
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
     )
 
 
@@ -935,8 +1101,8 @@ def _run_models(contents: List[Any], *, models: Optional[List[str]] = None,
                 retries: Optional[int] = None, timeout_ms: Optional[int] = None,
                 deadline_s: Optional[float] = None,
                 allow_body: bool = True, allow_bowel: bool = False) -> Dict[str, Any]:
-    """Send `contents` (photos+prompt or a text prompt) through the fallback
-    chain, strongest model first, and assemble the record from the JSON reply.
+    """Send `contents` (photos+prompt or a text prompt) through `models` in order
+    and assemble the record from the JSON reply.
 
     Returns one of three records by the model's `kind` verdict: a meal
     (`kind` == "meal"), a body-composition reading (`kind` == "body", images only),
@@ -945,19 +1111,24 @@ def _run_models(contents: List[Any], *, models: Optional[List[str]] = None,
     be a bowel note and a text note can't be a scale screenshot, so a verdict the
     path can't produce is a hallucination and falls back to "meal".
 
-    The `quick` sync path and the background worker share this by overriding the
-    chain / retries / per-call timeout / wall-clock deadline: the phone gets a
-    fast single-model pass, the worker a thorough one.
+    Callers own the patience policy, not this function: `_worker_kwargs` decides
+    which slice of the chain a given Cloud Tasks attempt may use, so on most
+    attempts `models` is a single entry and "fall back" means "give up, 5xx, and
+    let the queue re-run us" rather than "answer with a weaker model".
 
-    Two failure modes are treated differently:
-      * transient API errors (503 overloaded, 429, timeout) are retried on the
-        SAME model up to GEMINI_RETRIES times with exponential backoff;
+    Three failure modes are treated differently:
+      * Google-side capacity errors (503 overloaded, 500, 504, timeout) are
+        retried on the SAME model with exponential backoff + jitter (_backoff_s);
+      * a 429 is NOT (see _retry_same_model) — that one is our own quota, and more
+        calls make it worse. We end the model's turn and let the queue's backoff,
+        or the next model's separate quota, do the waiting;
       * an unparseable body (the model runs a number to tens of thousands of
         digits, or truncates at max_output_tokens) is deterministic at this
         temperature, so we skip straight to the next model instead of burning
         the retry budget reproducing the same garbage.
     A wall-clock deadline guarantees we return before Cloud Run's request
-    timeout rather than letting the caller (the phone) hit a 504.
+    timeout rather than letting Cloud Tasks see a 504 (which on the final attempt
+    would skip the stub and lose the meal).
     """
     models = models or _models()
     if retries is None:
@@ -979,13 +1150,15 @@ def _run_models(contents: List[Any], *, models: Optional[List[str]] = None,
                     config=_gen_config(timeout_ms))
             except Exception as err:  # network / API error: 503, 429, timeout, ...
                 last_err = err
-                if _is_permanent(err):
-                    app.logger.warning("model %s unusable, skipping: %s", model, err)
+                if not _retry_same_model(err):
+                    app.logger.warning(
+                        "model %s: not worth another call now, moving on: %s",
+                        model, err)
                     break
                 app.logger.warning("model %s attempt %d/%d failed: %s",
                                    model, attempt, retries, err)
                 if attempt < retries and time.monotonic() < deadline:
-                    time.sleep(min(2 ** attempt, 10))
+                    time.sleep(_backoff_s(attempt))
                 continue
             # Parse in its own guard: a malformed / truncated body raises
             # JSONDecodeError, and a runaway number raises ValueError (Python's
@@ -1070,7 +1243,7 @@ def analyze(images: List[Tuple[bytes, str]], note: str = "",
     two conflict; with `now` it can also infer the meal's hour from the note.
     `templates` lets the model recognise a dish the user has weighed and hand back
     its name instead of estimating. `kw` overrides (models/retries/timeout_ms/
-    deadline_s) let the sync path run a quick pass."""
+    deadline_s) carry the worker's per-attempt patience policy (_worker_kwargs)."""
     parts: List[Any] = [types.Part.from_bytes(data=img, mime_type=mime)
                         for img, mime in images]
     parts.append(_build_prompt(len(images), note, now, templates))
@@ -1093,17 +1266,50 @@ def analyze_text(note: str, now: datetime,
     return _run_models([prompt], allow_body=False, allow_bowel=True, **kw)
 
 
-def _quick_kwargs() -> Dict[str, Any]:
-    """Overrides for the phone-facing sync attempt: just the fastest model, one
-    shot, a tight per-call timeout and deadline. If it can't produce macros in
-    that window the meal is handed to the background worker instead of the phone
-    waiting (or hitting a 504)."""
-    return {
-        "models": _models()[:1],
-        "retries": 1,
-        "timeout_ms": int(os.environ.get("SYNC_TIMEOUT_MS", str(DEFAULT_SYNC_TIMEOUT_MS))),
-        "deadline_s": float(os.environ.get("SYNC_DEADLINE_S", str(DEFAULT_SYNC_DEADLINE_S))),
-    }
+def _max_attempts() -> int:
+    return _int_env("TASKS_MAX_ATTEMPTS", DEFAULT_TASKS_MAX_ATTEMPTS)
+
+
+def _analysis_budget(started: float) -> float:
+    """Seconds left for Gemini, counted from the START of the request rather than
+    from the first model call — the sheet reads and Drive downloads that precede
+    analysis come out of the same budget, so they can't push the response past
+    Cloud Run's request timeout. May go negative (then _run_models gives up at
+    once), which is what we want: better a retry than a 504 with no stub."""
+    total = float(os.environ.get("GEMINI_DEADLINE_S", str(DEFAULT_DEADLINE_S)))
+    return total - (time.monotonic() - started)
+
+
+def _worker_kwargs(attempt: int) -> Dict[str, Any]:
+    """Which models the worker may use on `attempt` (0-based, as Cloud Tasks
+    counts it in X-CloudTasks-TaskRetryCount).
+
+    The queue's retry window is a *patience budget*, and the point of this
+    function is to spend it on the best model instead of settling early. Walking
+    the chain top-to-bottom on every attempt would defeat the ordering entirely:
+    the first attempt would drop to flash-lite within seconds of a 3.5-flash
+    hiccup and answer with the weaker model, and the remaining seven attempts —
+    the patience — would never be used at all.
+
+    So: every attempt but the last few calls ONLY the first model, retrying it
+    within the attempt and then handing back a 5xx so Cloud Tasks re-runs us after
+    a backoff. With the queue's 8 attempts and 5→120 s backoff that is ~30 shots
+    at gemini-3.5-flash spread over ~11 minutes (measured) before anything weaker
+    is allowed to answer — at a peak of ~6 calls/min, which is what keeps us clear
+    of the free tier's ~10 RPM (see DEFAULT_BACKOFF_BASE).
+
+    On the last FALLBACK_LAST_N attempts patience runs out and we walk the whole
+    chain, one shot per model — a model that hangs for the full TIMEOUT_MS must
+    not eat the budget the next one needs — because a row from flash-lite beats
+    the "analysis failed" stub that the final attempt would otherwise write.
+    """
+    models = _models()
+    fallback_from = _max_attempts() - _int_env(
+        "GEMINI_FALLBACK_LAST_N", DEFAULT_FALLBACK_LAST_N)
+    if attempt + 1 > fallback_from:
+        return {"models": models, "retries": 1}
+    return {"models": models[:1],
+            "retries": _int_env("GEMINI_PATIENT_RETRIES", DEFAULT_PATIENT_RETRIES)}
 
 
 def _resolve_meal_time(hhmm: Any, now: datetime) -> datetime:
@@ -1691,12 +1897,11 @@ def _resolve_templates(nut: Dict[str, Any], note: str, when: datetime,
 
 
 def _finalize_body(rec: Dict[str, Any], now: datetime):
-    """Write a scale reading into daily_summary and tell the phone what landed.
+    """Write a scale reading into daily_summary.
 
     Keyed on the reading's own date (from the screen), not on `now` — see
-    _resolve_measured_at. Nothing is archived to Drive: unlike a meal photo, whose
-    estimate might need re-deriving from the original, these numbers ARE the data,
-    and the screenshot is still sitting in the user's camera roll."""
+    _resolve_measured_at. Runs on the worker now, so the JSON reply only reaches
+    Cloud Tasks, which reads nothing but the status."""
     body = rec.get("body") or {}
     if not body:
         return jsonify({
@@ -1709,6 +1914,13 @@ def _finalize_body(rec: Dict[str, Any], now: datetime):
     row = _body_row(body, measured)
     day = row.pop("date")
     write_daily(day, row)
+
+    # A scale reading for TODAY means the user just woke up — the one moment when
+    # last night's sleep is final and yesterday is closed. Wake the daily sync.
+    # A backfilled screenshot (an older reading re-sent) is NOT a wake signal, so
+    # it only writes its own row and leaves the sync to the backstop.
+    if day == now.date().isoformat():
+        _trigger_daily_sync(day)
 
     def shown(key: str, fmt: str) -> Optional[str]:
         return fmt.format(body[key]) if key in body else None
@@ -1732,9 +1944,9 @@ def _finalize_body(rec: Dict[str, Any], now: datetime):
 
 
 def _finalize_bowel(when: datetime):
-    """Flag the day's bowel movement and tell the phone. The whole feature is one
-    boolean, keyed on the local day the note was sent (like /feel) — the note text
-    is not stored anywhere. Setting the flag again is idempotent, so a re-sent note
+    """Flag the day's bowel movement. The whole feature is one boolean, keyed on
+    the local day the note was sent — the note text is not stored anywhere.
+    Setting the flag again is idempotent, so a re-sent note
     or a Cloud Tasks retry is harmless; only ever TRUE, never FALSE (a blank cell is
     'no'). The user goes at most once a day, so yes/no is the whole model."""
     day = when.date().isoformat()
@@ -1749,9 +1961,11 @@ def _finalize_bowel(when: datetime):
 def _finalize(nut: Dict[str, Any], photo_url: str, when: datetime,
               image_sha: str, note: str, text_only: bool,
               todays: List[Dict[str, Any]]):
-    """Shared tail for a successful analysis (sync path AND background worker):
-    stamp the inferred time, log the row (unless it's not food), and build the
-    phone-facing summary + running day totals."""
+    """Tail of a successful analysis: stamp the inferred time, log the row (unless
+    it's not food), and build the summary + running day totals.
+
+    The sheet write is the point. The JSON is now read only by Cloud Tasks, which
+    cares about nothing but the 2xx — it's kept for replaying /process by hand."""
     # If the note said when the meal was eaten (text-only OR a photo logged after
     # the fact, e.g. "this yogurt with my lunch"), the model returns meal_time and
     # the row lands at that hour today, sorting into place. With no timing note
@@ -1820,43 +2034,27 @@ def ingest():
     image_sha = (_sha12(b"".join(img for img, _ in images)) if images
                  else _sha12(("text:" + note).encode("utf-8")))
 
-    todays = _todays_meals(today)
-    if _exact_duplicate(image_sha, note, todays):
-        return jsonify({
-            "summary": ("Duplicate description — already logged today."
-                        if text_only
-                        else "Duplicate — same photo and note already logged today "
-                             "(change the note to re-estimate)."),
-            "duplicate": True,
-        }), 200
-
-    # The user's measured templates: the model may recognise this dish and hand
-    # back its name, and the note may ask to save a new one.
-    templates = read_templates()
-
-    # Quick, best-effort pass for instant macros on the phone. If Gemini isn't
-    # fast enough, we don't make the phone wait (or risk a 504) — we archive and
-    # hand the meal to the background worker, which retries until it lands.
+    # De-dupe before doing any work, so a double-tap doesn't archive and queue
+    # twice. Best-effort: if the sheet read fails we queue anyway and let the
+    # worker re-check before it writes — a slow duplicate check beats a lost meal.
     try:
-        nut = (analyze_text(note, when, templates, **_quick_kwargs()) if text_only
-               else analyze(images, note, now=when, templates=templates,
-                            **_quick_kwargs()))
-        quick_ok = True
-    except Exception as err:
-        app.logger.info("quick analysis missed, deferring to worker: %s", err)
-        nut, quick_ok = None, False
+        if _exact_duplicate(image_sha, note, _todays_meals(today)):
+            return jsonify({
+                "summary": ("Duplicate description — already logged today."
+                            if text_only
+                            else "Duplicate — same photo and note already logged "
+                                 "today (change the note to re-estimate)."),
+                "duplicate": True,
+            }), 200
+    except Exception:
+        app.logger.exception("duplicate pre-check failed; queueing anyway")
 
-    # Non-meal notes short-circuit here, before any Drive work: a scale screenshot
-    # (its ten metrics) or a bowel-movement note (one boolean) needs no archive, no
-    # meals row and no template logic — just a write into the day's row. Both are
-    # far quicker than nutrition reasoning, so the quick pass essentially always
-    # carries them.
-    if quick_ok and nut.get("kind") == "body":
-        return _finalize_body(nut, when)
-    if quick_ok and nut.get("kind") == "bowel":
-        return _finalize_bowel(when)
-
-    # Archive now — the sheet needs the links and the worker needs the bytes.
+    # Archive now — the sheet needs the links and, since the task body is too
+    # small to carry photos, the worker fetches the bytes back from Drive.
+    # A scale screenshot gets archived here too: nothing has classified the image
+    # yet (only Gemini can), and the worker ignores the photo once it turns out to
+    # be a body reading. A stray file in the meals folder is the price of never
+    # making the phone wait for the classification.
     archived: List[Dict[str, str]] = []
     if images:
         try:
@@ -1865,11 +2063,10 @@ def ingest():
             app.logger.exception("drive upload failed")
     photo_url = " ".join(a["url"] for a in archived if a.get("url"))
 
-    if quick_ok:
-        nut = _resolve_templates(nut, note, when, templates)
-        return _finalize(nut, photo_url, when, image_sha, note, text_only, todays)
-
-    # Hand off to the background queue (guaranteed-insert path).
+    # Hand off and acknowledge. NOTHING is analysed on this request: the phone's
+    # Shortcut fails the whole log if the response is slow, and the model we want
+    # (see DEFAULT_MODELS) is exactly the one that's often overloaded — so the
+    # request ends here, in seconds, and the worker gets minutes to be patient.
     try:
         _enqueue_process({
             "text_only": text_only, "note": note,
@@ -1878,7 +2075,9 @@ def ingest():
             "photo_url": photo_url, "refs": archived,
         })
         return jsonify({
-            "summary": ("Queued — your meal is being analysed and will appear "
+            "summary": ("Got it — analysing your note now; it'll be in the sheet "
+                        "shortly." if text_only else
+                        "Got it — analysing your photo now; it'll be in the sheet "
                         "shortly."),
             "queued": True, "photo_url": photo_url,
         }), 202
@@ -1894,12 +2093,18 @@ def ingest():
 
 @app.post("/process")
 def process():
-    """Background worker invoked by Cloud Tasks: the thorough analysis + row
-    insert. Returns 5xx to make Cloud Tasks retry later (that's the guarantee);
-    on the final attempt it writes a stub so the meal is never lost."""
+    """Background worker invoked by Cloud Tasks: the whole analysis + row insert.
+
+    This is where every meal is now analysed — /ingest only archives and enqueues.
+    Nothing is waiting on the response, so the worker can be slow and stubborn:
+    it returns 5xx to make Cloud Tasks retry later (that's the insertion
+    guarantee), spends most of its attempts on the best model alone
+    (_worker_kwargs), and only on the final attempt writes a stub, so the meal is
+    never lost."""
     if not _authorized(request):
         return jsonify({"error": "unauthorized"}), 401
 
+    started = time.monotonic()
     body = request.get_json(silent=True) or {}
     text_only = bool(body.get("text_only"))
     note = str(body.get("note") or "")
@@ -1916,26 +2121,32 @@ def process():
     if _exact_duplicate(image_sha, note, todays):  # idempotent: retry after success
         return jsonify({"status": "already-logged"}), 200
 
+    # Cloud Tasks counts the first attempt as 0.
+    attempt = int(request.headers.get("X-CloudTasks-TaskRetryCount", "0"))
+    max_attempts = _max_attempts()
+
+    kw = _worker_kwargs(attempt)
     templates = read_templates()
     try:
         images = download_photos(refs) if not text_only else []
-        nut = (analyze_text(note, when, templates) if text_only
-               else analyze(images, note, now=when, templates=templates))
+        # Budgeted from the top of the request, so the reads above are charged to
+        # the same deadline that keeps us inside Cloud Run's 180 s timeout.
+        kw["deadline_s"] = _analysis_budget(started)
+        nut = (analyze_text(note, when, templates, **kw) if text_only
+               else analyze(images, note, now=when, templates=templates, **kw))
     except Exception as err:
-        attempt = int(request.headers.get("X-CloudTasks-TaskRetryCount", "0"))
-        max_attempts = int(os.environ.get(
-            "TASKS_MAX_ATTEMPTS", str(DEFAULT_TASKS_MAX_ATTEMPTS)))
         if attempt + 1 >= max_attempts:  # give up: leave an auditable stub
             app.logger.exception("worker exhausted after %d attempts; stub", attempt + 1)
             _log_failure_stub(photo_url, when, image_sha, note)
             return jsonify({"status": "failed-stub"}), 200  # 200 => stop retrying
-        app.logger.warning("worker attempt %d failed, will retry: %s", attempt + 1, err)
+        app.logger.warning("worker attempt %d/%d failed on %s, will retry: %s",
+                           attempt + 1, max_attempts, kw["models"], err)
         return jsonify({"error": str(err)}), 500  # 5xx => Cloud Tasks retries
 
-    # The quick pass never got far enough to classify, so a non-meal note can reach
-    # the worker too (rare — only when a Gemini outage happens at the wrong moment).
-    # A screenshot was archived to Drive on the way in as if it were a meal, which
-    # is harmless: we just ignore the photo and write the numbers.
+    # Classification happens here now, so every scale screenshot and bowel note
+    # arrives through this path. A screenshot was archived to Drive on the way in
+    # as if it were a meal, which is harmless: we ignore the photo and write the
+    # numbers.
     if nut.get("kind") == "body":
         return _finalize_body(nut, when)
     if nut.get("kind") == "bowel":

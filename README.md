@@ -71,14 +71,25 @@ Health Tracker/
   portions); a note with no image estimates the meal from text alone at capped
   confidence. De-dupes (combined image hash, or note hash when text-only) ignoring
   failed stubs.
-  **Hybrid reliability:** a quick single-model pass gives the phone instant macros
-  when Gemini is fast; if it's slow, the photos are archived and the meal is handed
-  to a **Cloud Tasks** queue (`202 Queued`) that retries the analysis in the
-  background until the row lands — so a transient Gemini outage can't lose a meal.
+  **Ack-then-analyse:** the request analyses nothing. It archives the photos, hands
+  the meal to a **Cloud Tasks** queue and returns `202` in a couple of seconds —
+  the phone's Shortcut fails the whole log if the call is slow, and the model worth
+  waiting for is the one most likely to be overloaded. The queue's retry window is
+  then spent being patient (see `/process`), so a Gemini outage can neither lose a
+  meal nor time the phone out. The trade-off: the reply is an acknowledgement, not
+  the macros — read those back from the sheet or the iOS app.
 
-- `POST /process` — internal Cloud Tasks worker: the thorough analysis + row
-  insert. Returns 5xx to trigger a retry; writes an "analysis failed" stub only
-  on the final attempt. Same `X-Auth-Token` gate; not called by the phone.
+- `POST /process` — internal Cloud Tasks worker: **all** analysis + the row insert.
+  Nothing waits on it, so it's stubborn: for the first 6 of the queue's 8 attempts
+  it calls only `gemini-3.5-flash`, retrying it and then returning 5xx so the queue
+  re-runs it after a backoff — ~30 shots at the best model over ~11 minutes before
+  anything weaker may answer. Only on the last 2 attempts does it walk the rest of
+  the chain (a flash-lite row beats a stub), and only on the very last does it
+  write the "analysis failed" stub. Backoff is exponential + jittered and
+  deliberately unhurried: at ~6 calls/min peak it stays clear of the free tier's
+  ~10 RPM, so we don't answer Google's 503s with our own 429s. A **429 is never
+  retried on the same model** — that's our quota, not their capacity. Same
+  `X-Auth-Token` gate; not called by the phone.
 
 - `POST /ingest` — **a bowel-movement note.** A plain text note through the same
   note Shortcut — "fiz cocó", "I just pooped", any phrasing/language — sets
@@ -109,13 +120,24 @@ python -m src.schema_export swift > HealthTypes.swift   # Codable structs, gener
 
 ## Jobs
 
-- **`health-tracker-daily`** (07:00 Europe/Lisbon) — pulls **Fitbit Air
-  biometrics** from the Google Health API (~40 columns/day: sleep stages and
-  efficiency, resting HR, HRV, SpO2, respiration, skin temperature, steps,
-  distance, calories out, active/zone minutes, heart-rate range) and rolls the
-  `meals` tab up into `daily_summary`'s nutrition columns. 07:00 is late enough
-  that last night is scored and synced, and past the 05:00 nutrition cutoff so
-  yesterday can be totalled.
+- **`health-tracker-daily`** — pulls **Fitbit Air biometrics** from the Google
+  Health API (~40 columns/day: sleep stages and efficiency, resting HR, HRV, SpO2,
+  respiration, skin temperature, steps, distance, calories out, active/zone
+  minutes, heart-rate range) and rolls the `meals` tab up into `daily_summary`'s
+  nutrition columns.
+
+  **Triggered by your weigh-in**, not by a clock: the scale screenshot you send on
+  waking proves the night is over, scored and synced. A cron at **11:00
+  Europe/Lisbon** is only a backstop for days you don't weigh in.
+
+  Each block becomes final at a different moment, so a day's row fills in stages:
+
+  | block | final when | on today's row? |
+  |---|---|---|
+  | sleep, recovery | you wake | **yes** (sleep is keyed on the wake-day) |
+  | activity | midnight | no |
+  | nutrition | the 05:00 cutoff | no |
+  | body/weight | the screenshot | yes |
 
 ### What the tracker gives you (and what it can't)
 

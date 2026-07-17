@@ -1,6 +1,6 @@
 """Cloud entry point: refresh the per-day health model.
 
-Each run (Cloud Run Job, triggered ~07:00 Europe/Lisbon):
+Each run (Cloud Run Job):
 
   1. Pulls **Fitbit Air biometrics** from the Google Health API — sleep (stages,
      efficiency, naps kept apart), overnight recovery (resting HR, HRV, SpO2,
@@ -9,8 +9,32 @@ Each run (Cloud Run Job, triggered ~07:00 Europe/Lisbon):
   2. Rolls meals logged in the ``meals`` tab into ``daily_summary`` nutrition
      totals per day; non-food shots and failed analyses are ignored.
 
-07:00 is deliberate: it is after the night has been scored and synced, so the
-night that just ended lands on its own wake-day row the same morning.
+**What triggers a run, and why it is not a clock.** The job is kicked by the
+*weigh-in*: the scale screenshot the user sends on waking (ingest/main.py ->
+_trigger_daily_sync). That screenshot is a semantic "I am awake" event, and it is
+the only reliable one this system gets — which matters because everything here
+keys off the night being over.
+
+This replaced a 07:00 cron whose docstring claimed it ran "after the night has
+been scored and synced". It did not: the user wakes at ~08:30, so 07:00 ran while
+they were still ASLEEP. The night was not over, let alone scored — so every night's
+sleep missed its own row and only appeared ~24 h later, when the next morning's run
+re-rolled it inside HEALTH_RECONCILE_DAYS. Sleep was silently a day late, always.
+
+A cron remains at 11:00 purely as a backstop for days with no weigh-in; by then the
+night has ended and synced regardless. It is idempotent, so on a normal day it is a
+no-op re-roll.
+
+Each family becomes final at a different moment, which is the whole shape of this
+file (see fetch_biometrics and daily_nutrition):
+
+  * sleep + recovery -> final when the user WAKES  -> written to today's row
+  * activity         -> final at MIDNIGHT          -> today is never written
+  * nutrition        -> final at the 05:00 cutoff  -> today is never totalled
+
+So a fresh row grows in three steps: this morning it holds last night's sleep,
+recovery and the weigh-in; tonight's run adds nothing; tomorrow's weigh-in closes
+it with activity and nutrition.
 
 Body composition is **not** collected here. It arrives through the ingest service
 the moment the user screenshots their smart-scale app (see ingest/main.py) and is
@@ -134,14 +158,27 @@ def load_health_credentials() -> Credentials:
     return creds
 
 
-def fetch_biometrics(client: GoogleHealthClient, start: str,
-                     end: str) -> Dict[str, Dict[str, Any]]:
+def fetch_biometrics(client: GoogleHealthClient, start: str, end: str,
+                     activity_end: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
     """Every biometric column for [start, end), as date -> columns.
 
     Sleep and the daily-* summaries come from `list`; movement/energy come from
     `dailyRollUp`, which aggregates server-side over civil days (and is the only
     route to `total-calories`). A data type the tracker never produced just comes
     back empty and its columns stay blank.
+
+    `activity_end` (exclusive; defaults to `end`) bounds the ROLLUP types on their
+    own, because the three families stop changing at different moments and lumping
+    them together is what put a half-day's calories on a day still under way:
+
+      * **sleep** and **recovery** describe the night that just ENDED. They are
+        final the moment the user wakes, so today is fair game — indeed today's row
+        is exactly where they belong (sleep is keyed on the wake day).
+      * **activity** accumulates until midnight. Today's rollup is a *partial* day
+        that looks identical to a finished one — 903 kcal at 11:00 reads like a
+        person who burned 903 kcal all day. Callers pass today here so it is never
+        fetched, matching the rule nutrition already follows: only total a day once
+        it is over.
     """
     sleep_points = client.list_data_points(SLEEP, family="sleep", start=start, end=end)
     recovery_points = {
@@ -149,11 +186,12 @@ def fetch_biometrics(client: GoogleHealthClient, start: str,
                                            start=start, end=end)
         for data_type in DAILY_TYPES
     }
-    first, last = date.fromisoformat(start), date.fromisoformat(end)
+    first = date.fromisoformat(start)
+    last_activity = date.fromisoformat(activity_end or end)
     activity_points = {
-        data_type: client.daily_rollup(data_type, first, last)
+        data_type: client.daily_rollup(data_type, first, last_activity)
         for data_type in ROLLUP_TYPES
-    }
+    } if last_activity > first else {}
     return biometric_days(
         daily_sleep(sleep_points),
         daily_recovery(recovery_points),
@@ -313,10 +351,15 @@ def main() -> None:
     if start:
         try:
             client = GoogleHealthClient(load_health_credentials())
-            # end is exclusive and tomorrow, so today's partial day is included —
-            # steps so far today are real, unlike a partial nutrition total.
-            biometrics = fetch_biometrics(client, start,
-                                          (today + timedelta(days=1)).isoformat())
+            # Two different ends, on purpose (see fetch_biometrics): sleep and
+            # recovery run to tomorrow so the night that just ended lands on TODAY's
+            # row; activity stops at today so a still-running day is never rolled up
+            # as if it were finished.
+            biometrics = fetch_biometrics(
+                client, start,
+                (today + timedelta(days=1)).isoformat(),
+                activity_end=today.isoformat(),
+            )
             bio_note = f"{len(biometrics)} day(s)"
         except Exception as err:
             bio_note = f"FAILED ({err})"
