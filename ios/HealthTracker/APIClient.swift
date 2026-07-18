@@ -52,6 +52,12 @@ struct APIClient {
         return try await get("daily", query: query)
     }
 
+    /// The per-nutrient reference knowledge base (static; fetched once and cached).
+    func nutrients() async throws -> NutrientInfoResponse {
+        if useSampleData { return SampleData.nutrients }
+        return try await get("nutrients", query: [])
+    }
+
     // MARK: - Internals
 
     private func get<T: Decodable>(_ path: String, query: [URLQueryItem]) async throws -> T {

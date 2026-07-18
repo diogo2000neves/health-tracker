@@ -1399,3 +1399,56 @@ def test_today_meals_carry_per_item_nutrients_for_drilldown(monkeypatch):
     assert {i["name"] for i in lunch["items"]} == {"chicken", "rice"}
     chicken = next(i for i in lunch["items"] if i["name"] == "chicken")
     assert chicken["nutrients"]["zinc_mg"] == 3.0    # the drill-down source
+
+
+# -- GET /nutrients (the per-nutrient reference knowledge base) -----------------
+# Allowed fields on a nutrient row — the app relies on exactly these, so a stray
+# key in nutrient_info.json (a typo while populating from the PDF) must fail here
+# rather than silently not render.
+_INFO_FIELDS = {"summary", "roles", "goal_relevance", "optimal_range", "upper_limit",
+                "food_sources", "deficiency", "excess", "tips", "fact", "sections",
+                "references"}
+# A food source is a structured object (for the future meal-recommendation feature).
+_FOOD_SOURCE_FIELDS = {"food", "amount", "unit", "per", "note"}
+
+
+def test_nutrients_requires_the_token():
+    assert ingest.app.test_client().get("/nutrients").status_code == 401
+
+
+def test_nutrients_returns_info_keyed_by_known_nutrients(monkeypatch):
+    monkeypatch.setenv("INGEST_TOKEN", "t")
+    body = ingest.app.test_client().get("/nutrients", headers=_HDR).get_json()
+    assert "nutrients" in body and isinstance(body["nutrients"], dict)
+    # every row's key is a real nutrient (guards a typo in the JSON)
+    for key in body["nutrients"]:
+        assert key in ingest.NUTRIENT_KEYS, f"unknown nutrient key {key!r}"
+    # and every populated field is one the app knows how to render
+    for key, entry in body["nutrients"].items():
+        assert set(entry).issubset(_INFO_FIELDS), \
+            f"{key} has unknown field(s) {set(entry) - _INFO_FIELDS}"
+        # food sources are structured objects (food + amount), for future features
+        for source in entry.get("food_sources", []):
+            assert isinstance(source, dict) and "food" in source and "amount" in source
+            assert set(source).issubset(_FOOD_SOURCE_FIELDS), \
+                f"{key} food source has unknown field(s) {set(source) - _FOOD_SOURCE_FIELDS}"
+
+
+def test_nutrients_example_rows_are_populated(monkeypatch):
+    # nutrients the reference PDFs cover in depth — the UI must have rich content and
+    # the numeric recommendation values (optimal range, upper limit) the user cares about.
+    monkeypatch.setenv("INGEST_TOKEN", "t")
+    rows = ingest.app.test_client().get("/nutrients", headers=_HDR).get_json()["nutrients"]
+    for key in ("iron_mg", "magnesium_mg", "zinc_mg", "vitamin_b12_ug", "omega3_g"):
+        entry = rows[key]
+        assert entry["summary"]                       # non-empty text
+        assert entry["roles"] and isinstance(entry["roles"], list)
+        assert entry["optimal_range"] and entry["upper_limit"]
+        assert entry["food_sources"] and entry["food_sources"][0]["amount"] > 0
+
+
+def test_nutrient_info_covers_every_nutrient_as_a_fillable_row():
+    # the table is laid out with a row for EVERY nutrient, so populating from the
+    # PDF is only ever filling blanks — never adding rows.
+    info = ingest._nutrient_info()
+    assert set(info["nutrients"]) == set(ingest.NUTRIENT_KEYS)

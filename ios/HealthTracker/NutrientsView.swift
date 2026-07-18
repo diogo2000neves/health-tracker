@@ -14,6 +14,8 @@ import SwiftUI
 
 struct NutrientsView: View {
     let store: TodayStore
+    @State private var info = InfoStore()
+    @State private var selected: NutrientDef?
 
     var body: some View {
         NavigationStack {
@@ -31,6 +33,7 @@ struct NutrientsView: View {
             .navigationTitle("Nutrientes")
         }
         .task { await store.load() }
+        .task { await info.loadIfNeeded() }
     }
 
     @ViewBuilder
@@ -39,12 +42,15 @@ struct NutrientsView: View {
             VStack(spacing: 16) {
                 NutrientSummaryCard(response: r)
                 ForEach(NutrientGroup.allCases) { group in
-                    NutrientGroupCard(group: group, response: r)
+                    NutrientGroupCard(group: group, response: r) { selected = $0 }
                 }
             }
             .padding(16)
         }
         .refreshable { await store.load() }
+        .sheet(item: $selected) { def in
+            NutrientDetailSheet(def: def, response: r, info: info)
+        }
     }
 }
 
@@ -109,7 +115,7 @@ private struct NutrientSummaryCard: View {
 private struct NutrientGroupCard: View {
     let group: NutrientGroup
     let response: TodayResponse
-    @State private var selected: NutrientDef?
+    let onSelect: (NutrientDef) -> Void
 
     var body: some View {
         let defs = NutrientCatalog.defs(group)
@@ -119,14 +125,11 @@ private struct NutrientGroupCard: View {
                 ForEach(defs) { def in
                     NutrientRow(def: def, response: response)
                         .contentShape(Rectangle())
-                        .onTapGesture { selected = def }
+                        .onTapGesture { onSelect(def) }
                 }
             }
         }
         .card()
-        .sheet(item: $selected) { def in
-            NutrientDetailSheet(def: def, response: response)
-        }
     }
 }
 
@@ -210,6 +213,7 @@ private struct NutrientRow: View {
 private struct NutrientDetailSheet: View {
     let def: NutrientDef
     let response: TodayResponse
+    let info: InfoStore
     @Environment(\.dismiss) private var dismiss
 
     private struct Contributor: Identifiable {
@@ -224,6 +228,7 @@ private struct NutrientDetailSheet: View {
         let total = contributors.reduce(0) { $0 + $1.amount }
         let maxAmount = contributors.map(\.amount).max() ?? 0
         let target = response.targets[def.key]
+        let write = info.info(for: def.key)
 
         NavigationStack {
             List {
@@ -252,6 +257,22 @@ private struct NutrientDetailSheet: View {
                                           fill: Palette.accent, height: 6)
                             }
                             .padding(.vertical, 2)
+                        }
+                    }
+                }
+                // The "show more" the user asked for: only appears once there's a
+                // write-up for this nutrient (otherwise no dead-end).
+                if let write {
+                    Section {
+                        NavigationLink {
+                            NutrientInfoView(def: def, response: response, info: write)
+                        } label: {
+                            Label("Saber mais sobre \(def.label)", systemImage: "book.pages")
+                                .font(.subheadline.weight(.medium))
+                        }
+                    } footer: {
+                        if let summary = write.summary, !summary.isEmpty {
+                            Text(summary)
                         }
                     }
                 }
@@ -310,5 +331,227 @@ private struct NutrientDetailSheet: View {
             }
         }
         return out.sorted { $0.amount > $1.amount }
+    }
+}
+
+// MARK: - Deep info: the per-nutrient reference screen
+
+/// The clean, sectioned write-up for one nutrient. Renders only the sections that
+/// have content, so a sparsely-filled entry still looks intentional. Pushed from
+/// the tap-popup's "Saber mais" link.
+private struct NutrientInfoView: View {
+    let def: NutrientDef
+    let response: TodayResponse
+    let info: NutrientInfo
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                if let summary = info.summary, !summary.isEmpty {
+                    Text(summary)
+                        .font(.body)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .card()
+                }
+
+                todayRecap
+                recommendationCard
+
+                bulletsCard("Funções", "bolt.heart.fill", Palette.accent, info.roles)
+
+                textCard("Para o teu objetivo", "figure.strengthtraining.traditional",
+                         Palette.muscle, info.goalRelevance)
+
+                if let foods = info.foodSources, !foods.isEmpty {
+                    InfoCard(title: "Fontes alimentares", systemImage: "carrot.fill",
+                             accent: Palette.good) {
+                        VStack(spacing: 10) {
+                            ForEach(Array(foods.enumerated()), id: \.element.id) { index, food in
+                                VStack(spacing: 6) {
+                                    HStack(alignment: .firstTextBaseline) {
+                                        Text(food.food).font(.subheadline)
+                                        Spacer(minLength: 8)
+                                        Text(food.amountText)
+                                            .font(.subheadline.weight(.semibold).monospacedDigit())
+                                            .foregroundStyle(Palette.goodText)
+                                    }
+                                    if let note = food.note, !note.isEmpty {
+                                        Text(note)
+                                            .font(.caption).foregroundStyle(.secondary)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                }
+                                if index < foods.count - 1 { Divider() }
+                            }
+                        }
+                    }
+                }
+
+                textCard("Se faltar", "arrow.down.circle.fill", Palette.warning, info.deficiency)
+
+                if hasExcess {
+                    InfoCard(title: "Se em excesso", systemImage: "exclamationmark.triangle.fill",
+                             accent: Palette.critical) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            if let excess = info.excess, !excess.isEmpty {
+                                Text(excess).font(.body)
+                            }
+                            if let ul = info.upperLimit, !ul.isEmpty {
+                                Label(ul, systemImage: "gauge.with.dots.needle.67percent")
+                                    .font(.subheadline).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+
+                bulletsCard("Dicas", "lightbulb.fill", Palette.accent, info.tips)
+
+                if let fact = info.fact, !fact.isEmpty {
+                    Label {
+                        Text(fact).font(.subheadline)
+                    } icon: {
+                        Image(systemName: "sparkles").foregroundStyle(Palette.warning)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(16)
+                    .background(Palette.warning.opacity(0.12),
+                                in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                }
+
+                if let sections = info.sections {
+                    ForEach(sections) { section in
+                        InfoCard(title: section.title, systemImage: "text.alignleft",
+                                 accent: .secondary) {
+                            Text(section.body).font(.body)
+                        }
+                    }
+                }
+
+                if let refs = info.references, !refs.isEmpty {
+                    Text("Fontes: " + refs.joined(separator: " · "))
+                        .font(.caption2).foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 4)
+                }
+            }
+            .padding(16)
+        }
+        .background(Palette.screen)
+        .navigationTitle(def.label)
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private var hasExcess: Bool {
+        !(info.excess ?? "").isEmpty || !(info.upperLimit ?? "").isEmpty
+    }
+
+    /// A slim "your intake today" strip, so the education is grounded in real data.
+    @ViewBuilder
+    private var todayRecap: some View {
+        let consumed = response.consumed(def.key)
+        if let target = response.targets[def.key] {
+            let status = MetricStatus.of(target, consumed: consumed)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Hoje").font(.subheadline).foregroundStyle(.secondary)
+                    Spacer()
+                    Text(def.amount(consumed))
+                        .font(.subheadline.weight(.semibold).monospacedDigit())
+                        .foregroundStyle(status.text)
+                    Text(target.kind == Target.Kind.limit
+                         ? "máx \(def.amount(target.ceiling ?? 0))"
+                         : "de \(def.amount(target.floor ?? target.goal))")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                TargetBar(fraction: status.fraction, fill: status.fill, height: 8)
+            }
+            .card()
+        }
+    }
+
+    /// The daily reference values: RDA (the target floor), the optimal range, and
+    /// the upper limit — the numbers to keep front-and-centre.
+    @ViewBuilder
+    private var recommendationCard: some View {
+        let target = response.targets[def.key]
+        let rda: String? = {
+            guard let target, target.kind != Target.Kind.limit, let floor = target.floor
+            else { return nil }
+            return def.amount(floor)
+        }()
+        let hasAny = rda != nil
+            || !(info.optimalRange ?? "").isEmpty
+            || !(info.upperLimit ?? "").isEmpty
+        if hasAny {
+            InfoCard(title: "Recomendação diária", systemImage: "ruler.fill",
+                     accent: Palette.accent) {
+                VStack(spacing: 10) {
+                    if let rda { valueRow("Recomendado", rda) }
+                    if let optimal = info.optimalRange, !optimal.isEmpty {
+                        valueRow("Ótimo", optimal, highlight: true)
+                    }
+                    if let ul = info.upperLimit, !ul.isEmpty {
+                        valueRow("Limite máximo", ul)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func valueRow(_ label: String, _ value: String, highlight: Bool = false) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(label).font(.subheadline).foregroundStyle(.secondary)
+            Spacer(minLength: 12)
+            Text(value)
+                .font(.subheadline.weight(highlight ? .semibold : .regular).monospacedDigit())
+                .foregroundStyle(highlight ? Palette.accentText : .primary)
+                .multilineTextAlignment(.trailing)
+        }
+    }
+
+    @ViewBuilder
+    private func textCard(_ title: String, _ symbol: String, _ accent: Color,
+                          _ text: String?) -> some View {
+        if let text, !text.isEmpty {
+            InfoCard(title: title, systemImage: symbol, accent: accent) {
+                Text(text).font(.body)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func bulletsCard(_ title: String, _ symbol: String, _ accent: Color,
+                             _ items: [String]?) -> some View {
+        if let items, !items.isEmpty {
+            InfoCard(title: title, systemImage: symbol, accent: accent) {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(items, id: \.self) { item in
+                        HStack(alignment: .top, spacing: 10) {
+                            Circle().fill(accent).frame(width: 6, height: 6).padding(.top, 7)
+                            Text(item).font(.body)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A titled card used throughout the nutrient detail screen.
+private struct InfoCard<Content: View>: View {
+    let title: String
+    let systemImage: String
+    var accent: Color = .secondary
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SectionHeader(title: title, systemImage: systemImage, accent: accent)
+            content
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .card()
     }
 }

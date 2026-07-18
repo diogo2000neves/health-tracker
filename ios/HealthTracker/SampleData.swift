@@ -18,6 +18,62 @@ import Foundation
 enum SampleData {
     static let today: TodayResponse = decode(TodayResponse.self, from: todayJSON())
     static let daily: DailyResponse = decode(DailyResponse.self, from: dailyJSON())
+    static let nutrients: NutrientInfoResponse = decode(NutrientInfoResponse.self,
+                                                        from: nutrientsJSON())
+
+    // MARK: - /nutrients (a few populated examples; the rest render "em breve")
+
+    private static func nutrientsJSON() -> [String: Any] {
+        func src(_ food: String, _ amount: Double, _ unit: String, _ note: String = "") -> [String: Any] {
+            var d: [String: Any] = ["food": food, "amount": amount, "unit": unit, "per": "100 g"]
+            if !note.isEmpty { d["note"] = note }
+            return d
+        }
+        return [
+            "version": 2,
+            "nutrients": [
+                "iron_mg": [
+                    "summary": "Mineral vestigial que transporta oxigénio no sangue (hemoglobina) e nos músculos (mioglobina) e alimenta a produção de energia.",
+                    "roles": ["Transporte de oxigénio no sangue e músculos", "Produção de energia na mitocôndria", "Síntese de ADN e de neurotransmissores"],
+                    "goal_relevance": "O homem não tem forma de eliminar ferro a mais — a acumulação é um risco maior do que a falta. Ferro baixo faz os treinos parecerem mais duros. Não suplementes sem análises.",
+                    "optimal_range": "8–10 mg/dia (só da comida)",
+                    "upper_limit": "45 mg/dia",
+                    "food_sources": [src("Fígado de vaca", 6.5, "mg", "heme, 15–35% absorvido"), src("Ostras cozidas", 8, "mg", "heme"), src("Carne de vaca magra", 2.6, "mg", "heme"), src("Lentilhas cozidas", 3.3, "mg", "não-heme, 2–10%"), src("Espinafres cozidos", 3.6, "mg", "só ~2%")],
+                    "deficiency": "Cansaço, falta de ar no esforço, mãos frias, pernas inquietas e recuperação fraca; avançada: anemia.",
+                    "excess": "O ferro livre gera radicais e deposita-se no fígado, pâncreas e coração.",
+                    "tips": ["A vitamina C aumenta a absorção do ferro vegetal em 200–300%", "Café e chá à refeição reduzem a absorção em 50–70%", "O cálcio inibe a absorção — separa-o"],
+                    "fact": "Um homem adulto tem cerca de 4 g de ferro, a maioria nos glóbulos vermelhos.",
+                    "references": ["National Academies DRI — Iron"],
+                ],
+                "magnesium_mg": [
+                    "summary": "Cofator obrigatório de mais de 600 reações. Estabiliza o ATP, acalma o sistema nervoso e relaxa o músculo.",
+                    "roles": ["Produção de energia (Mg-ATP)", "Relaxamento muscular", "Bloqueio do recetor NMDA — calma e sono", "Saúde óssea"],
+                    "goal_relevance": "O mineral que se 'queima' mais depressa num homem ativo: treino, stress e cafeína aceleram o consumo. A falta subclínica confunde-se com ansiedade ou overtraining.",
+                    "optimal_range": "400–600 mg/dia",
+                    "upper_limit": "350 mg/dia (só de suplementos)",
+                    "food_sources": [src("Sementes de abóbora", 590, "mg"), src("Sementes de cânhamo", 700, "mg"), src("Chocolate preto (85%+)", 230, "mg"), src("Espinafres cozidos", 87, "mg"), src("Feijão preto cozido", 70, "mg")],
+                    "deficiency": "Pálpebra a tremer, cãibras, dores de cabeça, ansiedade, insónia e sensibilidade à cafeína.",
+                    "excess": "Quase impossível pela comida; doses altas de suplementos causam diarreia.",
+                    "tips": ["A B6 aumenta a captação e, juntos, produzem GABA (calma)", "O glicinato é bom para o sono; o malato para a manhã"],
+                    "fact": "Cerca de 60% do magnésio do corpo está guardado nos ossos.",
+                    "references": ["National Academies DRI — Magnesium"],
+                ],
+                "zinc_mg": [
+                    "summary": "Mineral vestigial cofator de mais de 300 enzimas. É o 'mineral masculino' — central para a testosterona e a imunidade.",
+                    "roles": ["Síntese de testosterona", "Cofator de 300+ enzimas e 'dedos de zinco'", "Maturação das células imunitárias", "Cicatrização e paladar"],
+                    "goal_relevance": "Perde-se 1–3 mg por ejaculação e mais no suor — a falta é comum em homens jovens ativos. Baixa de zinco = menos testosterona livre e mais infeções.",
+                    "optimal_range": "15–30 mg/dia",
+                    "upper_limit": "40 mg/dia",
+                    "food_sources": [src("Ostras", 30, "mg", "a maior densidade de zinco"), src("Carne de vaca (acém)", 8.5, "mg"), src("Sementes de abóbora", 7.8, "mg"), src("Peito de frango", 1.0, "mg")],
+                    "deficiency": "Testosterona baixa, menos libido, infeções, acne e perda de paladar/olfato.",
+                    "excess": "Náuseas em jejum; doses altas crónicas provocam falta de cobre.",
+                    "tips": ["Nunca em jejum — toma a meio de uma refeição", "Se tomas 30–50 mg/dia, junta 2–3 mg de cobre"],
+                    "fact": "Mantém uma razão zinco:cobre de ~10:1 a 15:1 para a defesa antioxidante.",
+                    "references": ["National Academies DRI — Zinc"],
+                ],
+            ],
+        ]
+    }
 
     // MARK: - /today
 

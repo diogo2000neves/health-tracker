@@ -2718,3 +2718,37 @@ def today():
         "basis": basis,
         "meals": meals_out,
     }), 200
+
+
+# The static per-nutrient reference knowledge base (what each vitamin/mineral does,
+# food sources, deficiency/excess, tips). It is REFERENCE content, identical for
+# every user — so it lives in the repo (version-controlled, reviewable) next to this
+# module and is served verbatim, rather than in the user's data sheet. One row per
+# nutrient keyed by NUTRIENT_KEYS; the app renders only the fields that are filled.
+NUTRIENT_INFO_FILE = os.path.join(os.path.dirname(__file__), "nutrient_info.json")
+
+
+@functools.lru_cache(maxsize=1)
+def _nutrient_info() -> Dict[str, Any]:
+    """Load and cache the nutrient knowledge base. Never fatal: a missing/invalid
+    file just means the app shows 'em breve' for every nutrient."""
+    try:
+        with open(NUTRIENT_INFO_FILE, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        app.logger.exception("nutrient_info.json missing or invalid")
+        return {"version": 0, "nutrients": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("nutrients"), dict):
+        app.logger.warning("nutrient_info.json has no nutrients map")
+        return {"version": 0, "nutrients": {}}
+    return data
+
+
+@app.get("/nutrients")
+def nutrients():
+    """The per-nutrient reference knowledge base for the deep-info screen. Static
+    across users and days, so a client fetches it once and caches it. Same auth as
+    everything else."""
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    return jsonify(_nutrient_info()), 200

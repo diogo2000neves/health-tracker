@@ -1,0 +1,1704 @@
+{
+  "version": 2,
+  "_schema": {
+    "note": "One row per nutrient (key matches the backend NUTRIENT_KEYS). The app renders only non-empty fields; an all-empty row shows 'em breve'. Content is pt-PT, framed for a 25-year-old active male, distilled from reference deep-dive PDFs.",
+    "fields": {
+      "summary": "string — what it is, 1-2 sentences",
+      "roles": "list of str — key functions in the body",
+      "goal_relevance": "string — why it matters for muscle / training / recovery",
+      "optimal_range": "string — the functional/optimal daily range",
+      "upper_limit": "string — tolerable upper intake level (UL)",
+      "food_sources": "list of {food, amount, unit, per, note?} — richest sources with amounts (for future meal recommendations)",
+      "deficiency": "string — signs/effects of too little",
+      "excess": "string — signs/effects of too much",
+      "tips": "list of str — absorption / synergy / timing tips",
+      "fact": "string — a light, engaging fact",
+      "sections": "list of {title, body} — any extra content",
+      "references": "list of str — citations / sources"
+    }
+  },
+  "nutrients": {
+    "fiber_g": {
+      "summary": "",
+      "roles": [],
+      "goal_relevance": "",
+      "optimal_range": "",
+      "upper_limit": "",
+      "food_sources": [],
+      "deficiency": "",
+      "excess": "",
+      "tips": [],
+      "fact": "",
+      "sections": [],
+      "references": []
+    },
+    "sugar_g": {
+      "summary": "",
+      "roles": [],
+      "goal_relevance": "",
+      "optimal_range": "",
+      "upper_limit": "",
+      "food_sources": [],
+      "deficiency": "",
+      "excess": "",
+      "tips": [],
+      "fact": "",
+      "sections": [],
+      "references": []
+    },
+    "added_sugar_g": {
+      "summary": "",
+      "roles": [],
+      "goal_relevance": "",
+      "optimal_range": "",
+      "upper_limit": "",
+      "food_sources": [],
+      "deficiency": "",
+      "excess": "",
+      "tips": [],
+      "fact": "",
+      "sections": [],
+      "references": []
+    },
+    "saturated_fat_g": {
+      "summary": "",
+      "roles": [],
+      "goal_relevance": "",
+      "optimal_range": "",
+      "upper_limit": "",
+      "food_sources": [],
+      "deficiency": "",
+      "excess": "",
+      "tips": [],
+      "fact": "",
+      "sections": [],
+      "references": []
+    },
+    "monounsaturated_fat_g": {
+      "summary": "Gorduras com uma só ligação dupla (ácido oleico, ómega-9). Estáveis e o alicerce ideal das calorias de gordura diárias.",
+      "roles": [
+        "Saúde cardiovascular (a base da dieta mediterrânica)",
+        "Protege da resistência à insulina",
+        "Suporta a produção de testosterona (sinalização da LH)"
+      ],
+      "goal_relevance": "Devem ser o grosso da tua gordura diária: estáveis ao calor, protegem o coração e uma dieta rica em MUFA favorece a produção de androgénios no homem.",
+      "optimal_range": "~15–20% das calorias (≈40–60 g/dia)",
+      "upper_limit": "Sem limite (parte saudável do total de gordura, 25–35% das calorias)",
+      "food_sources": [
+        {
+          "food": "Azeite virgem extra",
+          "amount": 73,
+          "unit": "g",
+          "per": "100 g",
+          "note": "muito estável ao calor (polifenóis)"
+        },
+        {
+          "food": "Nozes-macadâmia",
+          "amount": 59,
+          "unit": "g",
+          "per": "100 g"
+        },
+        {
+          "food": "Amêndoas",
+          "amount": 32,
+          "unit": "g",
+          "per": "100 g"
+        },
+        {
+          "food": "Abacate",
+          "amount": 10,
+          "unit": "g",
+          "per": "100 g"
+        }
+      ],
+      "deficiency": "Não é essencial, mas uma dieta pobre em MUFA perde o principal fator protetor cardiovascular e metabólico.",
+      "excess": "Muito estáveis e seguras; contam para o total de gordura (25–35% das calorias).",
+      "tips": [
+        "O azeite virgem extra tem ponto de fumo alto (~210 °C) — bom para cozinhar",
+        "É a gordura ideal para a base calórica do dia",
+        "Come gordura para absorver as vitaminas A, D, E e K"
+      ],
+      "fact": "O azeite virgem extra é ~73% gordura monoinsaturada e mantém-se estável ao cozinhar graças aos polifenóis.",
+      "sections": [],
+      "references": [
+        "Fat/Fibre reference report (2026)"
+      ]
+    },
+    "polyunsaturated_fat_g": {
+      "summary": "Gorduras com duas ou mais ligações duplas (ómega-3 e ómega-6). Essenciais, mas quimicamente instáveis e sensíveis ao calor.",
+      "roles": [
+        "Estrutura das membranas e sinalização celular",
+        "Precursoras dos eicosanoides (ómega-3 e ómega-6)",
+        "Função cerebral e cardiovascular"
+      ],
+      "goal_relevance": "O que importa é a QUALIDADE e o equilíbrio: privilegia o ómega-3 (peixe) e limita o ómega-6 dos óleos de sementes. Nunca as aqueças muito — oxidam com facilidade.",
+      "optimal_range": "Equilíbrio ómega-6:ómega-3 ≤ 3:1 (parte do total de gordura)",
+      "upper_limit": "Sem limite formal (o risco é a oxidação, não a quantidade)",
+      "food_sources": [
+        {
+          "food": "Nozes",
+          "amount": 47,
+          "unit": "g",
+          "per": "100 g"
+        },
+        {
+          "food": "Sementes de girassol",
+          "amount": 23,
+          "unit": "g",
+          "per": "100 g"
+        },
+        {
+          "food": "Peixe gordo (salmão, cavala)",
+          "amount": 4,
+          "unit": "g",
+          "per": "100 g",
+          "note": "rico em ómega-3 EPA/DHA"
+        },
+        {
+          "food": "Linhaça",
+          "amount": 39,
+          "unit": "g",
+          "per": "100 g",
+          "note": "rica em ALA"
+        }
+      ],
+      "deficiency": "Rara: idêntica à falta de ácidos gordos essenciais (pele, cicatrização, cognição).",
+      "excess": "Consumir muitas PUFA (sobretudo aquecidas/rançosas) gera peroxidação lipídica e radicais livres que danificam as artérias.",
+      "tips": [
+        "Nunca uses óleos poli-insaturados para fritar — oxidam e tornam-se tóxicos",
+        "A vitamina E protege as PUFA das células da oxidação",
+        "Guarda óleos e sementes ao abrigo da luz e do calor"
+      ],
+      "fact": "As múltiplas ligações duplas das PUFA tornam-nas voláteis — por isso nunca devem ir a alta temperatura.",
+      "sections": [],
+      "references": [
+        "Fat/Fibre reference report (2026)"
+      ]
+    },
+    "trans_fat_g": {
+      "summary": "",
+      "roles": [],
+      "goal_relevance": "",
+      "optimal_range": "",
+      "upper_limit": "",
+      "food_sources": [],
+      "deficiency": "",
+      "excess": "",
+      "tips": [],
+      "fact": "",
+      "sections": [],
+      "references": []
+    },
+    "omega3_g": {
+      "summary": "Família de gorduras poli-insaturadas essenciais: ALA (vegetal) e EPA/DHA (marinho). Anti-inflamatórias e estruturais do cérebro.",
+      "roles": [
+        "Fluidez das membranas (o DHA no cérebro e retina)",
+        "Produz eicosanoides anti-inflamatórios (resolvem a inflamação)",
+        "Baixa a inflamação induzida pelo exercício",
+        "Função cognitiva e cardiovascular"
+      ],
+      "goal_relevance": "Atenua a inflamação e as dores musculares (DOMS) do treino e protege o coração e o cérebro. O objetivo prático é empurrar a razão ómega-6:ómega-3 para ~3:1 (a dieta ocidental está em 15–20:1).",
+      "optimal_range": "ALA 1,6 g/dia (AI) · EPA+DHA 1000–2000 mg/dia (ótimo)",
+      "upper_limit": "Sem limite formal (doses muito altas fluidificam o sangue)",
+      "food_sources": [
+        {
+          "food": "Cavala",
+          "amount": 5.1,
+          "unit": "g",
+          "per": "100 g",
+          "note": "EPA/DHA diretos"
+        },
+        {
+          "food": "Linhaça",
+          "amount": 22,
+          "unit": "g",
+          "per": "100 g",
+          "note": "só ALA — conversão fraca no homem"
+        },
+        {
+          "food": "Chia",
+          "amount": 17,
+          "unit": "g",
+          "per": "100 g",
+          "note": "só ALA"
+        },
+        {
+          "food": "Salmão selvagem",
+          "amount": 2.2,
+          "unit": "g",
+          "per": "100 g",
+          "note": "EPA/DHA diretos"
+        },
+        {
+          "food": "Sardinhas",
+          "amount": 1.5,
+          "unit": "g",
+          "per": "100 g",
+          "note": "EPA/DHA diretos"
+        },
+        {
+          "food": "Nozes",
+          "amount": 9,
+          "unit": "g",
+          "per": "100 g",
+          "note": "só ALA"
+        }
+      ],
+      "deficiency": "Névoa mental, olhos secos, rigidez articular e pior recuperação; a longo prazo, inflamação crónica de baixo grau.",
+      "excess": "Doses muito altas de EPA/DHA fluidificam o sangue (nódoas negras). Óleos de peixe rançosos (oxidados) são prejudiciais.",
+      "tips": [
+        "O homem converte muito mal ALA→EPA (<5%) e →DHA (<0,5%): não contes só com chia/linhaça",
+        "O excesso de ómega-6 compete pelas mesmas enzimas e piora a conversão",
+        "Toma o suplemento com a maior refeição (a bílis emulsiona-o)",
+        "Prefere a forma triglicérido (TG) e óleo com selo IFOS / TOTOX baixo"
+      ],
+      "fact": "O DHA está tão concentrado no cérebro e na retina que define a fluidez das membranas neuronais.",
+      "sections": [],
+      "references": [
+        "Fat/Fibre reference report (2026)",
+        "National Academies DRI — ALA (AI)"
+      ]
+    },
+    "omega6_g": {
+      "summary": "Família de gorduras poli-insaturadas essenciais (ácido linoleico, LA). Necessárias, mas facílimas de consumir a mais.",
+      "roles": [
+        "Sinalização celular e estrutura das membranas",
+        "Precursor de eicosanoides (inflamatórios — reparação muscular aguda)",
+        "Saúde da pele e barreira cutânea"
+      ],
+      "goal_relevance": "Não é preciso 'atingir' um valor — a dieta moderna dá ómega-6 a mais (óleos de sementes industriais). O importante é a RAZÃO com o ómega-3: idealmente 3:1 ou menos. Restringir óleos de sementes é mais útil do que somar ómega-6.",
+      "optimal_range": "AI 17 g/dia — mas o foco é a razão ómega-6:ómega-3 ≤ 3:1",
+      "upper_limit": "Sem limite formal (o risco é o desequilíbrio, não a quantidade)",
+      "food_sources": [
+        {
+          "food": "Óleos de sementes (soja, milho, girassol)",
+          "amount": 50,
+          "unit": "g",
+          "per": "100 g",
+          "note": "restringir — fonte principal do excesso"
+        },
+        {
+          "food": "Nozes",
+          "amount": 38,
+          "unit": "g",
+          "per": "100 g"
+        },
+        {
+          "food": "Sementes de girassol",
+          "amount": 23,
+          "unit": "g",
+          "per": "100 g"
+        }
+      ],
+      "deficiency": "Muito rara: pele seca e escamosa e má cicatrização (só em carência real de gordura essencial).",
+      "excess": "O excesso crónico (com pouco ómega-3) 'inunda' as enzimas e gera inflamação crónica, aterosclerose e DOMS prolongado.",
+      "tips": [
+        "O valor absoluto importa menos do que a razão com o ómega-3 (≤3:1)",
+        "Corta óleos de sementes industriais e fritos para baixar o ómega-6",
+        "Óleos poli-insaturados nunca devem ser aquecidos a alta temperatura"
+      ],
+      "fact": "A dieta ocidental tem uma razão ómega-6:ómega-3 de 15–20:1; a ancestral era de 1:1 a 3:1.",
+      "sections": [],
+      "references": [
+        "Fat/Fibre reference report (2026)",
+        "National Academies DRI — Linoleic acid (AI)"
+      ]
+    },
+    "sodium_mg": {
+      "summary": "",
+      "roles": [],
+      "goal_relevance": "",
+      "optimal_range": "",
+      "upper_limit": "",
+      "food_sources": [],
+      "deficiency": "",
+      "excess": "",
+      "tips": [],
+      "fact": "",
+      "sections": [],
+      "references": []
+    },
+    "potassium_mg": {
+      "summary": "Principal catião dentro das células e o mineral do 'pump' e da performance: controla o volume dentro do músculo, o glicogénio e a tensão arterial.",
+      "roles": [
+        "Bomba sódio-potássio — potencial elétrico dos nervos e músculos",
+        "Armazenamento de glicogénio no músculo (o 'pump')",
+        "Vasodilatação — baixa a tensão e leva mais oxigénio ao músculo"
+      ],
+      "goal_relevance": "Dietas modernas têm pouco potássio e muito sódio, o que trava a performance, a recuperação e sobe a tensão mesmo em jovens em forma. Escala com os hidratos e com o suor.",
+      "optimal_range": "4000–4700 mg/dia",
+      "upper_limit": "Sem limite alimentar em rins saudáveis (suplementos limitados a 99 mg/comprimido)",
+      "food_sources": [
+        {
+          "food": "Folhas de beterraba cozidas",
+          "amount": 909,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "também ricas em nitratos"
+        },
+        {
+          "food": "Batata assada com casca",
+          "amount": 535,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "a casca é essencial"
+        },
+        {
+          "food": "Salmão",
+          "amount": 490,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Abacate",
+          "amount": 485,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Espinafres crus",
+          "amount": 558,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "não é bloqueado pelos oxalatos"
+        },
+        {
+          "food": "Banana",
+          "amount": 358,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "fonte média — tubérculos e verdes são melhores"
+        }
+      ],
+      "deficiency": "Fadiga precoce no treino, músculos 'lisos' sem pump, cãibras, tensão ligeiramente alta e palpitações; avançada: fraqueza grave e arritmias.",
+      "excess": "Pela comida é praticamente impossível num homem saudável. O perigo (hipercaliemia) vem de doença renal ou de sais de potássio em excesso — pode parar o coração.",
+      "tips": [
+        "Não consegues corrigir potássio sem magnésio suficiente — é pré-requisito",
+        "Comer potássio com hidratos (batata) leva-o para dentro do músculo via insulina",
+        "Sódio a mais e cafeína/álcool (diuréticos) esgotam o potássio",
+        "Ferver os vegetais perde muito potássio — vaporiza ou come crus"
+      ],
+      "fact": "A dieta ancestral tinha uma razão potássio:sódio de ~4:1; a moderna inverteu-a para ~1:3.",
+      "sections": [],
+      "references": [
+        "National Academy of Medicine — Potassium AI (2019)"
+      ]
+    },
+    "calcium_mg": {
+      "summary": "O mineral mais abundante do corpo. Mais de 99% está nos ossos e dentes; o resto controla a contração muscular, os nervos e a coagulação.",
+      "roles": [
+        "Estrutura de ossos e dentes (hidroxiapatite)",
+        "Contração muscular (liga-se à troponina)",
+        "Transmissão nervosa e libertação de neurotransmissores",
+        "Coagulação do sangue (Fator IV)"
+      ],
+      "goal_relevance": "Aos 25 já atingiste o pico de massa óssea — o objetivo passa a ser manter o osso e garantir contrações musculares fortes. Treino intenso com muito suor pode perder até 40 mg/hora, empurrando-te para o topo do intervalo.",
+      "optimal_range": "1000–1200 mg/dia (de preferência da comida)",
+      "upper_limit": "2500 mg/dia",
+      "food_sources": [
+        {
+          "food": "Parmigiano-Reggiano",
+          "amount": 1109,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "~32% absorvido"
+        },
+        {
+          "food": "Sardinhas com espinha",
+          "amount": 382,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "~30% absorvido"
+        },
+        {
+          "food": "Tofu firme (com cálcio)",
+          "amount": 345,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "~31% absorvido"
+        },
+        {
+          "food": "Couve-galega cozida",
+          "amount": 150,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "~50–60% — a melhor absorção"
+        },
+        {
+          "food": "Leite gordo",
+          "amount": 113,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "~32% absorvido"
+        },
+        {
+          "food": "Espinafres cozidos",
+          "amount": 136,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "só ~5% — os oxalatos bloqueiam-no"
+        }
+      ],
+      "deficiency": "O corpo rouba cálcio ao osso para manter o sangue, por isso a falta é silenciosa: cãibras (sobretudo nos gémeos), fasciculações, formigueiro e, a longo prazo, perda óssea precoce (osteopenia).",
+      "excess": "Em excesso (quase sempre de suplementos sem vitamina K2) deposita-se nas artérias em vez do osso — o 'paradoxo do cálcio' — e aumenta o risco de pedras nos rins.",
+      "tips": [
+        "A vitamina D3 é obrigatória: sem ela a absorção cai de ~30% para <10%",
+        "A vitamina K2 encaminha o cálcio para o osso e não para as artérias",
+        "Mais de 300 mg numa refeição bloqueiam a absorção de ferro — separa-os",
+        "O corpo só absorve ~500 mg de uma vez; divide doses grandes"
+      ],
+      "fact": "Um homem adulto guarda 1 a 1,2 kg de cálcio — praticamente tudo no esqueleto.",
+      "sections": [],
+      "references": [
+        "National Academies DRI — Calcium"
+      ]
+    },
+    "iron_mg": {
+      "summary": "Mineral vestigial que transporta oxigénio no sangue (hemoglobina) e nos músculos (mioglobina) e alimenta a produção de energia.",
+      "roles": [
+        "Transporte de oxigénio no sangue e músculos",
+        "Produção de energia na mitocôndria (cadeia de eletrões)",
+        "Síntese de ADN e de neurotransmissores (dopamina, serotonina)",
+        "Função da tiroide e imunitária"
+      ],
+      "goal_relevance": "Ao contrário das mulheres, o homem não tem forma de eliminar ferro a mais — por isso a ACUMULAÇÃO é um risco maior do que a falta. Ferro baixo faz os treinos parecerem mais duros; ferro a mais oxida os tecidos. Não suplementes sem análises.",
+      "optimal_range": "8–10 mg/dia (só da comida)",
+      "upper_limit": "45 mg/dia",
+      "food_sources": [
+        {
+          "food": "Fígado de vaca",
+          "amount": 6.5,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "heme, 15–35% absorvido"
+        },
+        {
+          "food": "Ostras cozidas",
+          "amount": 8,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "heme, 15–35% absorvido"
+        },
+        {
+          "food": "Carne de vaca magra",
+          "amount": 2.6,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "heme, 15–35% absorvido"
+        },
+        {
+          "food": "Lentilhas cozidas",
+          "amount": 3.3,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "não-heme, 2–10% absorvido"
+        },
+        {
+          "food": "Espinafres cozidos",
+          "amount": 3.6,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "não-heme, só ~2%"
+        }
+      ],
+      "deficiency": "Cansaço, falta de ar no esforço, mãos frias, pernas inquietas, recuperação fraca; avançada: anemia (glóbulos pequenos e pálidos). Num homem é sinal de alarme clínico — investigar.",
+      "excess": "O ferro livre gera radicais (reação de Fenton) e deposita-se no fígado, pâncreas e coração. 1 em 250 pessoas do norte da Europa tem hemocromatose genética.",
+      "tips": [
+        "A vitamina C aumenta a absorção do ferro vegetal em 200–300% (50–100 mg à refeição)",
+        "Café e chá à refeição reduzem a absorção em 50–70%",
+        "O cálcio (ex.: leite) inibe a absorção — separa-o do ferro",
+        "O cobre é necessário para o corpo usar o ferro"
+      ],
+      "fact": "Um homem adulto tem cerca de 4 g de ferro, a maioria nos glóbulos vermelhos.",
+      "sections": [],
+      "references": [
+        "National Academies DRI — Iron"
+      ]
+    },
+    "magnesium_mg": {
+      "summary": "Cofator obrigatório de mais de 600 reações. Estabiliza o ATP (energia), acalma o sistema nervoso e relaxa o músculo.",
+      "roles": [
+        "Produção de energia — o ATP só funciona ligado ao magnésio",
+        "Relaxamento muscular (antagoniza o cálcio)",
+        "Bloqueio do recetor NMDA — efeito calmante e de sono",
+        "Saúde óssea e reparação do ADN"
+      ],
+      "goal_relevance": "É o mineral que se 'queima' mais depressa num homem ativo: treino intenso, stress e cafeína aceleram o consumo. A falta subclínica é muito comum e confunde-se com ansiedade ou overtraining. Perde-se pelo suor.",
+      "optimal_range": "400–600 mg/dia",
+      "upper_limit": "350 mg/dia (apenas de suplementos; sem limite para o magnésio dos alimentos)",
+      "food_sources": [
+        {
+          "food": "Sementes de abóbora",
+          "amount": 590,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "tostar/demolhar reduz fitatos"
+        },
+        {
+          "food": "Sementes de cânhamo",
+          "amount": 700,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Chocolate preto (85%+)",
+          "amount": 230,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "rico em polifenóis"
+        },
+        {
+          "food": "Espinafres cozidos",
+          "amount": 87,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Feijão preto cozido",
+          "amount": 70,
+          "unit": "mg",
+          "per": "100 g"
+        }
+      ],
+      "deficiency": "Pálpebra a tremer, cãibras nos gémeos, dores de cabeça de tensão, ansiedade, insónia (acordar a meio da noite) e sensibilidade à cafeína; avançada: arritmias e resistência à insulina.",
+      "excess": "Quase impossível pela comida — os rins saudáveis eliminam o excesso. Doses altas de suplementos puxam água para o cólon e causam diarreia.",
+      "tips": [
+        "A vitamina B6 aumenta a captação celular e, juntos, produzem GABA (calma)",
+        "A vitamina D precisa de magnésio para ser ativada",
+        "O glicinato é suave para o estômago e bom para o sono; o malato para a manhã/energia",
+        "Doses altas de cálcio ou de zinco competem com a absorção"
+      ],
+      "fact": "Cerca de 60% do magnésio do corpo está guardado nos ossos; processar uma molécula de glucose gasta 28 de magnésio.",
+      "sections": [],
+      "references": [
+        "National Academies DRI — Magnesium"
+      ]
+    },
+    "zinc_mg": {
+      "summary": "Mineral vestigial cofator de mais de 300 enzimas. É o 'mineral masculino' — central para a testosterona, a imunidade e a reparação.",
+      "roles": [
+        "Síntese de testosterona (células de Leydig; inibe a aromatase)",
+        "Cofator de 300+ enzimas e de 'dedos de zinco' que regulam o ADN",
+        "Maturação das células imunitárias (linfócitos T)",
+        "Cicatrização e paladar/olfato"
+      ],
+      "goal_relevance": "Perde-se 1–3 mg por ejaculação (até 30% da dose diária) e mais ainda no suor — por isso a falta subclínica é muito comum em homens jovens ativos. Baixa de zinco = menos testosterona livre, menos libido e mais infeções.",
+      "optimal_range": "15–30 mg/dia",
+      "upper_limit": "40 mg/dia",
+      "food_sources": [
+        {
+          "food": "Ostras",
+          "amount": 30,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "a maior densidade de zinco de todos os alimentos"
+        },
+        {
+          "food": "Carne de vaca (acém)",
+          "amount": 8.5,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "rica em histidina/metionina que ajudam a absorção"
+        },
+        {
+          "food": "Sementes de abóbora",
+          "amount": 7.8,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "fitatos limitam a absorção"
+        },
+        {
+          "food": "Lentilhas cozidas",
+          "amount": 1.3,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "fitatos bloqueiam bastante"
+        },
+        {
+          "food": "Peito de frango",
+          "amount": 1.0,
+          "unit": "mg",
+          "per": "100 g"
+        }
+      ],
+      "deficiency": "Testosterona livre baixa, menos libido, infeções frequentes, acne, perda de paladar/olfato; avançada: queda de cabelo, manchas brancas nas unhas, cicatrização lenta.",
+      "excess": "Náuseas se tomado em jejum. Doses crónicas altas provocam falta de cobre (a metalotioneína prende o cobre) → anemia e neuropatia.",
+      "tips": [
+        "Nunca em jejum — toma a meio de uma refeição",
+        "Se tomas 30–50 mg/dia, acrescenta 2–3 mg de cobre para não induzir carência",
+        "A vitamina A precisa de zinco para ser transportada",
+        "Separa do ferro e do cálcio (leite) por competição"
+      ],
+      "fact": "Manter uma razão zinco:cobre de ~10:1 a 15:1 é essencial para a defesa antioxidante (enzima SOD).",
+      "sections": [],
+      "references": [
+        "National Academies DRI — Zinc"
+      ]
+    },
+    "phosphorus_mg": {
+      "summary": "Segundo mineral mais abundante. Forma os ossos, o ATP e a espinha do ADN. O problema moderno é o excesso, não a falta.",
+      "roles": [
+        "Energia celular — ligações do ATP e da creatina-fosfato",
+        "Estrutura dos ossos (hidroxiapatite) e das membranas celulares",
+        "Espinha de açúcar-fosfato do ADN e do ARN",
+        "Ativação de proteínas (fosforilação) e equilíbrio ácido-base"
+      ],
+      "goal_relevance": "Uma dieta rica em proteína já dá 1500+ mg/dia com facilidade. O risco é o fósforo inorgânico escondido em refrigerantes e processados, que desregula a razão cálcio:fósforo (ideal ~1:1) e acelera a calcificação vascular.",
+      "optimal_range": "700–1200 mg/dia (razão cálcio:fósforo ~1:1)",
+      "upper_limit": "4000 mg/dia",
+      "food_sources": [
+        {
+          "food": "Salmão",
+          "amount": 252,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "orgânico, 70–80% absorvido"
+        },
+        {
+          "food": "Costeletas de porco",
+          "amount": 230,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "orgânico, 70–80%"
+        },
+        {
+          "food": "Sementes de abóbora",
+          "amount": 1233,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "fítico, <50% absorvido"
+        },
+        {
+          "food": "Lentilhas cozidas",
+          "amount": 180,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "fítico, <50%"
+        },
+        {
+          "food": "Refrigerantes de cola",
+          "amount": 18,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "inorgânico, >90% — evitar"
+        }
+      ],
+      "deficiency": "Muito rara (alcoolismo, síndrome de realimentação): falência energética celular, fraqueza muscular grave e problemas respiratórios.",
+      "excess": "Fósforo alto crónico liga-se ao cálcio e deposita-se nas artérias e rins, e força a saída de cálcio do osso (osteopenia precoce). O FGF23 elevado é marcador de doença cardíaca.",
+      "tips": [
+        "A vitamina D3 aumenta a absorção do fósforo",
+        "Evita aditivos de fosfato (E338–E341/E450–E452) em refrigerantes e processados",
+        "O fósforo de plantas (fítico) absorve-se mal — o de carne/peixe muito melhor"
+      ],
+      "fact": "Cerca de 85% do fósforo do corpo está trancado no esqueleto.",
+      "sections": [],
+      "references": [
+        "National Academies DRI — Phosphorus"
+      ]
+    },
+    "copper_mg": {
+      "summary": "Mineral vestigial que ativa enzimas da energia, do tecido conjuntivo e dos neurotransmissores. É o mais 'sacrificado' quando se abusa do zinco.",
+      "roles": [
+        "Produção de energia (citocromo c oxidase, Complexo IV)",
+        "Mobilização do ferro (ceruloplasmina, hefaestina)",
+        "Ligação cruzada do colagénio e da elastina (lisil oxidase)",
+        "Defesa antioxidante (Cu/Zn SOD) e dopamina→noradrenalina"
+      ],
+      "goal_relevance": "Suplementar zinco em dose alta para a testosterona rouba cobre ao corpo. Fadiga inexplicada, articulações a degradar e anemia que não responde ao ferro são muitas vezes falta de cobre por uma razão zinco:cobre estragada.",
+      "optimal_range": "1,5–3,0 mg/dia",
+      "upper_limit": "10 mg/dia",
+      "food_sources": [
+        {
+          "food": "Fígado de vaca",
+          "amount": 9.8,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "cobre biodisponível com ferro e vitamina A"
+        },
+        {
+          "food": "Cogumelos shiitake secos",
+          "amount": 5.1,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Ostras cruas",
+          "amount": 4.5,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Cajus",
+          "amount": 2.2,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "fitatos limitam"
+        },
+        {
+          "food": "Chocolate preto (85%+)",
+          "amount": 1.8,
+          "unit": "mg",
+          "per": "100 g"
+        }
+      ],
+      "deficiency": "Cabelos a embranquecer cedo, dores articulares, e — avançada — anemia sideroblástica (parece falta de ferro mas não responde ao ferro) e problemas neurológicos que imitam a falta de B12.",
+      "excess": "Raro pela dieta (o fígado elimina o excesso na bílis). A doença de Wilson (genética) acumula cobre no fígado e cérebro.",
+      "tips": [
+        "Se suplementas zinco, toma 1 mg de cobre por cada 10–15 mg de zinco",
+        "Nunca tomes cobre e zinco ao mesmo tempo — competem pelo mesmo transportador",
+        "Doses muito altas de vitamina C (>1000 mg) reduzem o transporte de cobre"
+      ],
+      "fact": "Repor o cobre cura muitas vezes anemias por ferro que não respondiam a suplementos de ferro.",
+      "sections": [],
+      "references": [
+        "National Academies DRI — Copper"
+      ]
+    },
+    "manganese_mg": {
+      "summary": "Mineral vestigial no fio da navalha: essencial para a mitocôndria e para tendões e ligamentos, mas neurotóxico em excesso.",
+      "roles": [
+        "Defesa antioxidante da mitocôndria (Mn-SOD / SOD2)",
+        "Síntese de cartilagem, tendões e ligamentos (proteoglicanos)",
+        "Produção de glucose em jejum (piruvato carboxilase)",
+        "Eliminação de amónia (arginase, ciclo da ureia)"
+      ],
+      "goal_relevance": "Fundamental para reparar a mitocôndria e o tecido conjuntivo do atleta. Mas é um metal pesado que atravessa a barreira hematoencefálica — 'green powders' e suplementos que o carregam às cegas são um risco de neurotoxicidade.",
+      "optimal_range": "2,3–5,0 mg/dia",
+      "upper_limit": "11 mg/dia (teto neurológico rígido)",
+      "food_sources": [
+        {
+          "food": "Mexilhões cozidos",
+          "amount": 6.8,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "ótima fonte animal, sem antinutrientes"
+        },
+        {
+          "food": "Avelãs / nozes-pecã",
+          "amount": 5.0,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "fitatos limitam"
+        },
+        {
+          "food": "Aveia (crua)",
+          "amount": 3.6,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Ananás",
+          "amount": 0.9,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "também tem bromelina, boa p/ tendões"
+        },
+        {
+          "food": "Chá preto",
+          "amount": 0.4,
+          "unit": "mg",
+          "per": "100 g"
+        }
+      ],
+      "deficiency": "Muito rara: tendinites recorrentes ou recuperação articular lenta, alterações da pele e da tolerância à glucose.",
+      "excess": "Manganismo — síndrome quase indistinguível da doença de Parkinson (tremores, rigidez), irreversível. Vem de suplementos, água contaminada ou fumos de soldadura.",
+      "tips": [
+        "Quase nunca é preciso suplementar — a dieta cobre-o de sobra",
+        "Se tiveres falta de ferro, o corpo absorve manganês a mais por engano — cuidado",
+        "Confirma que fórmulas de articulações têm menos de 5 mg"
+      ],
+      "fact": "Só 1–5% do manganês da dieta é absorvido — o fígado despeja quase tudo o resto na bílis.",
+      "sections": [],
+      "references": [
+        "National Academies DRI — Manganese"
+      ]
+    },
+    "chloride_mg": {
+      "summary": "O 'eletrólito esquecido'. É o anião mais abundante fora das células e a matéria-prima do ácido do estômago.",
+      "roles": [
+        "Ácido do estômago (HCl) — digestão da proteína",
+        "'Desvio do cloreto' — limpa o CO₂ do músculo no esforço",
+        "Recetores GABA — o efeito calmante e do sono",
+        "Equilíbrio de fluidos e volume sanguíneo"
+      ],
+      "goal_relevance": "Numa dieta rica em proteína para ganhar músculo, o cloreto é o fator limitante da digestão dessa proteína (ácido do estômago). Escala 1:1 com o suor e o sódio — treinar no calor exige bastante mais do que a base.",
+      "optimal_range": "3000–5000+ mg/dia (ativo)",
+      "upper_limit": "3600 mg/dia (população sedentária; atletas que suam excedem-no em segurança)",
+      "food_sources": [
+        {
+          "food": "Sal de mesa / marinho",
+          "amount": 60000,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "1 colher de chá ≈ 3400 mg"
+        },
+        {
+          "food": "Kelp / algas secas",
+          "amount": 2000,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Azeitonas curadas",
+          "amount": 1200,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Aipo",
+          "amount": 115,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Tomate",
+          "amount": 50,
+          "unit": "mg",
+          "per": "100 g"
+        }
+      ],
+      "deficiency": "Muito rara (vómitos intensos, diuréticos): alcalose, fraqueza muscular, névoa mental e respiração superficial.",
+      "excess": "Excesso crónico de sal sem água/potássio: hipertensão e retenção de líquidos.",
+      "tips": [
+        "O sódio e o cloreto andam sempre juntos — não retéis um sem o outro",
+        "Antiácidos/IBPs cortam o uso de cloreto para o ácido gástrico e prejudicam a absorção de zinco, ferro e cálcio",
+        "A treinar e a suar muito, junta uma pitada de sal de qualidade à água"
+      ],
+      "fact": "O sal de mesa é ~60% cloreto e ~40% sódio em peso.",
+      "sections": [],
+      "references": [
+        "National Academies DRI — Chloride (AI)"
+      ]
+    },
+    "cholesterol_mg": {
+      "summary": "",
+      "roles": [],
+      "goal_relevance": "",
+      "optimal_range": "",
+      "upper_limit": "",
+      "food_sources": [],
+      "deficiency": "",
+      "excess": "",
+      "tips": [],
+      "fact": "",
+      "sections": [],
+      "references": []
+    },
+    "choline_mg": {
+      "summary": "Nutriente essencial (semelhante às vitaminas B) necessário em grande quantidade. Faz o acetilcolina e impede a gordura de ficar presa no fígado.",
+      "roles": [
+        "Precursor da acetilcolina (contração muscular e memória)",
+        "Exporta a gordura do fígado (fosfatidilcolina/VLDL) — previne o fígado gordo",
+        "Estrutura das membranas de todas as células",
+        "Doador de metilo (via a betaína) na metilação do ADN"
+      ],
+      "goal_relevance": "Numa dieta 'bulking' rica em gordura e proteína, a colina é o fator limitante para a contração explosiva (acetilcolina) e para evitar fígado gordo (NAFLD). Falta de colina = menos força de pico e fígado sob stress apesar de pareceres em forma.",
+      "optimal_range": "550–1000 mg/dia",
+      "upper_limit": "3500 mg/dia",
+      "food_sources": [
+        {
+          "food": "Gema de ovo",
+          "amount": 680,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "padrão de ouro — 2 ovos dão ~300 mg"
+        },
+        {
+          "food": "Caviar / ovas de peixe",
+          "amount": 490,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "ótima sinergia com o ómega-3"
+        },
+        {
+          "food": "Fígado de vaca",
+          "amount": 414,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Soja tostada",
+          "amount": 210,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "melhor fonte vegetal"
+        },
+        {
+          "food": "Carne de vaca picada (90% magra)",
+          "amount": 80,
+          "unit": "mg",
+          "per": "100 g"
+        }
+      ],
+      "deficiency": "Névoa mental, memória de trabalho fraca e menos potência no treino; grave: fígado gordo (NAFLD) e lesão muscular (picos de CPK no sangue).",
+      "excess": "Colina livre a mais é fermentada no intestino em TMA→TMAO (suor e hálito a peixe; associado a aterosclerose).",
+      "tips": [
+        "3–4 ovos inteiros por dia criam uma base sólida de fosfatidilcolina",
+        "O folato e a B12 'poupam' colina — garante-os",
+        "A DHA (ómega-3) e a colina constroem juntas sinapses novas",
+        "Dietas com muita frutose gastam mais colina (fabricam gordura no fígado)"
+      ],
+      "fact": "Dois ovos grandes fornecem cerca de metade da dose diária de colina, na forma mais segura (fosfatidilcolina).",
+      "sections": [],
+      "references": [
+        "National Academies DRI — Choline (AI)"
+      ]
+    },
+    "vitamin_c_mg": {
+      "summary": "",
+      "roles": [],
+      "goal_relevance": "",
+      "optimal_range": "",
+      "upper_limit": "",
+      "food_sources": [],
+      "deficiency": "",
+      "excess": "",
+      "tips": [],
+      "fact": "",
+      "sections": [],
+      "references": []
+    },
+    "vitamin_e_mg": {
+      "summary": "Família de 8 moléculas lipossolúveis; o corpo prioriza o alfa-tocoferol. É o antioxidante que protege as gorduras das células.",
+      "roles": [
+        "Antioxidante das membranas (trava a peroxidação lipídica)",
+        "Protege o colesterol LDL da oxidação (saúde das artérias)",
+        "Integridade das células imunitárias (linfócitos T)"
+      ],
+      "goal_relevance": "Quanto mais gorduras poli-insaturadas (PUFA) comes, mais vitamina E precisas para as proteger da oxidação dentro do corpo. Protege o músculo e os nervos do stress oxidativo do treino.",
+      "optimal_range": "15–30 mg/dia",
+      "upper_limit": "1000 mg/dia (só de suplementos; evita >400 UI sintética a longo prazo)",
+      "food_sources": [
+        {
+          "food": "Óleo de gérmen de trigo",
+          "amount": 149,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Sementes de girassol",
+          "amount": 35,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Amêndoas",
+          "amount": 26,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Avelãs",
+          "amount": 15,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Abacate",
+          "amount": 2.1,
+          "unit": "mg",
+          "per": "100 g"
+        }
+      ],
+      "deficiency": "Rara (má absorção de gordura): fraqueza muscular, neuropatia, ataxia e anemia hemolítica.",
+      "excess": "Age como anticoagulante (inibe a vitamina K): nódoas negras fáceis e, em megadoses, risco de hemorragia.",
+      "tips": [
+        "A vitamina C 'recicla' a vitamina E de volta ao estado ativo",
+        "Trabalha com o selénio: a E protege a parede lipídica, o selénio o interior",
+        "Prefere 'd-alfa-tocoferol' (natural) ao 'dl-alfa' (sintético) — o dobro da biodisponibilidade",
+        "Toma com uma refeição com gordura"
+      ],
+      "fact": "A vitamina E natural (d-alfa) é cerca de duas vezes mais biodisponível do que a sintética (dl-alfa).",
+      "sections": [],
+      "references": [
+        "National Academies DRI — Vitamin E"
+      ]
+    },
+    "vitamin_b1_mg": {
+      "summary": "Tiamina — o guardião que deixa o corpo extrair energia dos hidratos. Sem ela, o ciclo de Krebs pára.",
+      "roles": [
+        "Coenzima (TPP) que converte hidratos em energia (piruvato desidrogenase)",
+        "Passo gerador de ATP dentro do ciclo de Krebs",
+        "Síntese de mielina e dos neurotransmissores acetilcolina e GABA"
+      ],
+      "goal_relevance": "A necessidade sobe com os hidratos e com o treino. Quem come muitos hidratos para render precisa acima da RDA para que a produção de ATP nunca fique presa. Reservas duram só 2–3 semanas.",
+      "optimal_range": "2,0–5,0 mg/dia",
+      "upper_limit": "Sem limite conhecido (o excesso é eliminado na urina)",
+      "food_sources": [
+        {
+          "food": "Linhaça",
+          "amount": 1.64,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Sementes de girassol",
+          "amount": 1.48,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Nozes-macadâmia",
+          "amount": 1.2,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Costeleta de porco",
+          "amount": 0.9,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Feijão preto cozido",
+          "amount": 0.42,
+          "unit": "mg",
+          "per": "100 g"
+        }
+      ],
+      "deficiency": "Fadiga, irritabilidade, névoa mental e pernas pesadas; grave: beribéri (neurológico ou cardíaco) e, com álcool, síndrome de Wernicke-Korsakoff.",
+      "excess": "Praticamente inexistente por via oral — o intestino limita a absorção e os rins eliminam o resto.",
+      "tips": [
+        "O magnésio é obrigatório para ativar a tiamina (TPP) — sem ele, é inútil",
+        "O álcool bloqueia a absorção e a ativação da tiamina",
+        "Açúcar e farinhas refinadas gastam tiamina sem a fornecer"
+      ],
+      "fact": "Comer açúcar refinado 'rouba' tiamina às reservas do corpo para poder ser metabolizado.",
+      "sections": [],
+      "references": [
+        "National Academies DRI — Thiamin"
+      ]
+    },
+    "vitamin_b2_mg": {
+      "summary": "Riboflavina — o motor amarelo do metabolismo. Fornece os transportadores de eletrões (FAD/FMN) que fabricam ATP e ativa outras vitaminas B.",
+      "roles": [
+        "Cadeia de transporte de eletrões (FAD, Complexo II) — ATP",
+        "Queima de gordura (beta-oxidação)",
+        "Recicla o antioxidante-mestre glutationa",
+        "Ativa a B6 e o folato (enzima MTHFR)"
+      ],
+      "goal_relevance": "A necessidade escala com o gasto energético: um homem ativo que usa muito oxigénio 'queima' riboflavina mais depressa. Fundamental se tens a variante genética MTHFR (30–40% das pessoas).",
+      "optimal_range": "2,0–5,0 mg/dia",
+      "upper_limit": "Sem limite conhecido (o excesso torna a urina amarela-néon, inofensivo)",
+      "food_sources": [
+        {
+          "food": "Fígado de vaca",
+          "amount": 2.9,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Amêndoas",
+          "amount": 1.1,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Queijo feta",
+          "amount": 0.84,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Ovo inteiro",
+          "amount": 0.51,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Espinafres cozidos",
+          "amount": 0.24,
+          "unit": "mg",
+          "per": "100 g"
+        }
+      ],
+      "deficiency": "Fissuras nos cantos da boca, lábios gretados, língua inchada, sensibilidade à luz e fadiga; pode 'esconder' uma anemia (não mobiliza o ferro).",
+      "excess": "Sem toxicidade conhecida — o único 'sintoma' é urina amarela-fluorescente.",
+      "tips": [
+        "É destruída pela luz UV — por isso o leite se vende em cartão opaco",
+        "Necessária para ativar a B6 e o folato — está no topo da cascata das vitaminas B",
+        "Toma com uma refeição para aumentar a absorção até ~60%"
+      ],
+      "fact": "Neurologistas usam 400 mg/dia de riboflavina para prevenir enxaquecas, sem qualquer toxicidade.",
+      "sections": [],
+      "references": [
+        "National Academies DRI — Riboflavin"
+      ]
+    },
+    "vitamin_b3_mg": {
+      "summary": "Niacina — a base do NAD+, a moeda metabólica mais usada do corpo (400+ reações). Central para a energia, a testosterona e a reparação do ADN.",
+      "roles": [
+        "NAD+/NADP+ — transporte de eletrões e produção de ATP",
+        "Síntese de colesterol → testosterona e outras hormonas",
+        "Reparação do ADN (PARPs) e longevidade (sirtuínas)"
+      ],
+      "goal_relevance": "O treino intenso esgota o NAD+ para reparar o ADN muscular. Estar ligeiramente acima da RDA mantém o 'poço' de NAD+ cheio para reparar sem roubar energia.",
+      "optimal_range": "25–50 mg NE/dia",
+      "upper_limit": "35 mg/dia (só o 'rubor' de suplementos de ácido nicotínico, não toxicidade)",
+      "food_sources": [
+        {
+          "food": "Atum-rabilho",
+          "amount": 22.1,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Fígado de vaca",
+          "amount": 17.5,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Peito de frango",
+          "amount": 14.8,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Amendoins",
+          "amount": 14.4,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Costeleta de porco",
+          "amount": 10.9,
+          "unit": "mg",
+          "per": "100 g"
+        }
+      ],
+      "deficiency": "Indigestão, fadiga, aftas e língua vermelha; grave: pelagra (os '4 D' — dermatite, diarreia, demência, morte).",
+      "excess": "Ácido nicotínico acima de ~35 mg causa 'rubor' (pele quente e vermelha, inofensivo). Megadoses de niacina de libertação lenta podem lesar o fígado.",
+      "tips": [
+        "O corpo faz niacina a partir do triptófano (proteína): 60 mg de triptófano = 1 mg",
+        "Precisa de B2, B6 e ferro para essa conversão",
+        "O álcool 'mina' o NAD+ — trava a reparação muscular"
+      ],
+      "fact": "O NAD+ (feito a partir da B3) é consumido pelas sirtuínas e PARPs, os 'genes da longevidade' e reparadores de ADN.",
+      "sections": [],
+      "references": [
+        "National Academies DRI — Niacin"
+      ]
+    },
+    "vitamin_b5_mg": {
+      "summary": "Ácido pantoténico — o chassis de todo o metabolismo. É o tijolo da Coenzima A, o cruzamento central da bioquímica.",
+      "roles": [
+        "Forma a Coenzima A (Acetil-CoA) — início do ciclo de Krebs",
+        "Síntese de novos ácidos gordos",
+        "Produção de hormonas esteroides (testosterona, cortisol)",
+        "Acetilação de histonas (epigenética)"
+      ],
+      "goal_relevance": "A síntese de colesterol e daí de testosterona e cortisol depende do Acetil-CoA. Sob stress crónico e treino pesado, o consumo de CoA dispara — estar acima da AI evita que se torne o fator limitante das hormonas e da energia.",
+      "optimal_range": "10–50 mg/dia",
+      "upper_limit": "Sem limite conhecido (excecionalmente seguro)",
+      "food_sources": [
+        {
+          "food": "Fígado de vaca",
+          "amount": 7.1,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Sementes de girassol",
+          "amount": 7.06,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Cogumelos shiitake",
+          "amount": 3.59,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Ovo inteiro",
+          "amount": 1.53,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Abacate",
+          "amount": 1.39,
+          "unit": "mg",
+          "per": "100 g"
+        }
+      ],
+      "deficiency": "Muito rara: irritabilidade, insónia, fadiga e, o sinal clássico, 'síndrome dos pés a arder' (formigueiro e ardor nos pés).",
+      "excess": "Sem toxicidade conhecida; doses enormes (>10 g) podem dar diarreia ligeira.",
+      "tips": [
+        "Processamento, enlatamento e moagem destroem até 70% da B5 — prefere comida fresca",
+        "Partilha o transportador (SMVT) com a biotina — megadoses de biotina podem baixá-la",
+        "Precisa de magnésio e ATP para se transformar em CoA"
+      ],
+      "fact": "O nome vem do grego pantothen, 'de todo o lado' — está em quase todos os alimentos, mas o processamento destrói-o.",
+      "sections": [],
+      "references": [
+        "National Academies DRI — Pantothenic Acid (AI)"
+      ]
+    },
+    "vitamin_b6_mg": {
+      "summary": "O regulador-mestre do metabolismo dos aminoácidos. Dita como o corpo usa cada grama de proteína que comes.",
+      "roles": [
+        "Metabolismo dos aminoácidos (transaminação) — 140+ enzimas",
+        "Síntese de serotonina, dopamina, noradrenalina e GABA",
+        "Libertação rápida de glicogénio no esforço explosivo",
+        "Síntese de heme (hemoglobina)"
+      ],
+      "goal_relevance": "A necessidade escala linearmente com a proteína. Quem come 150–200+ g/dia acelera muito o consumo de B6 — estar no intervalo ótimo evita que a síntese proteica e dos neurotransmissores fique presa.",
+      "optimal_range": "2,0–5,0 mg/dia",
+      "upper_limit": "100 mg/dia (acima é neurotóxico — caso único entre as vitaminas hidrossolúveis)",
+      "food_sources": [
+        {
+          "food": "Atum-rabilho",
+          "amount": 1.04,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "PLP, alta biodisponibilidade"
+        },
+        {
+          "food": "Salmão",
+          "amount": 0.94,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Fígado de vaca",
+          "amount": 0.9,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Peito de frango",
+          "amount": 0.9,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Grão-de-bico cozido",
+          "amount": 0.5,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Banana",
+          "amount": 0.37,
+          "unit": "mg",
+          "per": "100 g"
+        }
+      ],
+      "deficiency": "Irritabilidade, névoa mental, sintomas depressivos, fraca recordação de sonhos, pele gretada e homocisteína elevada.",
+      "excess": "De suplementos: neuropatia periférica (dormência e formigueiro que começa nos pés e mãos). Não excedas 100 mg/dia.",
+      "tips": [
+        "Precisa de B2 e zinco para ser ativada (em PLP) — sem eles, é inútil",
+        "Com magnésio, reduz muito a ansiedade (produção de GABA)",
+        "Álcool e uso crónico de anti-inflamatórios (ibuprofeno) esgotam-na",
+        "Se suplementares, prefere P-5-P ao 'piridoxina HCl'"
+      ],
+      "fact": "75–80% da B6 do corpo está guardada no músculo esquelético.",
+      "sections": [],
+      "references": [
+        "National Academies DRI — Vitamin B6"
+      ]
+    },
+    "vitamin_a_ug": {
+      "summary": "",
+      "roles": [],
+      "goal_relevance": "",
+      "optimal_range": "",
+      "upper_limit": "",
+      "food_sources": [],
+      "deficiency": "",
+      "excess": "",
+      "tips": [],
+      "fact": "",
+      "sections": [],
+      "references": []
+    },
+    "vitamin_d_ug": {
+      "summary": "",
+      "roles": [],
+      "goal_relevance": "",
+      "optimal_range": "",
+      "upper_limit": "",
+      "food_sources": [],
+      "deficiency": "",
+      "excess": "",
+      "tips": [],
+      "fact": "",
+      "sections": [],
+      "references": []
+    },
+    "vitamin_k_ug": {
+      "summary": "Família lipossolúvel em duas formas: K1 (plantas, coagulação) e K2 (fermentados/animal, dirige o cálcio). Papéis muito diferentes.",
+      "roles": [
+        "K1: coagulação do sangue (fatores no fígado)",
+        "K2: leva o cálcio para o osso (osteocalcina)",
+        "K2: retira o cálcio das artérias (proteína Gla da matriz)"
+      ],
+      "goal_relevance": "Garantir K2 previne o endurecimento precoce das artérias e maximiza o pico de massa óssea (que estabiliza por volta dos 30). É o par obrigatório da vitamina D e do cálcio.",
+      "optimal_range": "120 µg K1 + 100–200 µg K2 (MK-7) por dia",
+      "upper_limit": "Sem limite conhecido (K1/K2 não são tóxicas)",
+      "food_sources": [
+        {
+          "food": "Natto (soja fermentada)",
+          "amount": 1000,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "K2 MK-7 — a fonte mais rica"
+        },
+        {
+          "food": "Couve-galega cozida",
+          "amount": 400,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "K1"
+        },
+        {
+          "food": "Espinafres cozidos",
+          "amount": 380,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "K1"
+        },
+        {
+          "food": "Fígado de ganso",
+          "amount": 370,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "K2 MK-4"
+        },
+        {
+          "food": "Queijos curados (Gouda)",
+          "amount": 75,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "K2"
+        },
+        {
+          "food": "Gema de ovo",
+          "amount": 30,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "K2 MK-4"
+        }
+      ],
+      "deficiency": "K1: nódoas negras e gengivas a sangrar. K2 (subclínica, comum): o cálcio deposita-se nas artérias em vez do osso → calcificação vascular e osteopenia.",
+      "excess": "Sem toxicidade conhecida para a K1/K2 naturais. (A K3 sintética é tóxica e está proibida em suplementos.)",
+      "tips": [
+        "A vitamina D3 é o par obrigatório — sem K2, o cálcio que a D traz vai para as artérias",
+        "Refogar as verduras em azeite triplica a absorção da K1",
+        "Prefere K2 como MK-7 (meia-vida ~72 h vs ~1,5 h do MK-4)"
+      ],
+      "fact": "O natto deve os seus 1000+ µg de K2 à bactéria da fermentação (Bacillus subtilis).",
+      "sections": [],
+      "references": [
+        "National Academies DRI — Vitamin K (AI)"
+      ]
+    },
+    "vitamin_b12_ug": {
+      "summary": "Cobalamina — a maior e mais complexa vitamina, com cobalto no centro. Governa a síntese de ADN e a integridade do sistema nervoso.",
+      "roles": [
+        "Síntese de ADN (divisão celular, crescimento muscular)",
+        "Proteção da bainha de mielina dos nervos",
+        "Limpeza da homocisteína (com o folato)",
+        "Metabolismo energético na mitocôndria"
+      ],
+      "goal_relevance": "Essencial para construir tecido novo depois do treino. Só existe em alimentos de origem animal — vegetarianos/veganos e quem tem problemas digestivos (ou toma metformina/IBPs) precisam de vigiar e suplementar.",
+      "optimal_range": "4–7 µg/dia (de alimentos)",
+      "upper_limit": "Sem limite conhecido (extraordinariamente segura)",
+      "food_sources": [
+        {
+          "food": "Amêijoas cozidas",
+          "amount": 98.9,
+          "unit": "µg",
+          "per": "100 g"
+        },
+        {
+          "food": "Fígado de vaca",
+          "amount": 70.6,
+          "unit": "µg",
+          "per": "100 g"
+        },
+        {
+          "food": "Ostras cozidas",
+          "amount": 28.8,
+          "unit": "µg",
+          "per": "100 g"
+        },
+        {
+          "food": "Salmão",
+          "amount": 3.0,
+          "unit": "µg",
+          "per": "100 g"
+        },
+        {
+          "food": "Carne de vaca magra",
+          "amount": 2.6,
+          "unit": "µg",
+          "per": "100 g"
+        },
+        {
+          "food": "Ovo inteiro",
+          "amount": 1.1,
+          "unit": "µg",
+          "per": "100 g"
+        }
+      ],
+      "deficiency": "Lenta (o fígado guarda 3–5 anos): fadiga, névoa mental, língua lisa e vermelha; grave: anemia megaloblástica e lesão neurológica irreversível.",
+      "excess": "Sem toxicidade bioquímica conhecida.",
+      "tips": [
+        "Não há fontes vegetais ativas — spirulina e afins são 'pseudo-B12' e até bloqueiam a real",
+        "Anda de mãos dadas com o folato (a 'armadilha do folato')",
+        "IBPs, metformina e óxido nitroso reduzem/inativam a B12",
+        "Se tens pouco ácido gástrico, usa formas sublinguais"
+      ],
+      "fact": "O fígado guarda 2–5 mg de B12 — reservas que chegam para 3 a 5 anos.",
+      "sections": [],
+      "references": [
+        "National Academies DRI — Vitamin B12"
+      ]
+    },
+    "folate_ug": {
+      "summary": "Vitamina B9 — o engenheiro da replicação celular. Transporta carbonos para construir ADN e para o ciclo da metilação.",
+      "roles": [
+        "Síntese de ADN e ARN (divisão celular, reparação muscular)",
+        "Ciclo da metilação → SAMe (creatina, dopamina, serotonina, melatonina)",
+        "Limpeza da homocisteína (com a B12)",
+        "Produção de glóbulos vermelhos"
+      ],
+      "goal_relevance": "Cada vez que reparas fibra muscular ou sintetizas neurotransmissores, puxas do 'poço' de folato. O topo do intervalo mantém a SAMe e mantém a homocisteína (que danifica as artérias) no mínimo.",
+      "optimal_range": "400–800 µg DFE/dia",
+      "upper_limit": "1000 µg/dia (só ácido fólico sintético; sem limite para o folato dos alimentos)",
+      "food_sources": [
+        {
+          "food": "Edamame (soja verde)",
+          "amount": 311,
+          "unit": "µg",
+          "per": "100 g"
+        },
+        {
+          "food": "Fígado de vaca",
+          "amount": 290,
+          "unit": "µg",
+          "per": "100 g"
+        },
+        {
+          "food": "Lentilhas cozidas",
+          "amount": 181,
+          "unit": "µg",
+          "per": "100 g"
+        },
+        {
+          "food": "Espargos cozidos",
+          "amount": 149,
+          "unit": "µg",
+          "per": "100 g"
+        },
+        {
+          "food": "Espinafres cozidos",
+          "amount": 146,
+          "unit": "µg",
+          "per": "100 g"
+        },
+        {
+          "food": "Abacate",
+          "amount": 81,
+          "unit": "µg",
+          "per": "100 g"
+        }
+      ],
+      "deficiency": "Letargia, língua dorida, problemas digestivos; grave: anemia megaloblástica e homocisteína muito elevada (risco cardiovascular).",
+      "excess": "Não há excesso pelo folato dos alimentos. O ácido fólico sintético em excesso (>1000 µg) deixa 'folato não metabolizado' no sangue e pode mascarar uma falta de B12.",
+      "tips": [
+        "Sem B12, o folato fica 'preso' e inútil (a armadilha do folato)",
+        "Precisa da B2 (riboflavina) para a enzima MTHFR funcionar",
+        "O álcool é devastador para o folato",
+        "Se suplementares, prefere L-5-MTHF (metilfolato) ao ácido fólico"
+      ],
+      "fact": "O nome vem de folium (folha) — os verdes escuros e as leguminosas são as fontes principais.",
+      "sections": [],
+      "references": [
+        "National Academies DRI — Folate"
+      ]
+    },
+    "biotin_ug": {
+      "summary": "Vitamina B7 — vendida para cabelo e unhas, mas na verdade o cofator das carboxilases: sintetiza gordura, quebra a leucina e mantém a glucose em jejum.",
+      "roles": [
+        "Metabolismo da gordura (síntese e oxidação — acetil-CoA carboxilase)",
+        "Produção de glucose em jejum (piruvato carboxilase)",
+        "Quebra da leucina (BCAA) para energia",
+        "Expressão de genes (biotinilação de histonas)"
+      ],
+      "goal_relevance": "Importante para queimar gordura e processar a leucina de uma dieta rica em proteína. A carência é rara com ovos cozidos e carne na dieta — suplementar 5000–10000 µg 'para o cabelo' não traz benefício e falseia análises ao sangue.",
+      "optimal_range": "30–100 µg/dia",
+      "upper_limit": "Sem limite conhecido (mas megadoses falseiam análises — ver abaixo)",
+      "food_sources": [
+        {
+          "food": "Fígado de vaca",
+          "amount": 41.6,
+          "unit": "µg",
+          "per": "100 g"
+        },
+        {
+          "food": "Gema de ovo cozida",
+          "amount": 25.0,
+          "unit": "µg",
+          "per": "100 g"
+        },
+        {
+          "food": "Sementes de girassol",
+          "amount": 7.8,
+          "unit": "µg",
+          "per": "100 g"
+        },
+        {
+          "food": "Batata-doce assada",
+          "amount": 4.8,
+          "unit": "µg",
+          "per": "100 g"
+        },
+        {
+          "food": "Amêndoas",
+          "amount": 4.4,
+          "unit": "µg",
+          "per": "100 g"
+        },
+        {
+          "food": "Salmão",
+          "amount": 4.0,
+          "unit": "µg",
+          "per": "100 g"
+        }
+      ],
+      "deficiency": "Rara: cabelo a cair, rash escamoso à volta dos olhos/nariz/boca, letargia e depressão.",
+      "excess": "Sem toxicidade biológica, MAS megadoses falseiam análises ao sangue — podem dar falsos positivos de tiroide e, perigosamente, falsos negativos de enfarte (troponina). Pára 72 h antes de análises.",
+      "tips": [
+        "Claras de ovo CRUAS contêm avidina, que prende a biotina — cozinha sempre os ovos",
+        "Partilha o transportador (SMVT) com a B5 — megadosear uma baixa a outra",
+        "Precisa de magnésio e ATP para se ligar às enzimas",
+        "Uma dose de 100–300 µg é mais que suficiente se precisares"
+      ],
+      "fact": "Uma dieta com muitas claras de ovo cruas pode causar carência de biotina (a avidina prende-a).",
+      "sections": [],
+      "references": [
+        "National Academies DRI — Biotin (AI)"
+      ]
+    },
+    "selenium_ug": {
+      "summary": "Mineral vestigial incorporado no 21.º aminoácido (selenocisteína). Central para a tiroide, a defesa antioxidante e a fertilidade.",
+      "roles": [
+        "Ativação da hormona da tiroide (T4→T3, deiodinases)",
+        "Antioxidante-mestre (glutationa peroxidase, GPx)",
+        "Estrutura e motilidade do espermatozoide",
+        "Neutralização de metais pesados (mercúrio)"
+      ],
+      "goal_relevance": "Sob stress oxidativo do treino e com dietas ricas em atum (mercúrio), a necessidade sobe. A janela terapêutica é estreita — suplementar às cegas causa toxicidade com facilidade.",
+      "optimal_range": "70–150 µg/dia",
+      "upper_limit": "400 µg/dia",
+      "food_sources": [
+        {
+          "food": "Castanha-do-brasil",
+          "amount": 1917,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "PERIGO: 1 noz pode ter 50–400 µg. Limita a 1–2"
+        },
+        {
+          "food": "Atum-rabilho",
+          "amount": 108,
+          "unit": "µg",
+          "per": "100 g"
+        },
+        {
+          "food": "Porco (lombo)",
+          "amount": 45,
+          "unit": "µg",
+          "per": "100 g"
+        },
+        {
+          "food": "Carne de vaca",
+          "amount": 32,
+          "unit": "µg",
+          "per": "100 g"
+        },
+        {
+          "food": "Ovos",
+          "amount": 30,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "concentrado na gema"
+        }
+      ],
+      "deficiency": "Fadiga, névoa mental e aumento de peso (T4→T3 travada), mais infeções, e — no homem — menos e piores espermatozoides.",
+      "excess": "Selenose: hálito a alho, queda de cabelo em zonas e unhas quebradiças. A janela é estreita — cuidado com a castanha-do-brasil.",
+      "tips": [
+        "Trabalha com o iodo — não suplementes iodo em dose alta sem selénio suficiente",
+        "Parceiro da vitamina E na defesa das membranas",
+        "O mercúrio (atum, espadarte) consome o selénio do corpo"
+      ],
+      "fact": "O conteúdo em selénio da comida depende inteiramente do solo onde cresceu.",
+      "sections": [],
+      "references": [
+        "National Academies DRI — Selenium"
+      ]
+    },
+    "iodine_ug": {
+      "summary": "Mineral vestigial com uma única função, mas mestre do metabolismo: é o tijolo das hormonas da tiroide.",
+      "roles": [
+        "Síntese das hormonas da tiroide (T4 e T3)",
+        "Regulação do metabolismo basal e da temperatura",
+        "Mielinização dos neurónios e clareza mental"
+      ],
+      "goal_relevance": "Trocar o sal iodado por sal 'rosa dos Himalaias' (quase sem iodo) mais o suor do treino levam muitos homens a hipotiroidismo subclínico: gordura teimosa, letargia e mãos frias apesar de treinarem.",
+      "optimal_range": "150–250 µg/dia",
+      "upper_limit": "1100 µg/dia",
+      "food_sources": [
+        {
+          "food": "Kelp / kombu seco",
+          "amount": 2750,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "densidade extrema — usar com muita moderação"
+        },
+        {
+          "food": "Bacalhau",
+          "amount": 110,
+          "unit": "µg",
+          "per": "100 g"
+        },
+        {
+          "food": "Laticínios (leite/iogurte)",
+          "amount": 35,
+          "unit": "µg",
+          "per": "100 g"
+        },
+        {
+          "food": "Ovos",
+          "amount": 24,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "na gema"
+        },
+        {
+          "food": "Sal iodado",
+          "amount": 4500,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "½ colher de chá dá ~150 µg"
+        }
+      ],
+      "deficiency": "Mãos e pés frios, ganho de gordura apesar da restrição, névoa mental, sobrancelha a rarear no terço externo; avançada: bócio (tiroide aumentada).",
+      "excess": "Doses agudas altas bloqueiam a tiroide (efeito Wolff-Chaikoff); crónico sem selénio suficiente pode desencadear tiroidite autoimune (Hashimoto).",
+      "tips": [
+        "Nunca suplementes iodo sem garantir selénio adequado (protege a tiroide)",
+        "Bromo (pães, alguns refrigerantes) e flúor competem com o iodo",
+        "Cozinhar os crucíferos (brócolos, couve) desativa os goitrogénios que bloqueiam o iodo"
+      ],
+      "fact": "70–80% de todo o iodo do corpo está guardado num único órgão: a tiroide.",
+      "sections": [],
+      "references": [
+        "National Academies DRI — Iodine"
+      ]
+    }
+  }
+}
