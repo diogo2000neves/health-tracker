@@ -1,7 +1,13 @@
 # Cloud Build pipeline — on push to main: run the unit tests, then build and
 # deploy every Cloud Run target:
-#   * health-tracker-daily   (Job)     from ./Dockerfile
-#   * health-tracker-ingest  (Service) from ./ingest/Dockerfile
+#   * health-tracker-daily   (Job)     from backend/Dockerfile
+#   * health-tracker-ingest  (Service) from backend/ingest/Dockerfile
+#
+# This file lives at the REPO ROOT (the trigger reads `cloudbuild.yaml` from the
+# root). The project is a monorepo — the deployable backend is under `backend/`,
+# so every step that touches source runs with `dir: backend`, i.e. as if `backend/`
+# were the working directory. That keeps the in-step paths (`Dockerfile`,
+# `ingest/Dockerfile`, `.` as the build context) exactly as the backend expects.
 #
 # The test step is the deploy gate: a failing test stops the build before any
 # image is built, so production keeps running the previous version.
@@ -18,6 +24,7 @@ steps:
   # --- gate: unit tests ---
   - id: test
     name: python:3.12-slim
+    dir: 'backend'
     entrypoint: bash
     args:
       - -c
@@ -25,8 +32,10 @@ steps:
         && python -m pytest tests -q
 
   # --- daily job ---
+  # Build context is backend/ so the image can COPY the shared schema/ registry.
   - id: build-daily
     name: gcr.io/cloud-builders/docker
+    dir: 'backend'
     args: ['build', '-f', 'Dockerfile', '-t', '${_AR}/health-tracker-daily:$COMMIT_SHA', '.']
   - id: push-daily
     name: gcr.io/cloud-builders/docker
@@ -38,10 +47,11 @@ steps:
            '--image', '${_AR}/health-tracker-daily:$COMMIT_SHA', '--region', '${_REGION}']
 
   # --- ingest service ---
-  # Context is the repo root (not `ingest`) so the image can COPY the shared
-  # schema/ registry that both targets depend on.
+  # Context is backend/ (not `ingest`) so the image can COPY the shared schema/
+  # registry and nutrient_info.json that the service depends on.
   - id: build-ingest
     name: gcr.io/cloud-builders/docker
+    dir: 'backend'
     args: ['build', '-f', 'ingest/Dockerfile', '-t', '${_AR}/health-tracker-ingest:$COMMIT_SHA', '.']
   - id: push-ingest
     name: gcr.io/cloud-builders/docker
