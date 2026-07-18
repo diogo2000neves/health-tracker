@@ -2277,3 +2277,47 @@ def daily():
 
     return jsonify({"from": start, "to": end, "count": len(days),
                     "blocks": wanted, "days": days}), 200
+
+
+@app.get("/meals")
+def meals():
+    """The individual meals of one day (default today), for the app's home screen.
+
+    `?date=` an ISO date (default: today, local tz). Newest last, so the list
+    reads top-to-bottom as the day happened. Non-meal stubs ("not food",
+    "analysis failed") and empty rows are excluded — exactly the rows the daily
+    totals skip (_day_totals) — so the list and the totals always agree.
+
+    Unlike /daily (the rolled-up summary) this is the meal-by-meal breakdown the
+    daily job aggregates; a client that wants the day's totals plus its meals gets
+    both from this one call.
+    """
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    day = request.args.get("date") or datetime.now(_tz()).date().isoformat()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        return jsonify({"error": "date must be YYYY-MM-DD"}), 400
+
+    rows = _todays_meals(day)  # filters the meals tab by the date prefix
+    macro_keys = ("calories", "protein_g", "carbs_g", "fat_g")
+    meals_out: List[Dict[str, Any]] = []
+    for r in rows:
+        if _is_stub(r):
+            continue
+        macros = {k: _round_num(r.get(k)) for k in macro_keys}
+        if max(macros.values()) <= 0:  # empty/zero row — as the totals treat it
+            continue
+        when = str(r.get("datetime") or "")
+        meals_out.append({
+            "datetime": when,
+            "time": when[11:16],  # "HH:MM" off the ISO string
+            "foods": str(r.get("foods") or "").strip(),
+            "note": str(r.get("note") or "").strip(),
+            "template": str(r.get("template") or "").strip(),
+            **macros,
+        })
+    meals_out.sort(key=lambda m: m["datetime"])
+
+    return jsonify({"date": day, "count": len(meals_out),
+                    "totals": _day_totals(rows), "meals": meals_out}), 200

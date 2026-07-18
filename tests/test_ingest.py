@@ -1131,3 +1131,44 @@ def test_schema_endpoint_teaches_a_client_the_causal_rule(monkeypatch):
     assert cols["resting_hr_bpm"]["direction"] == "down_good"
     assert cols["weight_kg"]["unit"] == "kg"
     assert {b["name"] for b in body["blocks"]} >= {"sleep", "recovery", "body"}
+
+
+# The meals tab the /meals endpoint reads: two meals today (out of order, to
+# prove sorting), one stub, and one from yesterday (to prove date filtering).
+_MEALS_GRID = [
+    ingest.MEALS_HEADERS,
+    ["2026-07-18T13:00:00+01:00", "Chicken", "[]", 500, 40, 10, 20,
+     0.9, "m", "", 300, "sha2", "big lunch", ""],
+    ["2026-07-18T08:30:00+01:00", "Oats", "[]", 300, 10, 50, 5,
+     0.8, "m", "", 200, "sha1", "", ""],
+    ["2026-07-18T20:00:00+01:00", "analysis failed", "[]", 0, 0, 0, 0,
+     0, "m", "", 0, "sha3", "", ""],
+    ["2026-07-17T12:00:00+01:00", "Yesterday", "[]", 100, 5, 5, 5,
+     0.5, "m", "", 100, "sha4", "", ""],
+]
+
+
+def test_meals_requires_the_token():
+    assert ingest.app.test_client().get("/meals").status_code == 401
+
+
+def test_meals_rejects_a_bad_date(monkeypatch):
+    r = _api(monkeypatch, _MEALS_GRID).get("/meals?date=18-07-2026", headers=_HDR)
+    assert r.status_code == 400
+
+
+def test_meals_lists_the_day_sorted_without_stubs_or_other_days(monkeypatch):
+    body = _api(monkeypatch, _MEALS_GRID).get(
+        "/meals?date=2026-07-18", headers=_HDR).get_json()
+    assert body["date"] == "2026-07-18"
+    assert body["count"] == 2                       # stub + yesterday dropped
+    assert [m["foods"] for m in body["meals"]] == ["Oats", "Chicken"]  # sorted
+    assert body["meals"][0]["time"] == "08:30"      # HH:MM off the ISO string
+    assert body["meals"][1]["note"] == "big lunch"
+
+
+def test_meals_totals_match_the_listed_meals(monkeypatch):
+    body = _api(monkeypatch, _MEALS_GRID).get(
+        "/meals?date=2026-07-18", headers=_HDR).get_json()
+    assert body["totals"] == {"calories": 800.0, "protein_g": 50.0,
+                              "carbs_g": 60.0, "fat_g": 25.0}
