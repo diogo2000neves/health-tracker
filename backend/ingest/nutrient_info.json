@@ -945,18 +945,70 @@
       ]
     },
     "vitamin_c_mg": {
-      "summary": "",
-      "roles": [],
-      "goal_relevance": "",
-      "optimal_range": "",
-      "upper_limit": "",
-      "food_sources": [],
-      "deficiency": "",
-      "excess": "",
-      "tips": [],
-      "fact": "",
+      "summary": "Ácido L-ascórbico, hidrossolúvel e essencial (o Homem perdeu a enzima GULO que a fabricava). Poderoso dador de eletrões (antioxidante) e cofator de enzimas.",
+      "roles": [
+        "Síntese de colagénio — tendões, ligamentos, cartilagem, pele e vasos",
+        "Síntese de carnitina — transporta gordura para a mitocôndria (energia)",
+        "Síntese de catecolaminas (dopamina → noradrenalina)",
+        "Antioxidante e defesa imunitária (os leucócitos concentram-na 50–100x)"
+      ],
+      "goal_relevance": "A saturação do plasma dá-se aos 200–400 mg/dia; manter esta faixa satura os leucócitos, acelera a reparação dos tecidos após treino de força e ajuda a equilibrar o cortisol/testosterona depois do esforço.",
+      "optimal_range": "200–500 mg/dia (fumadores +35 mg)",
+      "upper_limit": "2000 mg/dia",
+      "food_sources": [
+        {
+          "food": "Goiaba",
+          "amount": 228,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "rica em bioflavonoides"
+        },
+        {
+          "food": "Pimento vermelho/amarelo",
+          "amount": 150,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "cozinhar destrói 25–40%"
+        },
+        {
+          "food": "Kiwi",
+          "amount": 93,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Brócolos crus",
+          "amount": 89,
+          "unit": "mg",
+          "per": "100 g",
+          "note": "vaporizar preserva ~80%"
+        },
+        {
+          "food": "Morangos",
+          "amount": 59,
+          "unit": "mg",
+          "per": "100 g"
+        },
+        {
+          "food": "Laranja",
+          "amount": 53,
+          "unit": "mg",
+          "per": "100 g"
+        }
+      ],
+      "deficiency": "Fadiga (falha a carnitina), gengivas a sangrar, petéquias e recuperação lenta; avançada: escorbuto (dores articulares, hiperqueratose, pelos em saca-rolhas, má cicatrização, perda de dentes).",
+      "excess": "Muito raro (os rins eliminam o excesso). Doses agudas >2–3 g causam diarreia e cólicas; crónico pode aumentar o risco de pedras nos rins (oxalato) em predispostos e de sobrecarga de ferro na hemocromatose.",
+      "tips": [
+        "Aumenta a absorção do ferro vegetal em 200–400%",
+        "Os bioflavonoides (quercetina, rutina) prolongam a sua ação",
+        "Divide as doses — os transportadores saturam acima de 200 mg (250–500 mg 2x/dia)",
+        "Calor, luz e água destroem-na: ferver perde muito para a água"
+      ],
+      "fact": "Ao contrário da maioria dos animais, o Homem não consegue fabricar vitamina C — perdeu a enzima GULO por uma mutação evolutiva.",
       "sections": [],
-      "references": []
+      "references": [
+        "National Academies DRI — Vitamin C"
+      ]
     },
     "vitamin_e_mg": {
       "summary": "Família de 8 moléculas lipossolúveis; o corpo prioriza o alfa-tocoferol. É o antioxidante que protege as gorduras das células.",
@@ -1301,32 +1353,144 @@
       ]
     },
     "vitamin_a_ug": {
-      "summary": "",
-      "roles": [],
-      "goal_relevance": "",
-      "optimal_range": "",
-      "upper_limit": "",
-      "food_sources": [],
-      "deficiency": "",
-      "excess": "",
-      "tips": [],
-      "fact": "",
+      "summary": "Grupo de retinoides lipossolúveis (retinol, retinal, ácido retinoico) e de carotenoides provitamina A (beta-caroteno). Age mais como hormona do que como coenzima.",
+      "roles": [
+        "Visão — o retinal forma a rodopsina para a visão noturna",
+        "Expressão genética e diferenciação celular (ácido retinoico, recetores RAR/RXR)",
+        "Integridade das barreiras mucosas (intestino, pulmões, olhos) e da pele",
+        "Imunidade mucosa e síntese de testosterona (nos testículos)"
+      ],
+      "goal_relevance": "Ligeiramente acima da RDA maximiza a imunidade das mucosas, a síntese de testosterona (o ácido retinoico é necessário nos testículos) e a reparação rápida dos tecidos após treino intenso.",
+      "optimal_range": "900–1500 µg RAE/dia",
+      "upper_limit": "3000 µg/dia (de vitamina A pré-formada; sem limite para o beta-caroteno dos alimentos)",
+      "food_sources": [
+        {
+          "food": "Óleo de fígado de bacalhau",
+          "amount": 30000,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "pré-formada — usar com muita moderação"
+        },
+        {
+          "food": "Fígado de vaca",
+          "amount": 9400,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "pré-formada, 70–90% absorvida"
+        },
+        {
+          "food": "Batata-doce assada",
+          "amount": 960,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "provitamina (beta-caroteno)"
+        },
+        {
+          "food": "Cenoura cozida",
+          "amount": 830,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "provitamina"
+        },
+        {
+          "food": "Espinafres cozidos",
+          "amount": 520,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "provitamina"
+        },
+        {
+          "food": "Gema de ovo",
+          "amount": 380,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "pré-formada"
+        }
+      ],
+      "deficiency": "Cegueira noturna, pele áspera com 'borbulhas' (hiperqueratose folicular) e mais infeções respiratórias; avançada: olho seco extremo (xeroftalmia), manchas de Bitot e cegueira. A longo prazo: imunidade suprimida e atrofia testicular.",
+      "excess": "Hipervitaminose A, quase sempre de suplementos pré-formados ou de fígado em excesso. Aguda: náuseas, vómitos, visão turva e dor de cabeça (pressão intracraniana). Crónica (>3000 µg/dia): lesão hepática, dores ósseas/articulares, queda de cabelo, pele a descamar e menos densidade óssea.",
+      "tips": [
+        "Precisa de gordura na refeição — sem ela, a absorção dos carotenoides é quase nula (a gordura aumenta-a 300–400%)",
+        "O zinco é obrigatório para sintetizar a proteína de transporte (RBP); sem zinco, fica presa no fígado",
+        "A vitamina E protege a vitamina A da oxidação no intestino",
+        "O álcool compete pelas enzimas e esgota as reservas do fígado"
+      ],
+      "fact": "São precisos 12 a 21 µg de beta-caroteno para produzir 1 µg de retinol ativo — e ~40% das pessoas têm uma variante do gene BCO1 que trava ainda mais essa conversão.",
       "sections": [],
-      "references": []
+      "references": [
+        "National Academies DRI — Vitamin A"
+      ]
     },
     "vitamin_d_ug": {
-      "summary": "",
-      "roles": [],
-      "goal_relevance": "",
-      "optimal_range": "",
-      "upper_limit": "",
-      "food_sources": [],
-      "deficiency": "",
-      "excess": "",
-      "tips": [],
-      "fact": "",
+      "summary": "Não é bem uma vitamina — é uma hormona esteroide feita a partir do colesterol. Todas as células têm recetor de vitamina D (VDR). Produzida na pele com o sol.",
+      "roles": [
+        "Homeostase do cálcio e do osso (sobe a absorção intestinal de cálcio de ~10% para 30–40%)",
+        "Função endócrina — apoia a produção de testosterona (VDR nas células de Leydig)",
+        "Imunomodulação (os macrófagos usam-na para fabricar catelicidina)",
+        "'Interruptor genómico' — regula mais de 1000 genes"
+      ],
+      "goal_relevance": "Níveis ótimos correlacionam-se com testosterona livre saudável e melhor recuperação; a carência é uma epidemia em quem trabalha dentro de portas. O alvo é 40–60 ng/mL no sangue.",
+      "optimal_range": "2000–5000 UI/dia (50–125 µg) · alvo sérico 40–60 ng/mL",
+      "upper_limit": "4000 UI/dia (100 µg) — a Endocrine Society não vê toxicidade até 10 000 UI",
+      "food_sources": [
+        {
+          "food": "Óleo de fígado de bacalhau",
+          "amount": 250,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "~10 000 UI — usar com moderação"
+        },
+        {
+          "food": "Salmão selvagem",
+          "amount": 25,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "~1000 UI, D3"
+        },
+        {
+          "food": "Salmão de aquacultura",
+          "amount": 13,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "~500 UI"
+        },
+        {
+          "food": "Cavala",
+          "amount": 8.8,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "~350 UI"
+        },
+        {
+          "food": "Cogumelos expostos a UV",
+          "amount": 10,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "D2, menos potente"
+        },
+        {
+          "food": "Gema de ovo",
+          "amount": 3.8,
+          "unit": "µg",
+          "per": "100 g",
+          "note": "~150 UI"
+        }
+      ],
+      "deficiency": "Letargia, infeções respiratórias, dores ósseas e nas costas e recuperação lenta; avançada: osteomalácia (ossos moles), depressão, imunidade em baixo e testosterona clinicamente baixa.",
+      "excess": "Impossível pelo sol (a pele destrói o excesso). Só por suplementação extrema e prolongada (>30 000 UI/dia durante meses) → hipercalcemia: calcificação de artérias e rins, pedras nos rins e arritmias.",
+      "tips": [
+        "A vitamina K2 (MK-7) é o par obrigatório — dirige o cálcio para o osso e não para as artérias (~100 µg de K2 por cada 5000 UI de D3)",
+        "O magnésio é necessário para ativar a vitamina D — sem ele, fica na forma inativa",
+        "Toma com a maior refeição do dia, com gordura",
+        "Mais gordura corporal = precisas de dose maior (fica 'presa' nos adipócitos)",
+        "Prefere D3 (colecalciferol) a D2 — mantém os níveis muito mais tempo"
+      ],
+      "fact": "Não há praticamente forma de atingir o nível ótimo só pela comida sem sol ou suplemento — por isso a carência é tão comum.",
       "sections": [],
-      "references": []
+      "references": [
+        "National Academies DRI — Vitamin D",
+        "Endocrine Society Clinical Practice Guideline"
+      ]
     },
     "vitamin_k_ug": {
       "summary": "Família lipossolúvel em duas formas: K1 (plantas, coagulação) e K2 (fermentados/animal, dirige o cálcio). Papéis muito diferentes.",
