@@ -1,0 +1,24 @@
+# Xcode user state
+xcuserdata/
+*.xcuserstate
+*.xcuserdatad
+
+# Build products
+build/
+DerivedData/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Secrets — the API token lives here, never in git.
+HealthTracker/Config.swift
+
+# macOS
+.DS_Store
+
+# Swift Package Manager
+.swiftpm/
+.build/
+.idea/

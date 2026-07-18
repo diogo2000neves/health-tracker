@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+
+# Backend
+backend/venv/
+backend/credentials/
+backend/data/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/.pytest_cache/
+
+# iOS
+ios/build/
+ios/Config.swift
