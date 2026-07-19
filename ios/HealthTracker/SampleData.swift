@@ -91,7 +91,32 @@ enum SampleData {
                 "protein_g_per_kg": 2.0, "calorie_deficit_pct": 12.5, "goal": "recomp",
             ],
             "meals": meals,
+            "history": sampleHistory(today: consumed),
         ]
+    }
+
+    /// Seven completed days of intake, tuned so each biological lens has a clear story
+    /// to tell offline: Vitamin D low today but a healthy 7-day average (don't panic),
+    /// Vitamin C consistent (6/7 days on target), magnésio inconsistent (3/7), and iron
+    /// whose reserves sit right up against the 45 mg toxicity ceiling. Every other
+    /// nutrient is a realistic full-day scaling of today's partial intake.
+    private static func sampleHistory(today: [String: Double]) -> [[String: Any]] {
+        let vitD: [Double]      = [18, 20, 16, 22, 14, 19, 17]        // reserves fine
+        let vitC: [Double]      = [140, 110, 70, 160, 180, 130, 120]  // consistent (6/7 ≥ 90)
+        let magnesium: [Double] = [420, 300, 260, 450, 380, 500, 280] // inconsistent (3/7 ≥ 400)
+        let iron: [Double]      = [42, 38, 45, 30, 44, 40, 41]        // avg ~40, near the 45 UL
+        var days: [[String: Any]] = []
+        for i in 0..<7 {
+            let ago = 7 - i                                            // oldest (7) -> yesterday (1)
+            let factor = 1.3 + wave(i, 4.4) * 0.25                     // a fuller day than today so far
+            var consumed = today.mapValues { round1($0 * factor) }
+            consumed["vitamin_d_ug"] = vitD[i]
+            consumed["vitamin_c_mg"] = vitC[i]
+            consumed["magnesium_mg"] = magnesium[i]
+            consumed["iron_mg"] = iron[i]
+            days.append(["date": isoDay(-ago), "consumed": consumed])
+        }
+        return days
     }
 
     /// Three meals of a day in progress (mid-afternoon), each ingredient carrying a
@@ -175,19 +200,26 @@ enum SampleData {
             "added_sugar_g": target("limit", ceiling: 52, unit: "g", source: "measured"),
             "saturated_fat_g": target("limit", ceiling: 23, unit: "g", source: "measured"),
         ]
-        // rda micros (adult male 19-50), mirroring the backend table
-        let reach: [(String, Double, String)] = [
-            ("vitamin_a_ug", 900, "ug"), ("vitamin_c_mg", 90, "mg"), ("vitamin_d_ug", 15, "ug"),
-            ("vitamin_e_mg", 15, "mg"), ("vitamin_k_ug", 120, "ug"), ("vitamin_b1_mg", 1.2, "mg"),
-            ("vitamin_b2_mg", 1.3, "mg"), ("vitamin_b3_mg", 16, "mg"), ("vitamin_b5_mg", 5, "mg"),
-            ("vitamin_b6_mg", 1.3, "mg"), ("vitamin_b12_ug", 2.4, "ug"), ("folate_ug", 400, "ug"),
-            ("biotin_ug", 30, "ug"), ("choline_mg", 550, "mg"), ("calcium_mg", 1000, "mg"),
-            ("iron_mg", 8, "mg"), ("magnesium_mg", 400, "mg"), ("zinc_mg", 11, "mg"),
-            ("potassium_mg", 3400, "mg"), ("phosphorus_mg", 700, "mg"), ("copper_mg", 0.9, "mg"),
-            ("manganese_mg", 2.3, "mg"), ("selenium_ug", 55, "ug"), ("iodine_ug", 150, "ug"),
-            ("chloride_mg", 2300, "mg"), ("omega3_g", 1.6, "g"),
+        // rda micros (adult male 19-50) with their kinetics, mirroring the backend's
+        // _MICRO_TARGETS + _NUTRIENT_KINETICS: (key, floor, unit, horizon, UL?).
+        let reach: [(String, Double, String, String, Double?)] = [
+            ("vitamin_a_ug", 900, "ug", "rolling", 3000), ("vitamin_c_mg", 90, "mg", "daily", nil),
+            ("vitamin_d_ug", 15, "ug", "rolling", 100), ("vitamin_e_mg", 15, "mg", "rolling", 1000),
+            ("vitamin_k_ug", 120, "ug", "rolling", nil), ("vitamin_b1_mg", 1.2, "mg", "daily", nil),
+            ("vitamin_b2_mg", 1.3, "mg", "daily", nil), ("vitamin_b3_mg", 16, "mg", "daily", nil),
+            ("vitamin_b5_mg", 5, "mg", "daily", nil), ("vitamin_b6_mg", 1.3, "mg", "daily", nil),
+            ("vitamin_b12_ug", 2.4, "ug", "rolling", nil), ("folate_ug", 400, "ug", "rolling", nil),
+            ("biotin_ug", 30, "ug", "daily", nil), ("choline_mg", 550, "mg", "daily", nil),
+            ("calcium_mg", 1000, "mg", "rolling", 2500), ("iron_mg", 8, "mg", "rolling", 45),
+            ("magnesium_mg", 400, "mg", "daily", nil), ("zinc_mg", 11, "mg", "daily", 40),
+            ("potassium_mg", 3400, "mg", "daily", nil), ("phosphorus_mg", 700, "mg", "rolling", 4000),
+            ("copper_mg", 0.9, "mg", "rolling", 10), ("manganese_mg", 2.3, "mg", "rolling", 11),
+            ("selenium_ug", 55, "ug", "rolling", 400), ("iodine_ug", 150, "ug", "rolling", 1100),
+            ("chloride_mg", 2300, "mg", "daily", nil), ("omega3_g", 1.6, "g", "rolling", nil),
         ]
-        for (k, f, u) in reach { t[k] = target("reach", floor: f, unit: u, source: "rda") }
+        for (k, f, u, h, ul) in reach {
+            t[k] = target("reach", floor: f, ceiling: ul, unit: u, source: "rda", horizon: h)
+        }
         t["sodium_mg"] = target("limit", ceiling: 2300, unit: "mg", source: "rda")
         t["trans_fat_g"] = target("limit", ceiling: 2, unit: "g", source: "rda")
         t["cholesterol_mg"] = target("limit", ceiling: 300, unit: "mg", source: "rda")
@@ -279,8 +311,9 @@ enum SampleData {
     }
 
     private static func target(_ kind: String, floor: Double? = nil, ceiling: Double? = nil,
-                               unit: String, source: String) -> [String: Any] {
-        var t: [String: Any] = ["kind": kind, "unit": unit, "source": source]
+                               unit: String, source: String,
+                               horizon: String = "daily") -> [String: Any] {
+        var t: [String: Any] = ["kind": kind, "unit": unit, "source": source, "horizon": horizon]
         if let floor { t["floor"] = floor }
         if let ceiling { t["ceiling"] = ceiling }
         return t

@@ -27,28 +27,63 @@ struct TodayResponse: Decodable {
     let targets: [String: Target]
     let basis: Basis
     let meals: [TodayMeal]
+    /// The last few completed days of intake (see /today `history`). Optional so an
+    /// older payload still decodes; use `historyDays`. Powers the rolling-average and
+    /// week-consistency lenses on the Nutrients screen.
+    let history: [DayIntake]?
 
     enum CodingKeys: String, CodingKey {
-        case date, consumed, targets, basis, meals
+        case date, consumed, targets, basis, meals, history
         case mealCount = "meal_count"
     }
 
     func consumed(_ key: String) -> Double { consumed[key] ?? 0 }
+
+    /// The rolling window, oldest day first, empty when the backend sent none.
+    var historyDays: [DayIntake] { history ?? [] }
 }
 
-/// A per-metric goal. `kind` decides how to read floor/ceiling and how to colour it.
+/// One completed day from the rolling `history` window — the same shape as `consumed`,
+/// so a nutrient's multi-day pattern reads exactly like today's intake.
+struct DayIntake: Decodable, Hashable {
+    let date: String
+    let consumed: [String: Double]
+
+    enum CodingKeys: String, CodingKey { case date, consumed }
+
+    func consumed(_ key: String) -> Double { consumed[key] ?? 0 }
+}
+
+/// A per-metric goal. `kind` decides how to read floor/ceiling and how to colour it;
+/// `horizon` decides whether it's judged on today or on a rolling average; a `ceiling`
+/// on a non-limit metric is that nutrient's toxicity upper limit (UL).
 struct Target: Decodable, Hashable {
     let kind: String        // Kind.reach / .limit / .window
     let floor: Double?      // reach: hit this. window: lower edge.
-    let ceiling: Double?    // limit: stay under this. window: upper edge.
+    let ceiling: Double?    // limit: stay under this. window: upper edge. reach: the UL.
     let unit: String
     let source: String?     // "measured" | "rda" | "manual"
+    let horizon: String?    // Horizon.daily / .rolling; nil on older payloads
 
     enum Kind {
         static let reach = "reach"
         static let limit = "limit"
         static let window = "window"
     }
+
+    enum Horizon {
+        static let daily = "daily"      // non-cumulative — judge today; consistency matters
+        static let rolling = "rolling"  // body-banked — judge the multi-day average
+    }
+
+    /// Buffered by body stores, so a single low day is covered by reserves — read it
+    /// against the rolling average, not today. Defaults to daily when unknown.
+    var isRolling: Bool { horizon == Horizon.rolling }
+
+    /// A reach/window nutrient may also carry a toxicity ceiling (its UL). This is that
+    /// UL, or nil when a surplus is biologically safe (and so must never read as a
+    /// risk). For a pure `limit` the ceiling IS the target, not a UL, so it's excluded.
+    var upperLimit: Double? { kind == Kind.limit ? nil : ceiling }
 
     /// The single number a ring/bar fills toward: the floor for reach, the ceiling
     /// for a limit, the mid-point of a window.

@@ -2,39 +2,50 @@
 //  Nutrients.swift
 //  HealthTracker
 //
-//  The presentation catalogue for the 37 micronutrients: the pt-PT label, the
-//  group and the display order for each backend key. The backend owns the data
-//  (amounts + targets, in English snake_case keys); the app owns how it reads to a
-//  Portuguese-speaking human. Keys here are the single source of truth that must
-//  match the backend's NUTRIENT_KEYS.
+//  The presentation catalogue for the micronutrients: the pt-PT label and display
+//  order for each backend key, plus the mapping of a nutrient to the biological
+//  SECTION it belongs in. The section is *derived from the live target's kinetics*
+//  (`horizon` + whether it carries a ceiling), never hard-coded — so the screen's
+//  structure always matches the backend's science and can't silently drift from it.
+//  The backend owns the data (amounts, floors, ceilings, horizon); the app owns how
+//  it reads to a Portuguese-speaking human. Keys must match the backend's
+//  NUTRIENT_KEYS.
 //
 
 import Foundation
 
-/// The four groups the Nutrients screen is organised into, in display order.
-enum NutrientGroup: String, CaseIterable, Identifiable {
-    case watch       // limits — surfaced first ("show when over", not only under)
-    case vitamins
-    case minerals
-    case fatsFiber
+/// The three biological behaviours «Nutrientes» is organised around. A nutrient's
+/// home section is decided by its target (see `NutrientCatalog.members`), so it tracks
+/// the backend's kinetics rather than a second, drift-prone copy of the taxonomy.
+enum NutrientSection: String, CaseIterable, Identifiable {
+    case diarios     // daily floor — repõe todos os dias (consistency is the story)
+    case reservas    // rolling floor — o corpo acumula (read the multi-day average)
+    case vigiar      // a ceiling to respect — dietary limits + toxicity ULs (crosscuts)
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
-        case .watch:     return "A vigiar"
-        case .vitamins:  return "Vitaminas"
-        case .minerals:  return "Minerais"
-        case .fatsFiber: return "Gorduras & fibra"
+        case .diarios:  return "Diários"
+        case .reservas: return "Reservas"
+        case .vigiar:   return "A vigiar"
+        }
+    }
+
+    /// The one-line teaching caption under the section title — the science, in a phrase.
+    var caption: String {
+        switch self {
+        case .diarios:  return "Repõe todos os dias — o que conta é a consistência"
+        case .reservas: return "O corpo acumula — olha para a média, não para um só dia"
+        case .vigiar:   return "Teto de segurança — o objetivo é ficar abaixo"
         }
     }
 
     var systemImage: String {
         switch self {
-        case .watch:     return "exclamationmark.triangle.fill"
-        case .vitamins:  return "pills.fill"
-        case .minerals:  return "bolt.fill"
-        case .fatsFiber: return "drop.fill"
+        case .diarios:  return "sun.max.fill"
+        case .reservas: return "archivebox.fill"
+        case .vigiar:   return "shield.lefthalf.filled"
         }
     }
 }
@@ -62,58 +73,79 @@ struct NutrientDef: Identifiable, Hashable {
 }
 
 enum NutrientCatalog {
-    static let groups: [NutrientGroup: [NutrientDef]] = [
-        .watch: [
-            NutrientDef(key: "sodium_mg", label: "Sódio"),
-            NutrientDef(key: "added_sugar_g", label: "Açúcar adicionado"),
-            NutrientDef(key: "saturated_fat_g", label: "Gordura saturada"),
-            NutrientDef(key: "trans_fat_g", label: "Gordura trans"),
-            NutrientDef(key: "cholesterol_mg", label: "Colesterol"),
-        ],
-        .vitamins: [
-            NutrientDef(key: "vitamin_a_ug", label: "Vitamina A"),
-            NutrientDef(key: "vitamin_c_mg", label: "Vitamina C"),
-            NutrientDef(key: "vitamin_d_ug", label: "Vitamina D"),
-            NutrientDef(key: "vitamin_e_mg", label: "Vitamina E"),
-            NutrientDef(key: "vitamin_k_ug", label: "Vitamina K"),
-            NutrientDef(key: "vitamin_b1_mg", label: "B1 · Tiamina"),
-            NutrientDef(key: "vitamin_b2_mg", label: "B2 · Riboflavina"),
-            NutrientDef(key: "vitamin_b3_mg", label: "B3 · Niacina"),
-            NutrientDef(key: "vitamin_b5_mg", label: "B5 · Ác. pantoténico"),
-            NutrientDef(key: "vitamin_b6_mg", label: "Vitamina B6"),
-            NutrientDef(key: "vitamin_b12_ug", label: "Vitamina B12"),
-            NutrientDef(key: "folate_ug", label: "Folato"),
-            NutrientDef(key: "biotin_ug", label: "Biotina"),
-        ],
-        .minerals: [
-            NutrientDef(key: "calcium_mg", label: "Cálcio"),
-            NutrientDef(key: "iron_mg", label: "Ferro"),
-            NutrientDef(key: "magnesium_mg", label: "Magnésio"),
-            NutrientDef(key: "zinc_mg", label: "Zinco"),
-            NutrientDef(key: "potassium_mg", label: "Potássio"),
-            NutrientDef(key: "phosphorus_mg", label: "Fósforo"),
-            NutrientDef(key: "copper_mg", label: "Cobre"),
-            NutrientDef(key: "manganese_mg", label: "Manganês"),
-            NutrientDef(key: "selenium_ug", label: "Selénio"),
-            NutrientDef(key: "iodine_ug", label: "Iodo"),
-            NutrientDef(key: "choline_mg", label: "Colina"),
-            NutrientDef(key: "chloride_mg", label: "Cloreto"),
-        ],
-        .fatsFiber: [
-            NutrientDef(key: "fiber_g", label: "Fibra"),
-            NutrientDef(key: "omega3_g", label: "Ómega-3"),
-            NutrientDef(key: "monounsaturated_fat_g", label: "Gordura monoinsaturada"),
-            NutrientDef(key: "polyunsaturated_fat_g", label: "Gordura polinsaturada"),
-            NutrientDef(key: "omega6_g", label: "Ómega-6"),
-            NutrientDef(key: "sugar_g", label: "Açúcar total"),
-        ],
+    /// Every catalogued nutrient in display order (vitamins, then minerals, then fats
+    /// & fibre & the dietary limits). The section filters below preserve this order.
+    static let all: [NutrientDef] = [
+        // vitamins
+        NutrientDef(key: "vitamin_a_ug", label: "Vitamina A"),
+        NutrientDef(key: "vitamin_c_mg", label: "Vitamina C"),
+        NutrientDef(key: "vitamin_d_ug", label: "Vitamina D"),
+        NutrientDef(key: "vitamin_e_mg", label: "Vitamina E"),
+        NutrientDef(key: "vitamin_k_ug", label: "Vitamina K"),
+        NutrientDef(key: "vitamin_b1_mg", label: "B1 · Tiamina"),
+        NutrientDef(key: "vitamin_b2_mg", label: "B2 · Riboflavina"),
+        NutrientDef(key: "vitamin_b3_mg", label: "B3 · Niacina"),
+        NutrientDef(key: "vitamin_b5_mg", label: "B5 · Ác. pantoténico"),
+        NutrientDef(key: "vitamin_b6_mg", label: "Vitamina B6"),
+        NutrientDef(key: "vitamin_b12_ug", label: "Vitamina B12"),
+        NutrientDef(key: "folate_ug", label: "Folato"),
+        NutrientDef(key: "biotin_ug", label: "Biotina"),
+        // minerals
+        NutrientDef(key: "calcium_mg", label: "Cálcio"),
+        NutrientDef(key: "iron_mg", label: "Ferro"),
+        NutrientDef(key: "magnesium_mg", label: "Magnésio"),
+        NutrientDef(key: "zinc_mg", label: "Zinco"),
+        NutrientDef(key: "potassium_mg", label: "Potássio"),
+        NutrientDef(key: "phosphorus_mg", label: "Fósforo"),
+        NutrientDef(key: "copper_mg", label: "Cobre"),
+        NutrientDef(key: "manganese_mg", label: "Manganês"),
+        NutrientDef(key: "selenium_ug", label: "Selénio"),
+        NutrientDef(key: "iodine_ug", label: "Iodo"),
+        NutrientDef(key: "choline_mg", label: "Colina"),
+        NutrientDef(key: "chloride_mg", label: "Cloreto"),
+        // fats, fibre & the dietary limits
+        NutrientDef(key: "fiber_g", label: "Fibra"),
+        NutrientDef(key: "omega3_g", label: "Ómega-3"),
+        NutrientDef(key: "monounsaturated_fat_g", label: "Gordura monoinsaturada"),
+        NutrientDef(key: "polyunsaturated_fat_g", label: "Gordura polinsaturada"),
+        NutrientDef(key: "omega6_g", label: "Ómega-6"),
+        NutrientDef(key: "sugar_g", label: "Açúcar total"),
+        NutrientDef(key: "added_sugar_g", label: "Açúcar adicionado"),
+        NutrientDef(key: "saturated_fat_g", label: "Gordura saturada"),
+        NutrientDef(key: "trans_fat_g", label: "Gordura trans"),
+        NutrientDef(key: "sodium_mg", label: "Sódio"),
+        NutrientDef(key: "cholesterol_mg", label: "Colesterol"),
     ]
 
-    static func defs(_ group: NutrientGroup) -> [NutrientDef] { groups[group] ?? [] }
-
-    /// Every catalogued nutrient, for lookups (e.g. the drill-down label).
+    /// Every catalogued nutrient, for lookups (e.g. the Today flags, the drill-down).
     static let byKey: [String: NutrientDef] = Dictionary(
-        uniqueKeysWithValues: groups.values.flatMap { $0 }.map { ($0.key, $0) })
+        uniqueKeysWithValues: all.map { ($0.key, $0) })
 
     static func label(for key: String) -> String { byKey[key]?.label ?? key }
+
+    /// The nutrients to show in a section, derived from the LIVE targets so the screen
+    /// always matches the backend's kinetics:
+    ///  - `diarios`  — a floor to reach on a daily horizon (not body-banked);
+    ///  - `reservas` — a floor to reach on a rolling horizon (body-banked);
+    ///  - `vigiar`   — carries a ceiling to respect (a dietary limit OR a toxicity UL).
+    ///    This is cross-cutting on purpose: iron is a reserve AND a ceiling to watch,
+    ///    so it appears in both `reservas` and `vigiar`.
+    static func members(_ section: NutrientSection,
+                        targets: [String: Target]) -> [NutrientDef] {
+        all.filter { def in
+            guard let t = targets[def.key] else { return false }
+            switch section {
+            case .diarios:  return t.kind != Target.Kind.limit && !t.isRolling
+            case .reservas: return t.kind != Target.Kind.limit && t.isRolling
+            case .vigiar:   return t.kind == Target.Kind.limit || t.upperLimit != nil
+            }
+        }
+    }
+
+    /// Catalogued nutrients eaten today that have NO target — the context fats and
+    /// total sugar. Shown as amounts only, so nothing measured is silently dropped.
+    static func context(consumed: [String: Double],
+                        targets: [String: Target]) -> [NutrientDef] {
+        all.filter { targets[$0.key] == nil && (consumed[$0.key] ?? 0) > 0 }
+    }
 }

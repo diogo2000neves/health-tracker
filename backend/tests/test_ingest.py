@@ -1357,6 +1357,71 @@ def test_target_seed_rows_only_adds_missing_metrics():
     assert len(rows_some) == len(rows_all) - 2
 
 
+# -- kinetics: the biology stamped onto each target -----------------------------
+def test_with_kinetics_stamps_horizon_and_only_reachable_ceilings():
+    base = {
+        "vitamin_c_mg": {"kind": "reach", "floor": 90.0, "unit": "mg", "source": "rda"},
+        "vitamin_d_ug": {"kind": "reach", "floor": 15.0, "unit": "ug", "source": "rda"},
+        "iron_mg":      {"kind": "reach", "floor": 8.0, "unit": "mg", "source": "rda"},
+        "zinc_mg":      {"kind": "reach", "floor": 11.0, "unit": "mg", "source": "rda"},
+        "protein_g":    {"kind": "reach", "floor": 140.0, "unit": "g", "source": "measured"},
+        "sodium_mg":    {"kind": "limit", "ceiling": 2300.0, "unit": "mg", "source": "rda"},
+    }
+    out = ingest._with_kinetics(base)
+    # water-soluble, UL unreachable from food -> daily, and NO ceiling: a surplus is safe
+    assert out["vitamin_c_mg"]["horizon"] == "daily"
+    assert "ceiling" not in out["vitamin_c_mg"]
+    # stored in body fat/liver -> rolling, WITH a reachable toxicity ceiling
+    assert out["vitamin_d_ug"]["horizon"] == "rolling" and out["vitamin_d_ug"]["ceiling"] == 100.0
+    assert out["iron_mg"]["horizon"] == "rolling" and out["iron_mg"]["ceiling"] == 45.0
+    # the one non-cumulative nutrient that still carries a reachable ceiling
+    assert out["zinc_mg"]["horizon"] == "daily" and out["zinc_mg"]["ceiling"] == 40.0
+    # anything unlisted (a macro) defaults to daily with no ceiling
+    assert out["protein_g"]["horizon"] == "daily" and "ceiling" not in out["protein_g"]
+    # a pure limit keeps its own ceiling and takes the daily default
+    assert out["sodium_mg"]["horizon"] == "daily" and out["sodium_mg"]["ceiling"] == 2300.0
+    # purely additive: the input targets are not mutated
+    assert base["iron_mg"] == {"kind": "reach", "floor": 8.0, "unit": "mg", "source": "rda"}
+
+
+def test_with_kinetics_never_overwrites_a_user_ceiling():
+    base = {
+        # a user tightened iron in the sheet — the 45 mg UL must not clobber it
+        "iron_mg": {"kind": "reach", "floor": 8.0, "ceiling": 20.0, "unit": "mg",
+                    "source": "manual"},
+        # body-banked but no reachable UL -> rolling, and left open (surplus is safe)
+        "vitamin_b12_ug": {"kind": "reach", "floor": 2.4, "unit": "ug", "source": "rda"},
+    }
+    out = ingest._with_kinetics(base)
+    assert out["iron_mg"]["ceiling"] == 20.0                      # the user's value wins
+    assert out["vitamin_b12_ug"]["horizon"] == "rolling"
+    assert "ceiling" not in out["vitamin_b12_ug"]
+
+
+# -- the rolling history window (last N completed days, live from meals) ---------
+def test_history_window_sums_completed_days_and_skips_blanks():
+    def meal(dt, cals, nutrients):
+        return {"datetime": dt, "foods": "food", "calories": cals, "protein_g": 0,
+                "carbs_g": 0, "fat_g": 0,
+                "items": json.dumps([{"name": "x", "portion_g": 100, "calories": cals,
+                                      "protein_g": 0, "carbs_g": 0, "fat_g": 0,
+                                      "nutrients": nutrients}])}
+    rows = [
+        meal("2026-07-17T08:00:00+01:00", 300, {"iron_mg": 2.0}),
+        meal("2026-07-17T13:00:00+01:00", 200, {"iron_mg": 1.0}),   # same day -> summed
+        meal("2026-07-15T13:00:00+01:00", 400, {"iron_mg": 5.0}),
+        # 2026-07-16 has ONLY a stub -> that day is omitted, never emitted as a zero
+        {"datetime": "2026-07-16T09:00:00+01:00", "foods": "analysis failed",
+         "calories": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0, "items": "[]"},
+        meal("2026-07-18T08:00:00+01:00", 999, {"iron_mg": 9.0}),   # the ref day -> excluded
+    ]
+    hist = ingest._history_window(rows, "2026-07-18", 7)
+    assert [d["date"] for d in hist] == ["2026-07-15", "2026-07-17"]   # oldest first
+    assert hist[-1]["consumed"]["iron_mg"] == 3.0                 # 2.0 + 1.0 across the day
+    assert hist[-1]["consumed"]["calories"] == 500.0
+    assert ingest._history_window([], "2026-07-18", 7) == []      # no meals -> empty window
+
+
 # -- GET /today (the live daily-screen payload) --------------------------------
 _TODAY_DAILY_GRID = [
     ["date", "total_cals_out", "weight_kg", "lean_mass_kg", "bmr_kcal", "updated_at"],
@@ -1436,7 +1501,7 @@ def test_today_attaches_targets_layered_over_defaults(monkeypatch):
         "/today?date=2026-07-18", headers=_HDR).get_json()["targets"]
     # a measured macro, computed live from the user's own data
     assert t["protein_g"] == {"kind": "reach", "floor": 140.0, "unit": "g",
-                              "source": "measured"}
+                              "source": "measured", "horizon": "daily"}
     # an RDA default present though it isn't in the tab at all
     assert t["vitamin_c_mg"]["floor"] == 90.0 and t["vitamin_c_mg"]["source"] == "rda"
     # a manual override WINS over the measured calorie window
@@ -1444,6 +1509,22 @@ def test_today_attaches_targets_layered_over_defaults(monkeypatch):
     assert t["calories"]["floor"] == 1500.0 and t["calories"]["ceiling"] == 1800.0
     # a manual micro override wins over the rda default (2300 -> 2000)
     assert t["sodium_mg"]["ceiling"] == 2000.0 and t["sodium_mg"]["source"] == "manual"
+
+
+def test_today_stamps_horizon_and_returns_the_rolling_history(monkeypatch):
+    body = _today_client(monkeypatch).get(
+        "/today?date=2026-07-18", headers=_HDR).get_json()
+    t = body["targets"]
+    # every micro carries its kinetics horizon
+    assert t["vitamin_c_mg"]["horizon"] == "daily"       # non-cumulative
+    assert t["vitamin_d_ug"]["horizon"] == "rolling"     # body-banked
+    # a reachable toxicity ceiling is stamped on the stored nutrients, not the safe ones
+    assert t["iron_mg"]["ceiling"] == 45.0 and t["iron_mg"]["horizon"] == "rolling"
+    assert "ceiling" not in t["vitamin_c_mg"]            # a surplus of C is safe
+    # the rolling window: yesterday's meal, summed live from the meals tab
+    hist = body["history"]
+    assert [d["date"] for d in hist] == ["2026-07-17"]   # only the prior day had real food
+    assert hist[0]["consumed"]["iron_mg"] == 99.0
 
 
 def test_today_basis_exposes_the_derivation_inputs(monkeypatch):

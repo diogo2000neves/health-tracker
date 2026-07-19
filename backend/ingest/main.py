@@ -269,6 +269,12 @@ NUTRIENTS_UG = [
 ]
 NUTRIENT_KEYS = NUTRIENTS_G + NUTRIENTS_MG + NUTRIENTS_UG
 
+# How many completed days /today returns as the rolling `history` window. Buffered
+# ("rolling") nutrients are read against this window's average, so a single low day is
+# judged against reserves, not shown as a deficit. Seven smooths daily variance while
+# still being short enough to have data for a newer user; it is a tunable constant.
+NUTRIENT_HISTORY_DAYS = 7
+
 # -- targets: the per-metric goals every number is shown against --------------
 # A number without a target is trivia. The `targets` tab is the source of truth,
 # user-visible and editable in the sheet (like `meals`/`templates`, it is created
@@ -295,6 +301,15 @@ TARGETS_LAST_COL = chr(ord("A") + len(TARGETS_TAB_HEADERS) - 1)  # "F"
 
 TARGET_REACH, TARGET_LIMIT, TARGET_WINDOW = "reach", "limit", "window"
 SRC_MEASURED, SRC_RDA, SRC_MANUAL = "measured", "rda", "manual"
+
+# A nutrient's kinetics `horizon` — how a deficit should be read (see _with_kinetics
+# and _NUTRIENT_KINETICS). This is intrinsic biology, not a per-user setting, so it is
+# stamped onto targets at read time and never stored in the sheet.
+#   daily   = not stored in the body in any useful amount; judge TODAY vs the floor —
+#             the excess is excreted, so what matters is day-to-day CONSISTENCY.
+#   rolling = buffered by body stores (liver, fat, bone) for days to months; judge the
+#             rolling AVERAGE — a single low day is covered by reserves, not a deficit.
+HORIZON_DAILY, HORIZON_ROLLING = "daily", "rolling"
 
 # Micronutrient reference values for an ADULT MALE, 19-50 (the user: male, 25).
 # reach floors are the U.S. DRI RDA where one exists, else the AI; limit ceilings
@@ -338,6 +353,53 @@ _MICRO_TARGETS: Dict[str, Tuple[str, Optional[float], Optional[float], str]] = {
     "sodium_mg":      (TARGET_LIMIT, None, 2300, "mg"),   # CDRR
     "trans_fat_g":    (TARGET_LIMIT, None, 2,    "g"),    # keep as low as possible
     "cholesterol_mg": (TARGET_LIMIT, None, 300,  "mg"),   # traditional guideline
+}
+
+# The biological kinetics of each nutrient — the reference science that turns a bare
+# daily percentage into an honest reading. Two intrinsic properties, same for every
+# person, so they live here (not in the user's sheet) and are attached at read time by
+# _with_kinetics:
+#
+#   horizon  daily | rolling (see HORIZON_*). Water-soluble vitamins are `daily`, BUT
+#            the taxonomy follows physiology, not chemistry: B12 and folate are
+#            `rolling` because the liver banks them (B12 for 3-5 YEARS, folate for
+#            weeks), while magnesium/potassium/zinc are `daily` because an active male
+#            sweats them out faster than any tissue pool can buffer.
+#   ceiling  a Tolerable Upper Intake Level (UL), assigned ONLY when it is both
+#            reachable from food/ordinary supplements AND genuinely harmful. This is
+#            the line between a harmless surplus and a dangerous one: vitamin C's UL
+#            (2000 mg) is ~22x its floor and unreachable from food, so a 300% day is
+#            fine and it gets NO ceiling; iron's UL (45 mg) is one liver portion away
+#            and a male cannot excrete the excess, so it gets one. A `None` here means
+#            "surplus is safe" and the UI must never colour it as a risk.
+#
+# Anything absent from this map defaults to (daily, no ceiling). Only the `rolling`
+# nutrients and the one `daily` nutrient with a reachable ceiling (zinc) are listed;
+# the remaining daily-with-no-ceiling nutrients (vitamin C, B1/B2/B3/B5/B6, biotin,
+# choline, magnesium, potassium, chloride, fibre) fall through to the default. The
+# pure `limit` metrics (sodium, added sugar, sat/trans fat, cholesterol) already carry
+# their ceiling from _MICRO_TARGETS/_derive_targets and just take the daily default.
+# Each entry: key -> (horizon, upper_limit | None).
+_NUTRIENT_KINETICS: Dict[str, Tuple[str, Optional[float]]] = {
+    # fat-soluble vitamins — stored in liver and fat for weeks to months.
+    "vitamin_a_ug":   (HORIZON_ROLLING, 3000.0),   # preformed retinol is hepatotoxic
+    "vitamin_d_ug":   (HORIZON_ROLLING, 100.0),    # 4000 IU; hypercalcaemia above
+    "vitamin_e_mg":   (HORIZON_ROLLING, 1000.0),   # anticoagulant at megadoses
+    "vitamin_k_ug":   (HORIZON_ROLLING, None),     # no toxicity from K1/K2
+    # water-soluble but body-banked, so read as reserves, not day-to-day.
+    "vitamin_b12_ug": (HORIZON_ROLLING, None),     # liver holds 3-5 years
+    "folate_ug":      (HORIZON_ROLLING, None),     # UL is synthetic-only; food exempt
+    # minerals the body accumulates / regulates over the long term.
+    "iron_mg":        (HORIZON_ROLLING, 45.0),     # a male cannot excrete the excess
+    "calcium_mg":     (HORIZON_ROLLING, 2500.0),   # a ~1 kg skeletal buffer
+    "phosphorus_mg":  (HORIZON_ROLLING, 4000.0),   # bone-buffered; excess is the risk
+    "copper_mg":      (HORIZON_ROLLING, 10.0),     # liver-stored
+    "manganese_mg":   (HORIZON_ROLLING, 11.0),     # neurotoxic ceiling
+    "selenium_ug":    (HORIZON_ROLLING, 400.0),    # narrow window (one Brazil nut!)
+    "iodine_ug":      (HORIZON_ROLLING, 1100.0),   # thyroid banks 70-80%
+    "omega3_g":       (HORIZON_ROLLING, None),     # incorporates into membranes slowly
+    # non-cumulative, but the ONE daily nutrient with a reachable, risky ceiling.
+    "zinc_mg":        (HORIZON_DAILY,   40.0),     # excess depletes copper
 }
 
 # Recomposition parameters (the user's chosen goal: lose fat, hold muscle). All
@@ -1477,12 +1539,19 @@ def _rows_as_dicts(values: List[List[Any]]) -> List[Dict[str, Any]]:
     return [dict(zip(values[0], row)) for row in values[1:]]
 
 
-def _todays_meals(today: str) -> List[Dict[str, Any]]:
+def _all_meal_rows() -> List[Dict[str, Any]]:
+    """Every meal row as a dict, or [] if the tab doesn't exist yet. Read once per
+    request and sliced for both today and the rolling history, so the window costs no
+    extra sheet read (the whole meals tab is already loaded)."""
     try:
-        rows = _rows_as_dicts(_read_tab(MEALS_TAB))
+        return _rows_as_dicts(_read_tab(MEALS_TAB))
     except Exception:  # tab not created yet
         return []
-    return [r for r in rows if str(r.get("datetime", "")).startswith(today)]
+
+
+def _todays_meals(today: str) -> List[Dict[str, Any]]:
+    return [r for r in _all_meal_rows()
+            if str(r.get("datetime", "")).startswith(today)]
 
 
 def _ensure_meals_tab() -> Optional[int]:
@@ -2038,6 +2107,26 @@ def _resolve_targets(derived: Dict[str, Dict[str, Any]],
     return final
 
 
+def _with_kinetics(targets: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Attach each metric's intrinsic biology to its target: a `horizon` (daily vs
+    rolling) and, for a nutrient with a reachable toxicity ceiling (a UL) that has no
+    ceiling yet, that UL as `ceiling`.
+
+    This is the last layer over _resolve_targets, applied only at the /today boundary
+    so the layering logic and its tests stay untouched. It is purely additive — a
+    user's own floor/ceiling (from the sheet) is never overwritten — and it is where
+    the app learns that a low vitamin-D day is fine (rolling) while an iron surplus is
+    not (a 45 mg ceiling)."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for metric, target in targets.items():
+        horizon, upper = _NUTRIENT_KINETICS.get(metric, (HORIZON_DAILY, None))
+        enriched = {**target, "horizon": horizon}
+        if upper is not None and enriched.get("ceiling") is None:
+            enriched["ceiling"] = float(upper)
+        out[metric] = enriched
+    return out
+
+
 def _todays_consumed(rows: List[Dict[str, Any]]) -> Dict[str, float]:
     """Live totals for the day: macros from the flat meal columns plus every one of
     the 37 micronutrients, summed from each meal's per-ingredient `items` JSON.
@@ -2067,6 +2156,34 @@ def _todays_consumed(rows: List[Dict[str, Any]]) -> Dict[str, float]:
         if value > 0:
             consumed[key] = round(value, 2 if key.endswith("_g") else 1)
     return consumed
+
+
+def _history_window(meal_rows: List[Dict[str, Any]], ref_day: str,
+                    n: int) -> List[Dict[str, Any]]:
+    """The `n` completed days BEFORE ref_day, each as {date, consumed} — the same
+    per-day intake sum /today reports for today, computed live from the meals tab for
+    the whole window. This is what lets the app read a buffered (rolling) nutrient
+    against its multi-day average instead of alarming over a single low day.
+
+    A day with no logged meal is OMITTED, never emitted as a zero: a blank day means
+    'not tracked', and counting it as 0 intake would falsely drag a rolling average
+    down. Oldest day first, so the app reads it left-to-right as time."""
+    by_day: Dict[str, List[Dict[str, Any]]] = {}
+    for row in meal_rows:
+        day = str(row.get("datetime", ""))[:10]
+        if day:
+            by_day.setdefault(day, []).append(row)
+    ref = datetime.fromisoformat(ref_day).date()
+    out: List[Dict[str, Any]] = []
+    for delta in range(n, 0, -1):
+        day = (ref - timedelta(days=delta)).isoformat()
+        rows = by_day.get(day)
+        if not rows:
+            continue
+        consumed = _todays_consumed(rows)
+        if consumed.get("calories", 0) > 0:   # a real eating day, not just stubs
+            out.append({"date": day, "consumed": consumed})
+    return out
 
 
 def _today_meals_out(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2758,8 +2875,12 @@ def today():
 
     `targets` merges three layers (see _resolve_targets): the RDA reference table,
     the user's edits in the `targets` tab, and the calorie/macro targets derived
-    live from measured data. `basis` exposes the inputs behind the derived numbers
-    (TDEE, weight) so the app can be honest about where they came from.
+    live from measured data, then each is stamped with its kinetics (`horizon` +, for
+    a nutrient with a reachable toxicity ceiling, that UL — see _with_kinetics).
+    `basis` exposes the inputs behind the derived numbers (TDEE, weight) so the app
+    can be honest about where they came from. `history` is the last
+    NUTRIENT_HISTORY_DAYS completed days of intake (same shape as `consumed`), so the
+    app can read a buffered nutrient against its rolling average.
 
     `?date=` (default today, server tz) lets the app review an earlier day too.
     """
@@ -2770,7 +2891,9 @@ def today():
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
         return jsonify({"error": "date must be YYYY-MM-DD"}), 400
 
-    meal_rows = _todays_meals(day)                      # meals tab, filtered by date
+    all_meal_rows = _all_meal_rows()                    # the meals tab, read once
+    meal_rows = [r for r in all_meal_rows               # today: consumed + the list
+                 if str(r.get("datetime", "")).startswith(day)]
     daily_rows = _rows_as_dicts(_read_tab(DAILY_TAB))   # for the measured derivation
     derived, basis = _derive_targets(daily_rows)
 
@@ -2779,7 +2902,7 @@ def today():
         _seed_targets(grid, derived)
     except Exception:
         app.logger.warning("targets seed skipped (non-fatal)", exc_info=True)
-    targets = _resolve_targets(derived, _targets_from_grid(grid))
+    targets = _with_kinetics(_resolve_targets(derived, _targets_from_grid(grid)))
 
     meals_out = _today_meals_out(meal_rows)
     return jsonify({
@@ -2789,6 +2912,7 @@ def today():
         "targets": targets,
         "basis": basis,
         "meals": meals_out,
+        "history": _history_window(all_meal_rows, day, NUTRIENT_HISTORY_DAYS),
     }), 200
 
 

@@ -139,6 +139,152 @@ struct MetricStatus {
     }
 }
 
+// MARK: - NutrientReading (the kinetics-aware read)
+
+/// Reads one micronutrient the way its biology demands, replacing the single-day
+/// `MetricStatus` for the Nutrients screen. It combines two independent stories:
+///
+///   * a DEFICIT story — is the floor met? Judged on the rolling AVERAGE for a
+///     buffered ("rolling") nutrient (so a single low day is covered by reserves and
+///     never turns red), and on TODAY for a non-cumulative one (where consistency is
+///     what matters);
+///   * a CEILING story — for a nutrient with a reachable toxicity limit (a UL) or a
+///     dietary limit, how close is intake to it? Judged on the worse of today (acute)
+///     and the rolling average (chronic), so one liver-heavy day still flags.
+///
+/// The headline colour is the worse of the two, so "reserves fine" never hides
+/// "approaching a toxic ceiling", and a harmless surplus (no UL) never reads as risk.
+struct NutrientReading {
+    let target: Target
+    let today: Double
+    /// This nutrient's intake per completed day in the rolling window, oldest first.
+    let dailyHistory: [Double]
+
+    init(target: Target, today: Double, dailyHistory: [Double]) {
+        self.target = target
+        self.today = today
+        self.dailyHistory = dailyHistory
+    }
+
+    /// Pull a nutrient's today + rolling history straight out of a /today payload.
+    init(key: String, target: Target, response: TodayResponse) {
+        self.init(target: target, today: response.consumed(key),
+                  dailyHistory: response.historyDays.map { $0.consumed(key) })
+    }
+
+    // -- the window --
+    var daysCounted: Int { dailyHistory.count }
+    var average: Double? {
+        daysCounted > 0 ? dailyHistory.reduce(0, +) / Double(daysCounted) : nil
+    }
+    /// True when the deficit is read against reserves (a rolling nutrient with history),
+    /// not today.
+    var usesRolling: Bool { target.isRolling && average != nil }
+    /// The amount the deficit is judged against.
+    var basis: Double { usesRolling ? (average ?? today) : today }
+
+    var isLimit: Bool { target.kind == Target.Kind.limit }
+    /// The floor to reach (nil for a pure limit — there's nothing to hit).
+    var floor: Double? { isLimit ? nil : target.floor }
+    /// The toxicity upper limit, or nil when a surplus is biologically safe.
+    var upperLimit: Double? { target.upperLimit }
+
+    var floorFraction: Double {
+        guard let f = floor, f > 0 else { return 0 }
+        return basis / f
+    }
+    /// The exposure tested against the ceiling: a limit is judged on today (a daily
+    /// budget), a UL on the worse of today (acute) and the rolling average (chronic).
+    var ceilingExposure: Double { isLimit ? today : max(today, basis) }
+    var ceilingFraction: Double {
+        guard let c = target.ceiling, c > 0 else { return 0 }
+        return ceilingExposure / c
+    }
+
+    enum Deficit { case met, close, far }
+    enum Ceiling { case none, ok, near, over }
+
+    var deficit: Deficit {
+        guard floor != nil else { return .met }          // no floor -> nothing to reach
+        if floorFraction >= 1 { return .met }
+        return floorFraction >= 0.6 ? .close : .far
+    }
+    var ceiling: Ceiling {
+        guard target.ceiling != nil else { return .none }
+        if ceilingFraction > 1 { return .over }
+        if ceilingFraction >= 0.8 { return .near }
+        return .ok
+    }
+
+    /// The headline colour: the worse of the ceiling and deficit stories.
+    var fill: Color {
+        switch ceiling {
+        case .over: return Palette.critical
+        case .near: return Palette.warning              // a warning even if the floor is met
+        case .ok, .none:
+            switch deficit {
+            case .met:   return Palette.good
+            case .close: return Palette.warning
+            case .far:   return Palette.neutral
+            }
+        }
+    }
+
+    var textColor: Color {
+        switch ceiling {
+        case .over: return Palette.criticalText
+        case .near: return Palette.warningText
+        case .ok, .none:
+            switch deficit {
+            case .met:   return Palette.goodText
+            case .close: return Palette.warningText
+            case .far:   return .secondary
+            }
+        }
+    }
+
+    var symbol: String {
+        switch ceiling {
+        case .over: return "exclamationmark.circle.fill"
+        case .near: return "exclamationmark.triangle.fill"
+        case .ok, .none:
+            switch deficit {
+            case .met:   return "checkmark.circle.fill"
+            case .close: return usesRolling ? "arrow.up.circle.fill" : "hourglass"
+            case .far:   return usesRolling ? "arrow.down.circle" : ""
+            }
+        }
+    }
+
+    /// A short pt-PT status word, tuned to the nutrient's kind so the same colour reads
+    /// correctly whether it's a reserve, a daily essential, or a limit.
+    var label: String {
+        if isLimit {
+            switch ceiling {
+            case .over: return "acima"
+            case .near: return "perto do limite"
+            default:    return "com folga"
+            }
+        }
+        switch ceiling {
+        case .over: return "acima do teto"
+        case .near: return "perto do teto"
+        case .ok, .none:
+            switch deficit {
+            case .met:   return "no alvo"
+            case .close: return usesRolling ? "reservas a descer" : "quase lá"
+            case .far:   return usesRolling ? "reservas baixas" : "em falta"
+            }
+        }
+    }
+
+    /// Counts toward the section's "on target" tally: floor met (or a limit respected)
+    /// and not over a ceiling.
+    var onTarget: Bool { ceiling != .over && (isLimit || deficit == .met) }
+    var isNearCeiling: Bool { ceiling == .near }
+    var isOverCeiling: Bool { ceiling == .over }
+}
+
 // MARK: - Ring
 
 /// A circular progress ring with a rounded cap and any centred content. The fill is
@@ -196,6 +342,96 @@ struct TargetBar: View {
                         .frame(width: 2, height: height + 4)
                         .offset(x: marker * w - 1)
                 }
+            }
+        }
+        .frame(height: height)
+    }
+}
+
+// MARK: - Kinetics lenses
+
+/// The consistency record for a NON-CUMULATIVE nutrient: one dot per completed day,
+/// filled green when that day hit the floor, hollow when it fell short. The whole
+/// point of the daily lens — for a nutrient the body can't store, what matters isn't a
+/// single big day, it's how many days in a row you actually hit it.
+struct WeekDots: View {
+    var values: [Double]        // this nutrient, per completed day, oldest first
+    var floor: Double
+    var dot: CGFloat = 8
+
+    var body: some View {
+        HStack(spacing: 5) {
+            ForEach(Array(values.enumerated()), id: \.offset) { _, v in
+                let met = floor > 0 && v >= floor
+                Circle()
+                    .fill(met ? Palette.good : Palette.track)
+                    .frame(width: dot, height: dot)
+                    .overlay(
+                        Circle().strokeBorder(
+                            met ? Color.clear : Palette.neutral.opacity(0.45),
+                            lineWidth: 1))
+            }
+        }
+    }
+}
+
+/// The reserves view for a CUMULATIVE nutrient: the bar fills to the rolling AVERAGE
+/// (coloured by the average's status, so a low today reads calm), and a faint marker
+/// shows where today alone landed — the single-day dip or spike against the buffer.
+struct RollingBar: View {
+    var averageFraction: Double     // average / floor
+    var todayFraction: Double       // today / floor
+    var fill: Color
+    var height: CGFloat = 10
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let avg = min(max(averageFraction, 0), 1)
+            let today = min(max(todayFraction, 0), 1)
+            ZStack(alignment: .leading) {
+                Capsule().fill(Palette.track)
+                Capsule().fill(fill)
+                    .frame(width: max(height, avg * w))
+                    .animation(.easeOut(duration: 0.5), value: averageFraction)
+                Rectangle()
+                    .fill(Color.primary.opacity(0.35))
+                    .frame(width: 2, height: height + 4)
+                    .offset(x: today * w - 1)
+            }
+        }
+        .frame(height: height)
+    }
+}
+
+/// The floor -> optimal -> ceiling view for a nutrient with a real toxicity limit.
+/// The track is banded: a faint deficit zone up to the floor, a green optimal band
+/// from the floor to 80% of the UL, and a red zone approaching and past the UL — with
+/// a marker for where intake actually sits. This is what makes a safe surplus look
+/// calm and a dangerous one look dangerous, instead of both reading as "over 100%".
+struct RangeGauge: View {
+    var floor: Double?
+    var ceiling: Double         // the UL
+    var current: Double
+    var marker: Color
+    var height: CGFloat = 12
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let floorX = CGFloat((floor.map { min(max($0 / ceiling, 0), 1) } ?? 0)) * w
+            let warnX = 0.8 * w                                   // 80% of the UL
+            let curX = CGFloat(min(max(current / ceiling, 0), 1)) * w
+            ZStack(alignment: .leading) {
+                Capsule().fill(Palette.track)                    // deficit zone (0..floor)
+                Capsule().fill(Palette.good.opacity(0.22))       // optimal band
+                    .frame(width: max(0, warnX - floorX)).offset(x: floorX)
+                Capsule().fill(Palette.critical.opacity(0.20))   // near/over the UL
+                    .frame(width: max(0, w - warnX)).offset(x: warnX)
+                Capsule().fill(marker)                           // where intake sits
+                    .frame(width: 3, height: height + 6)
+                    .offset(x: min(max(curX, 1.5), w - 1.5) - 1.5)
+                    .animation(.easeOut(duration: 0.5), value: current)
             }
         }
         .frame(height: height)
