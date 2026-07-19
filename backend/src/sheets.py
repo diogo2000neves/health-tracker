@@ -207,6 +207,67 @@ class SheetClient:
             body={"values": [row]},
         ).execute()
 
+    def _heal_daily_duplicates(self, grid: List[List[Any]]) -> List[List[Any]]:
+        """Collapse rows that share a date, folding the extras' non-blank cells
+        into the first occurrence and deleting them from the sheet.
+
+        This job and the ingest service's `write_daily` are two independent
+        read-modify-write writers against the same tab with no lock between them:
+        a weigh-in writes the body columns for TODAY the instant it lands, but if
+        this job's grid snapshot (taken here, before the merge below) was read a
+        moment earlier — this run was already mid-flight (the 11:00 backstop, or a
+        previous weigh-in's triggered run) when the weigh-in landed — it won't
+        find that date yet and appends a second, half-empty row instead of merging
+        into it. Healing on every run means the duplicate never survives past the
+        next call here, rather than accumulating."""
+        width = len(DAILY_HEADERS)
+        survivor_idx: Dict[str, int] = {}     # date -> index into `grid`
+        survivors: Dict[int, List[Any]] = {}  # grid index -> merged, padded row
+        doomed_rownums: List[int] = []        # 1-based sheet rows to delete
+
+        for i, row in enumerate(grid):
+            if not row:
+                continue
+            day = str(row[0])
+            padded = list(row) + [None] * (width - len(row))
+            if day not in survivor_idx:
+                survivor_idx[day] = i
+                survivors[i] = padded
+            else:
+                target = survivors[survivor_idx[day]]
+                for col in range(1, width):
+                    if target[col] in (None, "") and padded[col] not in (None, ""):
+                        target[col] = padded[col]
+                doomed_rownums.append(i + 2)  # grid[0] is sheet row 2
+
+        if not doomed_rownums:
+            return grid
+
+        data = [
+            {"range": f"{DAILY_TAB}!A{i + 2}:{col_letter(width - 1)}{i + 2}",
+             "values": [survivors[i]]}
+            for i in survivor_idx.values()
+        ]
+        self.svc.spreadsheets().values().batchUpdate(
+            spreadsheetId=self.sid,
+            body={"valueInputOption": "RAW", "data": data}).execute()
+
+        tab_id = self.sheet_id(DAILY_TAB)
+        if tab_id is not None:
+            # One batch, indices descending, so deleting a lower row never shifts
+            # the sheet row number a later request in the same batch still refers to.
+            delete_requests = [
+                {"deleteDimension": {"range": {
+                    "sheetId": tab_id, "dimension": "ROWS",
+                    "startIndex": rownum - 1, "endIndex": rownum,
+                }}}
+                for rownum in sorted(doomed_rownums, reverse=True)
+            ]
+            self.svc.spreadsheets().batchUpdate(
+                spreadsheetId=self.sid, body={"requests": delete_requests}).execute()
+
+        return [survivors[i] for i in sorted(survivor_idx.values())]
+
     # -- daily_summary: merge-upsert on date ----------------------------
     def upsert_daily(self, rows: List[Dict[str, Any]]) -> Dict[str, int]:
         """Merge rows into daily_summary keyed on `date`.
@@ -227,6 +288,9 @@ class SheetClient:
             )
             .execute().get("values", [])
         )
+        healed = len(grid)
+        grid = self._heal_daily_duplicates(grid)
+        healed -= len(grid)
         date_to_index = {str(r[0]): i for i, r in enumerate(grid) if r}
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -261,4 +325,4 @@ class SheetClient:
                 valueInputOption="RAW", insertDataOption="INSERT_ROWS",
                 body={"values": appends},
             ).execute()
-        return {"updated": len(updates), "appended": len(appends)}
+        return {"updated": len(updates), "appended": len(appends), "healed": healed}

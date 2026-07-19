@@ -395,6 +395,7 @@ def main() -> None:
         f"window>={start or 'ALL'}: biometrics {bio_note}; read {len(meals)} "
         f"meal rows -> {len(nutrition)} nutrition day(s); daily_summary updated "
         f"{daily_result['updated']}, appended {daily_result['appended']}, "
+        f"healed {daily_result['healed']} duplicate(s), "
         f"{sort_note}; views {views_note} "
         f"(spreadsheet {spreadsheet_id}, project {project})."
     )

@@ -812,6 +812,68 @@ def test_meal_row_index_finds_the_prior_row_for_upsert():
     assert ingest._meal_row_index(values, "missing") is None
 
 
+class _FakeSheetsSvc:
+    """Records the two request shapes `_heal_daily_duplicates` issues, keyed by
+    whether `.values()` was chained before `.batchUpdate()` (a values write) or
+    not (a structural request like deleteDimension)."""
+
+    def __init__(self):
+        self.value_batch_bodies = []
+        self.sheet_batch_bodies = []
+        self._in_values = False
+
+    def spreadsheets(self):
+        self._in_values = False
+        return self
+
+    def values(self):
+        self._in_values = True
+        return self
+
+    def batchUpdate(self, spreadsheetId, body):
+        (self.value_batch_bodies if self._in_values else self.sheet_batch_bodies).append(body)
+        return self
+
+    def execute(self):
+        return {}
+
+
+def test_heal_daily_duplicates_merges_and_deletes_the_extra_row(monkeypatch):
+    # Reproduces the reported bug: a weigh-in's own row (weight_kg only) and the
+    # daily job's row (sleep_mins only) both landed under the same date.
+    svc = _FakeSheetsSvc()
+    monkeypatch.setattr(ingest, "_sheets", lambda: svc)
+    monkeypatch.setattr(ingest, "_sid", lambda: "sid")
+    monkeypatch.setattr(ingest, "_tab_id", lambda tab: 7)
+
+    header = ["date", "sleep_mins", "weight_kg"]
+    row_a = ["2026-07-19", "", 70.5]
+    row_b = ["2026-07-19", 420, ""]
+    grid = [header, row_a, row_b]
+
+    healed = ingest._heal_daily_duplicates(grid)
+
+    assert healed == [header, ["2026-07-19", 420, 70.5]]
+    assert svc.value_batch_bodies == [{
+        "valueInputOption": "RAW",
+        "data": [{"range": "daily_summary!A2:C2",
+                  "values": [["2026-07-19", 420, 70.5]]}],
+    }]
+    assert svc.sheet_batch_bodies == [{"requests": [{"deleteDimension": {"range": {
+        "sheetId": 7, "dimension": "ROWS", "startIndex": 2, "endIndex": 3,
+    }}}]}]
+
+
+def test_heal_daily_duplicates_is_a_noop_without_duplicates(monkeypatch):
+    def _no_api_calls():
+        raise AssertionError("must not touch the Sheets API without a duplicate")
+    monkeypatch.setattr(ingest, "_sheets", lambda: _no_api_calls())
+
+    header = ["date", "weight_kg"]
+    grid = [header, ["2026-07-19", 70.5], ["2026-07-20", 71.0]]
+    assert ingest._heal_daily_duplicates(grid) is grid
+
+
 def test_run_models_surfaces_inferred_meal_time(monkeypatch):
     body = ('{"reasoning":"had oats","meal_time":"08:15","items":[{"name":"oats",'
             '"portion_g":250,"calories":300,"protein_g":10,"carbs_g":50,"fat_g":5}],'

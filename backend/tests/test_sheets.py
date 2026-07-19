@@ -1,7 +1,8 @@
 """Unit tests for sheet schema constants and helpers."""
 from src.biometrics import BIOMETRIC_COLUMNS
 from src.sheets import (
-    BODY_METRICS, DAILY_HEADERS, READ_LAST_COL, TIER1_NUTRIENTS, col_letter,
+    BODY_METRICS, DAILY_HEADERS, DAILY_TAB, READ_LAST_COL, SheetClient,
+    TIER1_NUTRIENTS, col_letter,
 )
 
 
@@ -80,5 +81,83 @@ def test_every_scale_metric_has_a_column():
     # the derived and stamped columns close the block
     i = DAILY_HEADERS.index
     assert i("metabolic_age") < i("lean_mass_kg") < i("body_measured_at")
+
+
+class _FakeSheetsSvc:
+    """Records the two request shapes `_heal_daily_duplicates` issues, keyed by
+    whether `.values()` was chained before `.batchUpdate()`/`.get()` (a values
+    write) or not (a structural request, or the metadata read for `sheet_id`)."""
+
+    def __init__(self):
+        self.value_batch_bodies = []
+        self.sheet_batch_bodies = []
+        self._in_values = False
+
+    def spreadsheets(self):
+        self._in_values = False
+        return self
+
+    def values(self):
+        self._in_values = True
+        return self
+
+    def get(self, spreadsheetId):
+        return self
+
+    def batchUpdate(self, spreadsheetId, body):
+        (self.value_batch_bodies if self._in_values else self.sheet_batch_bodies).append(body)
+        return self
+
+    def execute(self):
+        return {"sheets": [{"properties": {"title": DAILY_TAB, "sheetId": 7}}]}
+
+
+def _client(svc):
+    client = SheetClient.__new__(SheetClient)
+    client.svc = svc
+    client.sid = "sid"
+    client._titles = None
+    return client
+
+
+def test_heal_daily_duplicates_merges_and_deletes_the_extra_row():
+    # Reproduces the reported bug: a weigh-in's own row (weight_kg only) and the
+    # daily job's row (sleep_mins only) both landed under the same date because
+    # the job's grid snapshot predated the weigh-in's write.
+    width = len(DAILY_HEADERS)
+    weight_i, sleep_i = DAILY_HEADERS.index("weight_kg"), DAILY_HEADERS.index("sleep_mins")
+    row_a, row_b = [None] * width, [None] * width
+    row_a[0], row_a[weight_i] = "2026-07-19", 70.5
+    row_b[0], row_b[sleep_i] = "2026-07-19", 420
+
+    svc = _FakeSheetsSvc()
+    healed = _client(svc)._heal_daily_duplicates([row_a, row_b])
+
+    assert len(healed) == 1
+    assert healed[0][0] == "2026-07-19"
+    assert healed[0][weight_i] == 70.5
+    assert healed[0][sleep_i] == 420
+    # the merge was written back to the surviving row (sheet row 2, since a
+    # bare grid — no header — starts data at row 2)...
+    assert len(svc.value_batch_bodies) == 1
+    assert svc.value_batch_bodies[0]["data"][0]["range"] == \
+        f"{DAILY_TAB}!A2:{col_letter(width - 1)}2"
+    # ...and the duplicate (sheet row 3) was deleted
+    assert svc.sheet_batch_bodies == [{"requests": [{"deleteDimension": {"range": {
+        "sheetId": 7, "dimension": "ROWS", "startIndex": 2, "endIndex": 3,
+    }}}]}]
+
+
+def test_heal_daily_duplicates_is_a_noop_without_duplicates():
+    width = len(DAILY_HEADERS)
+    row = [None] * width
+    row[0] = "2026-07-19"
+
+    svc = _FakeSheetsSvc()
+    healed = _client(svc)._heal_daily_duplicates([row])
+
+    assert healed == [row]
+    assert svc.value_batch_bodies == []
+    assert svc.sheet_batch_bodies == []
 
 
