@@ -147,17 +147,21 @@ same OAuth client as the rest of the system but its own token with `spreadsheets
 |---|---|---|
 | `FDC_API_KEY` | `DEMO_KEY` | USDA key. **DEMO_KEY is capped at ~30 req/hour** — get a free key (instant, no billing) at <https://fdc.nal.usda.gov/api-key-signup.html> and export it to lift the cap to ~1000/hour. |
 | `FDC_MATCH_MODEL` / `FDC_MATCH_EFFORT` | `sonnet` / `low` | Model + effort for the light FDC-matching call (text ranking — cheap). |
-| `AUDIT_THIRD_MODEL_DISAGREEMENT` | `0.25` | Divergence above which the third estimator (once wired) is invoked. |
+| `AUDIT_THIRD_MODEL_DISAGREEMENT` | `0.25` | Divergence above which the third estimator is invoked. |
+| `GEMINI_BIN` / `GEMINI_CLI_MODEL` | `gemini` / `gemini-3.1-pro-preview` | The third estimator's CLI binary + model (see below). |
 | `AUDIT_CLAUDE_TIMEOUT_S` *(via each stage)* | `900` | Per-call timeout for the heavy image estimate/adjudication calls. |
 | `HEALTH_SPREADSHEET_ID`, `HEALTH_TZ`, `CLAUDE_BIN` | see code | Overrides the backend also honours. |
 
-### Plugging in the third model (Gemini 3.1 Pro)
+### The third model (Gemini 3.1 Pro)
 
-Set `audit._THIRD_ESTIMATOR` to a callable `(note: str, img_paths: list[Path]) ->`
-estimate dict (same shape `estimate.estimate` returns: `{"items": [...],
-"confidence": float, ...}`). It's already gated on disagreement and wrapped so a
-failure is non-fatal. The eval harness's second sample slot is the natural place to
-give it real cross-family diversity.
+`gemini_estimate.py` shells out to the local **`gemini` CLI** — subscription-backed,
+exactly like the `claude` CLI, **no API key**. It auto-wires when the `gemini` binary
+is on PATH (`audit.py` checks `gemini_estimate.available()`), and stays off otherwise.
+It reuses the identical independent-estimate prompt, so Gemini and Claude answer the
+same question; it hands images to the CLI as `@<path>` refs and runs
+`--approval-mode yolo` so an unattended run never blocks on a tool prompt. If your CLI
+uses different flags/model ids, override `GEMINI_BIN` / `GEMINI_CLI_MODEL` or adjust the
+argv in `gemini_estimate.py`. (The CLI must be logged in to your subscription.)
 
 ## Running it by hand
 

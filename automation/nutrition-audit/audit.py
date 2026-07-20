@@ -133,14 +133,18 @@ KNOWN_SCOPES = [
 
 log = logging.getLogger("nutrition-audit")
 
-# Wire in Gemini 3.1 Pro as the disagreement-gated third estimator, but only when a
-# Gemini key is configured (otherwise the pipeline stays Gemini-ingest + Claude).
-if os.environ.get("GEMINI_API_KEY"):
-    try:
-        import gemini_estimate
+# Wire in Gemini 3.1 Pro as the disagreement-gated third estimator, using the local
+# `gemini` CLI (subscription, like `claude`). Only when the CLI is on PATH — otherwise
+# the pipeline stays Gemini-ingest + Claude, no error.
+try:
+    import gemini_estimate
+    if gemini_estimate.available():
         _THIRD_ESTIMATOR = gemini_estimate.estimate
-    except Exception as _exc:  # noqa: BLE001
-        log.warning("third estimator (Gemini) not wired: %s", _exc)
+    else:
+        log.info("gemini CLI not on PATH — third estimator off "
+                 "(install it / set GEMINI_BIN to enable)")
+except Exception as _exc:  # noqa: BLE001
+    log.warning("third estimator (Gemini) not wired: %s", _exc)
 
 
 # -- auth & clients ------------------------------------------------------------
@@ -662,7 +666,7 @@ def _third_said(estimates: List[Dict[str, Any]], dis: Dict[str, Any]) -> str:
     if third:
         return _estimate_summary(third)
     if _THIRD_ESTIMATOR is None:
-        return "not configured (no GEMINI_API_KEY)"
+        return "not configured (gemini CLI not found)"
     mr = float(dis.get("max_rel", 0.0))
     return (f"not invoked — estimates agreed within gate "
             f"({mr * 100:.0f}% < {THIRD_MODEL_DISAGREEMENT * 100:.0f}%)")
