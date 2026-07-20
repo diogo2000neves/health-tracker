@@ -159,17 +159,23 @@ struct NutrientReading {
     let today: Double
     /// This nutrient's intake per completed day in the rolling window, oldest first.
     let dailyHistory: [Double]
+    /// When true, the DEFICIT is read against today even for a buffered nutrient — the
+    /// "Hoje" lens ("am I on track for today's target right now?"). The ceiling/safety
+    /// read stays chronic regardless, so the lens can never hide a toxicity risk.
+    let readToday: Bool
 
-    init(target: Target, today: Double, dailyHistory: [Double]) {
+    init(target: Target, today: Double, dailyHistory: [Double], readToday: Bool = false) {
         self.target = target
         self.today = today
         self.dailyHistory = dailyHistory
+        self.readToday = readToday
     }
 
     /// Pull a nutrient's today + rolling history straight out of a /today payload.
-    init(key: String, target: Target, response: TodayResponse) {
+    init(key: String, target: Target, response: TodayResponse, readToday: Bool = false) {
         self.init(target: target, today: response.consumed(key),
-                  dailyHistory: response.historyDays.map { $0.consumed(key) })
+                  dailyHistory: response.historyDays.map { $0.consumed(key) },
+                  readToday: readToday)
     }
 
     // -- the window --
@@ -177,11 +183,15 @@ struct NutrientReading {
     var average: Double? {
         daysCounted > 0 ? dailyHistory.reduce(0, +) / Double(daysCounted) : nil
     }
-    /// True when the deficit is read against reserves (a rolling nutrient with history),
-    /// not today.
-    var usesRolling: Bool { target.isRolling && average != nil }
-    /// The amount the deficit is judged against.
-    var basis: Double { usesRolling ? (average ?? today) : today }
+    /// A buffered nutrient's reserves (its rolling average), or today when it isn't
+    /// buffered or has no history yet. Independent of the lens.
+    var chronicBasis: Double { (target.isRolling ? average : nil) ?? today }
+    /// True when the deficit is read against reserves (the biological lens on a rolling
+    /// nutrient with history), not today.
+    var usesRolling: Bool { !readToday && target.isRolling && average != nil }
+    /// The amount the deficit is judged against: reserves for a buffered nutrient in the
+    /// biological lens, otherwise today.
+    var basis: Double { readToday ? today : chronicBasis }
 
     var isLimit: Bool { target.kind == Target.Kind.limit }
     /// The floor to reach (nil for a pure limit — there's nothing to hit).
@@ -193,9 +203,10 @@ struct NutrientReading {
         guard let f = floor, f > 0 else { return 0 }
         return basis / f
     }
-    /// The exposure tested against the ceiling: a limit is judged on today (a daily
-    /// budget), a UL on the worse of today (acute) and the rolling average (chronic).
-    var ceilingExposure: Double { isLimit ? today : max(today, basis) }
+    /// The exposure tested against the ceiling — ALWAYS chronic-aware (the worse of
+    /// today and the rolling average), so the "Hoje" lens can never hide a chronic
+    /// toxicity. A pure limit is judged on today (a daily budget).
+    var ceilingExposure: Double { isLimit ? today : max(today, chronicBasis) }
     var ceilingFraction: Double {
         guard let c = target.ceiling, c > 0 else { return 0 }
         return ceilingExposure / c

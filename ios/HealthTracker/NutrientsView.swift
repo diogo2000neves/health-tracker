@@ -20,10 +20,24 @@
 
 import SwiftUI
 
+/// Which lens the reach sections (Diários, Reservas) are shown through:
+///  - `historico` — the biological read: consistency dots for daily nutrients, the
+///    rolling average for buffered ones (a low today never reads as a deficit);
+///  - `hoje` — today's progress toward the daily target, the practical "what should I
+///    still eat?" view.
+/// The A vigiar safety board and the header summary stay biological in both, and the
+/// ceiling read is always chronic, so switching to Hoje never hides a toxicity risk.
+enum NutrientLens: String, CaseIterable, Identifiable {
+    case historico, hoje
+    var id: String { rawValue }
+    var title: String { self == .hoje ? "Hoje" : "Histórico" }
+}
+
 struct NutrientsView: View {
     let store: TodayStore
     @State private var info = InfoStore()
     @State private var selected: NutrientDef?
+    @State private var lens: NutrientLens = .historico
 
     var body: some View {
         NavigationStack {
@@ -50,8 +64,12 @@ struct NutrientsView: View {
             VStack(spacing: 16) {
                 NutrientHeaderCard(response: r)
                 CeilingAlertCard(response: r) { selected = $0 }
-                LensSection(section: .diarios, response: r) { selected = $0 }
-                LensSection(section: .reservas, response: r) { selected = $0 }
+                Picker("Vista", selection: $lens) {
+                    ForEach(NutrientLens.allCases) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                LensSection(section: .diarios, response: r, lens: lens) { selected = $0 }
+                LensSection(section: .reservas, response: r, lens: lens) { selected = $0 }
                 VigiarCard(response: r) { selected = $0 }
                 ContextCard(response: r) { selected = $0 }
             }
@@ -66,9 +84,14 @@ struct NutrientsView: View {
 
 // MARK: - Shared helpers
 
-/// A reading for a nutrient, or nil when it has no target (a context nutrient).
-private func reading(_ def: NutrientDef, _ r: TodayResponse) -> NutrientReading? {
-    r.targets[def.key].map { NutrientReading(key: def.key, target: $0, response: r) }
+/// A reading for a nutrient, or nil when it has no target (a context nutrient). Pass
+/// `today: true` for the "Hoje" lens, where the deficit is read against today's intake
+/// rather than the multi-day average.
+private func reading(_ def: NutrientDef, _ r: TodayResponse,
+                     today: Bool = false) -> NutrientReading? {
+    r.targets[def.key].map {
+        NutrientReading(key: def.key, target: $0, response: r, readToday: today)
+    }
 }
 
 private func sectionAccent(_ section: NutrientSection) -> Color {
@@ -203,6 +226,7 @@ private struct SectionTitle: View {
 private struct LensSection: View {
     let section: NutrientSection
     let response: TodayResponse
+    let lens: NutrientLens
     let onSelect: (NutrientDef) -> Void
 
     var body: some View {
@@ -212,7 +236,7 @@ private struct LensSection: View {
                 SectionTitle(section: section)
                 VStack(spacing: 18) {
                     ForEach(defs) { def in
-                        NutrientRow(def: def, section: section, response: response)
+                        NutrientRow(def: def, section: section, response: response, lens: lens)
                             .contentShape(Rectangle())
                             .onTapGesture { onSelect(def) }
                     }
@@ -227,11 +251,14 @@ private struct NutrientRow: View {
     let def: NutrientDef
     let section: NutrientSection
     let response: TodayResponse
+    let lens: NutrientLens
 
     var body: some View {
-        if let rd = reading(def, response) {
+        if let rd = reading(def, response, today: lens == .hoje) {
             let floor = rd.target.floor ?? 0
-            let leadsWithAverage = section == .reservas && rd.daysCounted > 0
+            // In Histórico a reserve leads with its average (the number that matters);
+            // in Hoje every row leads with today.
+            let leadsWithAverage = section == .reservas && lens == .historico && rd.daysCounted > 0
             let lead = leadsWithAverage ? (rd.average ?? rd.today) : rd.today
             VStack(spacing: 7) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -248,14 +275,23 @@ private struct NutrientRow: View {
                     Text(rd.label)
                         .font(.caption2.weight(.medium)).foregroundStyle(rd.fill)
                 }
-                lens(rd, floor)
+                lensVisual(rd, floor)
             }
         }
     }
 
     @ViewBuilder
-    private func lens(_ rd: NutrientReading, _ floor: Double) -> some View {
-        if section == .reservas {
+    private func lensVisual(_ rd: NutrientReading, _ floor: Double) -> some View {
+        if lens == .hoje {
+            // Today's progress toward the daily target — one clear bar for every nutrient.
+            TargetBar(fraction: floor > 0 ? rd.today / floor : 0, fill: rd.fill, height: 9)
+            if section == .reservas, rd.daysCounted > 0, let avg = rd.average {
+                // Keep the reserve average in view even here — it's the important part.
+                caption("de \(def.amount(floor)) · reservas: média 7 d \(def.amount(avg))")
+            } else {
+                caption("de \(def.amount(floor)) hoje")
+            }
+        } else if section == .reservas {
             if rd.daysCounted > 0 {
                 RollingBar(averageFraction: floor > 0 ? (rd.average ?? 0) / floor : 0,
                            todayFraction: floor > 0 ? rd.today / floor : 0,

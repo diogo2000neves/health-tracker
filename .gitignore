@@ -15,3 +15,7 @@ backend/.pytest_cache/
 # iOS
 ios/build/
 ios/Config.swift
+
+# Local automation (personal machine only)
+automation/**/logs/
+automation/**/__pycache__/

@@ -121,8 +121,6 @@ enum NutrientCatalog {
     static let byKey: [String: NutrientDef] = Dictionary(
         uniqueKeysWithValues: all.map { ($0.key, $0) })
 
-    static func label(for key: String) -> String { byKey[key]?.label ?? key }
-
     /// The nutrients to show in a section, derived from the LIVE targets so the screen
     /// always matches the backend's kinetics:
     ///  - `diarios`  — a floor to reach on a daily horizon (not body-banked);

@@ -506,9 +506,15 @@ these keys and units:
     vitamin_b3_mg, vitamin_b5_mg, vitamin_b6_mg
   micrograms (ug):  vitamin_a_ug, vitamin_d_ug, vitamin_k_ug, vitamin_b12_ug,
     folate_ug, biotin_ug, selenium_ug, iodine_ug
-Include every nutrient the food contains in a non-negligible amount; OMIT keys
-that are essentially zero or trace for that food (do not pad the object with
-zeros). Base values on the cooked weight and method from steps 3-4.
+Report EVERY nutrient key this food is a genuine dietary source of, however
+small — a food doesn't need to be famous for a nutrient to contribute a
+meaningful amount of it (even ~5% of a daily reference intake is worth
+reporting). Most whole foods register on 10+ of these 26 keys; if you're
+listing only 2-3, you're almost certainly under-reporting — go back through
+the full list and check each one. OMIT a key only when the food is not a
+plausible source of it at all (e.g. no B12/iodine from an all-plant item with
+no iodized salt or seaweed) — never omit one just because it isn't the item's
+defining nutrient. Base values on the cooked weight and method from steps 3-4.
 
 CONFIDENCE — use this EXACT scale (0-1) so the score means the same thing no
 matter which model produces it. Report ONE value for the whole meal, set by your
@@ -736,7 +742,10 @@ profile scaled to the grams, using EXACTLY these keys and units:
     vitamin_b3_mg, vitamin_b5_mg, vitamin_b6_mg
   micrograms (ug):  vitamin_a_ug, vitamin_d_ug, vitamin_k_ug, vitamin_b12_ug,
     folate_ug, biotin_ug, selenium_ug, iodine_ug
-Omit keys that are essentially zero/trace for that food.
+Report every key this food is a genuine dietary source of, however small — a
+food doesn't need to be famous for a nutrient to contribute a meaningful
+amount of it (even ~5% of a daily reference intake is worth reporting). Omit a
+key only when the food is not a plausible source of it at all.
 
 CONFIDENCE — CAP AT 0.50 (there is no photo). Use this scale:
   0.35-0.50  the description is specific about foods AND amounts.
