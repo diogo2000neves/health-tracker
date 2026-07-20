@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Source of truth for the nutrition-audit launchd job. This file lives in the repo;
+  a COPY is installed at ~/Library/LaunchAgents/com.dneves.nutrition-audit.plist
+  (launchd only reads from there). To change the schedule: edit this file, copy it
+  over, and reload:
+
+    cp automation/nutrition-audit/com.dneves.nutrition-audit.plist ~/Library/LaunchAgents/
+    launchctl bootout  gui/$(id -u)/com.dneves.nutrition-audit 2>/dev/null
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dneves.nutrition-audit.plist
+
+  RunAtLoad is deliberately OFF so bootstrapping never fires an unexpected write —
+  the job only runs at the three scheduled times (and catches up shortly after wake
+  if the Mac was asleep at one of them).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dneves.nutrition-audit</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/dneves/personal/health-tracker/backend/venv/bin/python</string>
+        <string>/Users/dneves/personal/health-tracker/automation/nutrition-audit/audit.py</string>
+    </array>
+
+    <!-- 11:00, 15:00 and 23:00 local time, every day. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>23</integer><key>Minute</key><integer>0</integer></dict>
+    </array>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- claude is a self-contained binary, but include the node bin dir on PATH so
+         any node-based tooling it may shell to still resolves under launchd's
+         otherwise-minimal environment. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/dneves/.nvm/versions/node/v22.12.0/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/dneves/personal/health-tracker/automation/nutrition-audit/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/dneves/personal/health-tracker/automation/nutrition-audit/logs/launchd.err.log</string>
+</dict>
+</plist>
