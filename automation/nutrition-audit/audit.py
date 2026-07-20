@@ -133,18 +133,22 @@ KNOWN_SCOPES = [
 
 log = logging.getLogger("nutrition-audit")
 
-# Wire in Gemini 3.1 Pro as the disagreement-gated third estimator, using the local
-# `gemini` CLI (subscription, like `claude`). Only when the CLI is on PATH — otherwise
-# the pipeline stays Gemini-ingest + Claude, no error.
-try:
-    import gemini_estimate
-    if gemini_estimate.available():
-        _THIRD_ESTIMATOR = gemini_estimate.estimate
-    else:
-        log.info("gemini CLI not on PATH — third estimator off "
-                 "(install it / set GEMINI_BIN to enable)")
-except Exception as _exc:  # noqa: BLE001
-    log.warning("third estimator (Gemini) not wired: %s", _exc)
+# Third estimator (Gemini 3.1 Pro) — OPTIONAL and disagreement-gated, OFF by default.
+# The local `gemini` CLI is hard-blocked for individual Gemini Code Assist tiers
+# ("IneligibleTierError ... migrate to Antigravity"), so a subscription CLI call cannot
+# work headlessly. To actually use a third model you need a path valid for your account
+# (e.g. a BILLED Gemini API key — gemini-3.1-pro-preview has no free tier) wired into
+# gemini_estimate.estimate, then set AUDIT_ENABLE_THIRD=1. Until then the pipeline runs
+# Gemini(row) + Claude, which is complete on its own.
+if os.environ.get("AUDIT_ENABLE_THIRD"):
+    try:
+        import gemini_estimate
+        if gemini_estimate.available():
+            _THIRD_ESTIMATOR = gemini_estimate.estimate
+        else:
+            log.info("AUDIT_ENABLE_THIRD set but gemini estimator unavailable — third off")
+    except Exception as _exc:  # noqa: BLE001
+        log.warning("third estimator not wired: %s", _exc)
 
 
 # -- auth & clients ------------------------------------------------------------
