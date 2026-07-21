@@ -43,7 +43,9 @@ _FDC_LOOKUP_ERRORS = (urllib.error.URLError, TimeoutError, ValueError, KeyError,
                       json.JSONDecodeError)
 
 # FDC matching is a text-ranking task — cheap model, low effort, short timeout.
-MATCH_MODEL = os.environ.get("FDC_MATCH_MODEL", "sonnet")
+# Pinned to the model ID, not the "sonnet" alias — see estimate.py's DEFAULT_MODEL
+# comment: the alias resolves to a stale claude-sonnet-4-6 on this machine's CLI.
+MATCH_MODEL = os.environ.get("FDC_MATCH_MODEL", "claude-sonnet-5")
 MATCH_EFFORT = os.environ.get("FDC_MATCH_EFFORT", "low")
 MATCH_TIMEOUT_S = int(os.environ.get("FDC_MATCH_TIMEOUT_S", "240"))
 

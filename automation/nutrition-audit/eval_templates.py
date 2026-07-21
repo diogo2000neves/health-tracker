@@ -21,10 +21,10 @@ What it measures:
 
 Cost note: each meal costs `--samples` independent Claude estimates + one adjudication
 (~3 heavy calls, ~20 min). Run it with `--limit` on a handful of template meals; it is
-NOT meant to run over a whole day. The second estimate slot is where a future third
-model (Gemini 3.1 Pro) plugs in for real cross-family diversity — until then the
-samples are independent Claude runs, whose run-to-run variance still exercises the
-adjudicator.
+NOT meant to run over a whole day. This mirrors the live pipeline's ensemble, which is
+independent Claude passes at different effort levels rather than a second vendor (see
+audit._THIRD_ESTIMATOR) — the samples here are independent Claude runs, whose
+run-to-run variance still exercises the adjudicator.
 
 Usage:
     backend/venv/bin/python automation/nutrition-audit/eval_templates.py --limit 3

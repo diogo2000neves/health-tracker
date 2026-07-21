@@ -22,7 +22,12 @@ import nutrients
 
 log = logging.getLogger("nutrition-audit")
 
-DEFAULT_MODEL = "sonnet"
+# Pinned to the model ID, NOT the "sonnet" alias: verified 2026-07-21 that on this
+# machine's installed CLI the alias resolves to claude-sonnet-4-6, not the current
+# claude-sonnet-5 (`--model sonnet` -> modelUsage shows claude-sonnet-4-6; `--model
+# claude-sonnet-5` -> modelUsage shows claude-sonnet-5). An alias silently tracks
+# whatever the CLI considers "latest", which drifted stale here — pin the ID instead.
+DEFAULT_MODEL = "claude-sonnet-5"
 DEFAULT_EFFORT = "high"
 # A high-effort call that reads image(s) and fills ~30 nutrients across every item
 # is genuinely slow (6.5-9 min on a complex plate). Generous, env-overridable.

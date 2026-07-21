@@ -9,14 +9,18 @@ treats meal analysis as TWO problems:
     models genuinely disagree, so we ENSEMBLE: take Gemini's estimate (already in the
     row) plus a fresh, independent Claude estimate, and RECONCILE them against the
     image (adjudicate.py) instead of letting one overwrite the other. Disagreement is
-    kept as signal, not discarded.
+    kept as signal, not discarded. When Gemini and Claude still diverge past
+    THIRD_MODEL_DISAGREEMENT, a THIRD opinion breaks the tie — Claude again, at xhigh
+    effort instead of high (see _THIRD_ESTIMATOR). A second Gemini opinion was tried
+    here first (via the `agy` Antigravity CLI); Sonnet is simply the stronger food
+    estimator in practice, so the extra opinion is more thinking on the model that's
+    already winning, not another vendor.
   * KNOWLEDGE (the ~30 micronutrient values for a known food × grams) — a lookup, not
     a guess, so we GROUND it in USDA FoodData Central (ground.py): measured, consistent,
     comparable across days; the model's estimate is kept only for the few keys FDC lacks.
 
-Pipeline per meal:  Gemini(row) + Claude estimate  ->  adjudicate  ->  ground  ->  write.
-A third estimator (e.g. Gemini 3.1 Pro) can plug in as a disagreement-gated tie-break
-(see _THIRD_ESTIMATOR).
+Pipeline per meal:  Gemini(row) + Claude(high) [+ Claude(xhigh) if disagreement]  ->
+adjudicate  ->  ground  ->  write.
 
 Design invariants carried over from the original single-model job:
   * LOCAL, not cloud — the subscription-backed `claude` CLI only exists on this Mac.
@@ -103,7 +107,7 @@ REVIEWS_HEADERS = [
     "models",               # which models took part + the adjudicator
     "gemini_said",          # Gemini's own conclusion (the ingest estimate in the row)
     "claude_said",          # the independent Claude estimate's conclusion
-    "third_said",           # Gemini 3.1 Pro's conclusion, or why it wasn't invoked
+    "third_said",           # the xhigh-effort Sonnet tie-break's conclusion, or why not
     "disagreement",         # how far the estimates diverged — the ensemble signal
     "adjudicator_verdict",  # per-item: agreed / adjudicated / added, and why
     "grounding",            # per-item nutrient source: FDC entry vs kept-from-model
@@ -114,14 +118,28 @@ REVIEWS_HEADERS = [
 ]
 REVIEWS_LAST_COL = chr(ord("A") + len(REVIEWS_HEADERS) - 1)
 
-# ---- Phase 3 plug point: a disagreement-gated third estimator ----------------
+# ---- Phase 3: a disagreement-gated third opinion ------------------------------
 # A callable (note: str, img_paths: List[Path]) -> estimate dict (same shape as
-# estimate_mod.estimate). When set, it is called ONLY when Gemini and Claude diverge
-# by more than THIRD_MODEL_DISAGREEMENT — spend the extra opinion where uncertainty
-# actually is, not on every meal. Leave None until Gemini 3.1 Pro is wired in.
-_THIRD_ESTIMATOR: Optional[Callable[[str, List[Path]], Dict[str, Any]]] = None
+# estimate_mod.estimate). Called ONLY when Gemini and Claude diverge by more than
+# THIRD_MODEL_DISAGREEMENT — spend the extra opinion where uncertainty actually is,
+# not on every meal.
 THIRD_MODEL_DISAGREEMENT = float(
     os.environ.get("AUDIT_THIRD_MODEL_DISAGREEMENT", "0.25"))
+# Deliberately the SAME estimator as the second opinion (Claude, same prompt) at a
+# HIGHER reasoning effort, not a second vendor. A Gemini third opinion (via the `agy`
+# Antigravity CLI) was tried here first, but Sonnet is simply the stronger food
+# estimator in practice — a second Gemini call wasn't adding a genuinely different
+# perspective, just a weaker one. Spending more thinking budget on the strong model,
+# gated on disagreement, is the tie-break that actually helps.
+THIRD_MODEL = os.environ.get("AUDIT_THIRD_MODEL", estimate_mod.DEFAULT_MODEL)
+THIRD_EFFORT = os.environ.get("AUDIT_THIRD_EFFORT", "xhigh")
+
+
+def _third_estimate(note: str, img_paths: List[Path]) -> Dict[str, Any]:
+    return estimate_mod.estimate(note, img_paths, model=THIRD_MODEL, effort=THIRD_EFFORT)
+
+
+_THIRD_ESTIMATOR: Callable[[str, List[Path]], Dict[str, Any]] = _third_estimate
 
 # The scopes the token MAY carry. Documentation only — the credential is loaded with
 # the token's OWN granted scopes (see get_credentials).
@@ -132,20 +150,6 @@ KNOWN_SCOPES = [
 ]
 
 log = logging.getLogger("nutrition-audit")
-
-# Third estimator (a deliberate Gemini opinion) via the `agy` Antigravity CLI on the
-# personal subscription — verified working headless. Wires in automatically when agy is
-# installed; without it the pipeline is Gemini(row) + Claude, which is complete on its
-# own. (The legacy `gemini` CLI is hard-blocked for individual tiers — IneligibleTierError
-# "migrate to Antigravity" — which is why this goes through agy.)
-try:
-    import gemini_estimate
-    if gemini_estimate.available():
-        _THIRD_ESTIMATOR = gemini_estimate.estimate
-    else:
-        log.info("agy CLI not found — third estimator off (set AGY_BIN to enable)")
-except Exception as _exc:  # noqa: BLE001
-    log.warning("third estimator not wired: %s", _exc)
 
 
 # -- auth & clients ------------------------------------------------------------
@@ -398,7 +402,7 @@ def gather_estimates(row: Dict[str, Any], note: str, img_paths: List[Path]
     estimates = [gemini, claude]
     dis = _disagreement(gemini, claude) if gemini["items"] else {"max_rel": 0.0}
 
-    if _THIRD_ESTIMATOR and dis.get("max_rel", 0.0) >= THIRD_MODEL_DISAGREEMENT:
+    if dis.get("max_rel", 0.0) >= THIRD_MODEL_DISAGREEMENT:
         try:
             third = _THIRD_ESTIMATOR(note, img_paths)
             third["_source"] = "third"
@@ -661,13 +665,11 @@ def _models_line(estimates: List[Dict[str, Any]], adj_model: str, stage: str) ->
 
 
 def _third_said(estimates: List[Dict[str, Any]], dis: Dict[str, Any]) -> str:
-    """The third model's conclusion, or a clear reason it didn't run — so a test can
-    always tell whether Gemini 3.1 Pro was consulted and why."""
+    """The third opinion's conclusion, or a clear reason it didn't run — so a test can
+    always tell whether the xhigh-effort Sonnet tie-break was consulted and why."""
     third = _by_source(estimates, "third")
     if third:
         return _estimate_summary(third)
-    if _THIRD_ESTIMATOR is None:
-        return "not configured (gemini CLI not found)"
     mr = float(dis.get("max_rel", 0.0))
     return (f"not invoked — estimates agreed within gate "
             f"({mr * 100:.0f}% < {THIRD_MODEL_DISAGREEMENT * 100:.0f}%)")

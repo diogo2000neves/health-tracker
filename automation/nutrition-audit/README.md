@@ -32,12 +32,13 @@ already share. Runs at **11:00, 15:00, 23:00** daily.
    audited**.
 
 2. **Gather independent estimates** (`estimate.py`). Estimate #1 is Gemini's, already
-   in the row from ingest — free, no API call. Estimate #2 is a fresh Claude pass that
-   is **never shown any other model's numbers** (see *Why the estimate is independent*).
-   A **disagreement-gated third estimator** (e.g. Gemini 3.1 Pro) can plug in at
-   `audit._THIRD_ESTIMATOR` and is called **only** when the first two diverge past
-   `AUDIT_THIRD_MODEL_DISAGREEMENT` (default 25 %) — spend the extra opinion where the
-   uncertainty is, not on every meal.
+   in the row from ingest — free, no API call. Estimate #2 is a fresh Claude pass (sonnet,
+   high effort) that is **never shown any other model's numbers** (see *Why the estimate
+   is independent*). A **disagreement-gated third opinion** (`audit._THIRD_ESTIMATOR`)
+   is called **only** when the first two diverge past `AUDIT_THIRD_MODEL_DISAGREEMENT`
+   (default 25 %) — spend the extra opinion where the uncertainty is, not on every meal.
+   It's the same estimator as #2, at **xhigh** effort instead of high, not a third
+   vendor — see *The third opinion* below for why.
 
 3. **Adjudicate** (`adjudicate.py`) — the step that replaces the old "second model
    overwrites the first" coup. A fresh Claude pass looks at the photo again and
@@ -82,7 +83,7 @@ already share. Runs at **11:00, 15:00, 23:00** daily.
    | `models` | which models took part + the adjudicator, with their ids |
    | `gemini_said` | **Gemini's own conclusion** (the ingest estimate): kcal, macros, portion, item + nutrient-key counts |
    | `claude_said` | **the independent Claude estimate's conclusion**, same format |
-   | `third_said` | **Gemini 3.1 Pro's conclusion**, or a clear reason it wasn't invoked (agreement below gate / not configured) |
+   | `third_said` | **the xhigh-effort Sonnet tie-break's conclusion**, or a clear reason it wasn't invoked (agreement below gate) |
    | `disagreement` | how far the estimates diverged — the ensemble signal |
    | `adjudicator_verdict` | **what the adjudicator decided**, per item: agreed / adjudicated / added, and why |
    | `grounding` | **per-item nutrient source** — which FDC entry backed each item, or that the model estimate was kept (and why) |
@@ -146,40 +147,30 @@ same OAuth client as the rest of the system but its own token with `spreadsheets
 | Env var | Default | What it does |
 |---|---|---|
 | `FDC_API_KEY` | `DEMO_KEY` | USDA key. **DEMO_KEY is capped at ~30 req/hour** — get a free key (instant, no billing) at <https://fdc.nal.usda.gov/api-key-signup.html> and export it to lift the cap to ~1000/hour. |
-| `FDC_MATCH_MODEL` / `FDC_MATCH_EFFORT` | `sonnet` / `low` | Model + effort for the light FDC-matching call (text ranking — cheap). |
-| `AUDIT_THIRD_MODEL_DISAGREEMENT` | `0.25` | Divergence above which the third estimator is invoked. |
-| `AGY_BIN` / `AGY_MODEL` | `~/.local/bin/agy` / `gemini-3.6-flash-high` | The third estimator's CLI binary + model (see below). |
+| `FDC_MATCH_MODEL` / `FDC_MATCH_EFFORT` | `claude-sonnet-5` / `low` | Model + effort for the light FDC-matching call (text ranking — cheap). |
+| `AUDIT_THIRD_MODEL_DISAGREEMENT` | `0.25` | Divergence above which the third opinion is invoked. |
+| `AUDIT_THIRD_MODEL` / `AUDIT_THIRD_EFFORT` | `claude-sonnet-5` / `xhigh` | The third opinion's model + effort (see below). |
 | `AUDIT_CLAUDE_TIMEOUT_S` *(via each stage)* | `900` | Per-call timeout for the heavy image estimate/adjudication calls. |
 | `HEALTH_SPREADSHEET_ID`, `HEALTH_TZ`, `CLAUDE_BIN` | see code | Overrides the backend also honours. |
 
-### The third model (a deliberate Gemini opinion, via `agy`)
+### The third opinion (more Sonnet, not more vendors)
 
-`gemini_estimate.py` shells out to the local **`agy` (Antigravity) CLI** —
-subscription-backed like the `claude` CLI, **no API key**. It auto-wires when `agy` is
-installed and reuses the identical independent-estimate prompt, so Gemini and Claude
-answer the same question.
+`audit._THIRD_ESTIMATOR` calls `estimate.py` again — the identical independent-estimate
+prompt and CLI path as estimate #2 — but at `AUDIT_THIRD_EFFORT` (default `xhigh`)
+instead of `high`. It only runs when Gemini and Claude disagree by more than
+`AUDIT_THIRD_MODEL_DISAGREEMENT`.
 
-*Why `agy` and not `gemini`:* Google retired individual sign-in on the legacy
-`@google/gemini-cli` — it fails with `IneligibleTierError … migrate to Antigravity`.
-`agy` is the supported terminal client for individual subscriptions.
+*Why not a second Gemini opinion:* that was the original design — `gemini_estimate.py`
+shelled out to the local `agy` (Antigravity) CLI for a `gemini-3.6-flash-high` tie-break,
+same subscription-backed, no-API-key pattern as `claude_cli.py`. In practice Sonnet is
+simply the stronger food estimator: a second Gemini call wasn't adding a genuinely
+different perspective on a hard meal, it was adding a weaker one. So the tie-break now
+spends the extra opinion as more reasoning effort on the model that's already winning,
+gated on disagreement exactly as before.
 
-*Why `gemini-3.6-flash-high` and not 3.1-pro:* `backend/ingest/main.py` documents that
-3.1-pro is **older** and **loses to the Flash line on multimodal understanding** (MMMU-Pro) —
-and this workload is photos of food. The original diagnosis was also that Gemini's errors
-here are a **speed tax, not incompetence** (cloud ingest runs flash rushed under a ~105 s
-deadline), so running the same family at **high** effort with no deadline makes this a
-genuinely *deliberate* Gemini opinion, decorrelated from the rushed ingest one.
-`gemini-3.6-flash` (released 2026-07-21) replaced `gemini-3.5-flash` as cloud ingest's
-primary model, so this tracks it — "same family as ingest's primary" is the point.
-Override with `AGY_MODEL` (`agy models` lists ids; `gemini-3.1-pro-high` is available).
-
-*Verified invocation:* `agy -p <prompt> --model <id> --print-timeout 15m
---dangerously-skip-permissions`. The effort level is part of the model id, not a flag.
-The skip-permissions flag is required because **headless agy auto-denies tool
-permissions** (it can't prompt), so `read_file` on the photo would be refused; blast
-radius is limited by running with `cwd` = the throwaway photo temp dir. If you'd prefer
-not to auto-approve, add a scoped `permissions.allow` rule (e.g. `read_file(<tmp dir>)`)
-in agy's `settings.json` instead and drop the flag.
+Override with `AUDIT_THIRD_MODEL` / `AUDIT_THIRD_EFFORT` if you want a different
+model or effort for the tie-break (e.g. back to a Gemini opinion via a callable wired
+into `audit._THIRD_ESTIMATOR`, or `opus` at `high`).
 
 ## Running it by hand
 
@@ -225,8 +216,9 @@ the raw per-meal JSON to `logs/`. Each meal costs ~3 heavy Claude calls, so keep
 Per meal: one independent Claude estimate + one adjudication (both **sonnet, high
 effort**, image, ~6–9 min each) + one **light** FDC-matching call + a handful of cached
 FDC HTTP lookups. Roughly **2 heavy calls/meal** (vs 1 before), all background, plus a
-third heavy call only on high-disagreement meals once that estimator is wired. FDC is
-free; the on-disk cache means a repeated food costs nothing.
+third heavy call (**sonnet, xhigh effort** — slower still) only on meals where Gemini
+and Claude disagree past the gate. FDC is free; the on-disk cache means a repeated food
+costs nothing.
 
 ## Schedule — disable / re-enable
 

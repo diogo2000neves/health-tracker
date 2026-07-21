@@ -35,7 +35,9 @@ import nutrients
 
 log = logging.getLogger("nutrition-audit")
 
-DEFAULT_MODEL = "sonnet"
+# Pinned to the model ID, not the "sonnet" alias — see estimate.py's DEFAULT_MODEL
+# comment: the alias resolves to a stale claude-sonnet-4-6 on this machine's CLI.
+DEFAULT_MODEL = "claude-sonnet-5"
 DEFAULT_EFFORT = "high"
 DEFAULT_TIMEOUT_S = 900
 
