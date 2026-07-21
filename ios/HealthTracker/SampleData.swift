@@ -222,7 +222,9 @@ enum SampleData {
         }
         t["sodium_mg"] = target("limit", ceiling: 2300, unit: "mg", source: "rda")
         t["trans_fat_g"] = target("limit", ceiling: 2, unit: "g", source: "rda")
-        t["cholesterol_mg"] = target("limit", ceiling: 300, unit: "mg", source: "rda")
+        // cholesterol_mg has no target: the fixed 300 mg/day cap is no longer
+        // evidence-based (see backend/ingest/main.py's _MICRO_TARGETS comment), so
+        // it shows in the Context section (amount only) rather than as a limit.
         return t
     }
 

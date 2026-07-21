@@ -237,8 +237,7 @@ private struct FlagsCard: View {
     }
 
     private var flags: [Flag] {
-        let keys = ["sodium_mg", "added_sugar_g", "saturated_fat_g",
-                    "trans_fat_g", "cholesterol_mg"]
+        let keys = ["sodium_mg", "added_sugar_g", "saturated_fat_g", "trans_fat_g"]
         var out: [Flag] = []
         for key in keys {
             guard let target = response.targets[key],

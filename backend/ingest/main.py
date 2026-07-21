@@ -288,8 +288,8 @@ NUTRIENT_HISTORY_DAYS = 7
 #
 #   kind    reach  = hit a floor (protein, fibre, every vitamin/most minerals):
 #                    under is amber, met is green.
-#           limit  = stay under a ceiling (sodium, added sugar, sat/trans fat,
-#                    cholesterol): under is green, over is red.
+#           limit  = stay under a ceiling (sodium, added sugar, sat/trans fat):
+#                    under is green, over is red.
 #           window = stay near a value with a floor and a ceiling (calories, the
 #                    fill macro carbs).
 #   source  measured = computed by the backend from the user's own data
@@ -322,7 +322,14 @@ HORIZON_DAILY, HORIZON_ROLLING = "daily", "rolling"
 # complete set of references and are seeded as `source=rda` — edit any cell in the
 # sheet to personalise it. `added_sugar_g`/`saturated_fat_g` are NOT here: they
 # scale with the calorie target, so they are derived in _derive_targets instead.
-# Values verified 2026-07 against the U.S. National Academies DRI tables.
+# `cholesterol_mg` is NOT here either: the fixed 300 mg/day cap was dropped by the
+# 2015-2020 Dietary Guidelines for Americans once the evidence showed dietary
+# cholesterol is a weak, individually-variable predictor of serum LDL-C for most
+# people (serum LDL is set mainly by hepatic LDL-receptor activity, which responds
+# far more to saturated fat than to cholesterol intake) — so it's tracked and shown
+# (NUTRIENT_KEYS, NutrientCatalog's context section) but carries no target/ceiling.
+# Values verified 2026-07 against the U.S. National Academies DRI tables and the
+# 2025-2030 Dietary Guidelines for Americans.
 # Each entry: key -> (kind, floor, ceiling, unit).
 _MICRO_TARGETS: Dict[str, Tuple[str, Optional[float], Optional[float], str]] = {
     # fat-soluble vitamins
@@ -357,7 +364,6 @@ _MICRO_TARGETS: Dict[str, Tuple[str, Optional[float], Optional[float], str]] = {
     # things to stay under
     "sodium_mg":      (TARGET_LIMIT, None, 2300, "mg"),   # CDRR
     "trans_fat_g":    (TARGET_LIMIT, None, 2,    "g"),    # keep as low as possible
-    "cholesterol_mg": (TARGET_LIMIT, None, 300,  "mg"),   # traditional guideline
 }
 
 # The biological kinetics of each nutrient — the reference science that turns a bare
@@ -381,9 +387,11 @@ _MICRO_TARGETS: Dict[str, Tuple[str, Optional[float], Optional[float], str]] = {
 # Anything absent from this map defaults to (daily, no ceiling). Only the `rolling`
 # nutrients and the one `daily` nutrient with a reachable ceiling (zinc) are listed;
 # the remaining daily-with-no-ceiling nutrients (vitamin C, B1/B2/B3/B5/B6, biotin,
-# choline, magnesium, potassium, chloride, fibre) fall through to the default. The
-# pure `limit` metrics (sodium, added sugar, sat/trans fat, cholesterol) already carry
+# choline, magnesium, potassium, chloride, fibre, cholesterol) fall through to the
+# default. The pure `limit` metrics (sodium, added sugar, sat/trans fat) already carry
 # their ceiling from _MICRO_TARGETS/_derive_targets and just take the daily default.
+# Cholesterol has neither a target ceiling nor a UL here (see the note above
+# _MICRO_TARGETS) — it's tracked but never colours as a risk.
 # Each entry: key -> (horizon, upper_limit | None).
 _NUTRIENT_KINETICS: Dict[str, Tuple[str, Optional[float]]] = {
     # fat-soluble vitamins — stored in liver and fat for weeks to months.

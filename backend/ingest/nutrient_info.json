@@ -871,18 +871,34 @@
       ]
     },
     "cholesterol_mg": {
-      "summary": "",
-      "roles": [],
-      "goal_relevance": "",
-      "optimal_range": "",
-      "upper_limit": "",
-      "food_sources": [],
-      "deficiency": "",
-      "excess": "",
-      "tips": [],
-      "fact": "",
+      "summary": "Um lípide estrutural, não um vilão isolado. O fígado e o intestino fabricam 700–1250 mg/dia — várias vezes mais do que uma dieta típica fornece — e ajustam essa produção consoante o que comes.",
+      "roles": [
+        "Estrutura de todas as membranas celulares",
+        "Precursor de hormonas esteroides — incluindo testosterona",
+        "Precursor da vitamina D e dos ácidos biliares (digestão de gordura)"
+      ],
+      "goal_relevance": "É matéria-prima para testosterona, por isso uma dieta demasiado pobre em gordura/colesterol pode prejudicar a produção hormonal. Para a maioria das pessoas, o colesterol da dieta pesa pouco no colesterol LDL do sangue — quem manda no LDL é sobretudo a gordura saturada, não os mg de colesterol no prato.",
+      "optimal_range": "Sem um número-alvo fixo. A prioridade é a gordura saturada (ver essa ficha) e o padrão alimentar geral, não contar mg de colesterol.",
+      "upper_limit": "Não há um teto com base sólida em evidência — as diretrizes americanas abandonaram o limite fixo de 300 mg/dia em 2015-2020 depois de anos de dados a mostrar que o colesterol da dieta é um preditor fraco e inconsistente do LDL sérico na maioria das pessoas. Cerca de 1 em cada 4 é \"hiper-respondedor\" e vê o LDL subir de forma real com a dieta — vale a pena confirmar com um painel lipídico se comes ovos/marisco em quantidade.",
+      "food_sources": [
+        {"food": "Gema de ovo", "amount": 1085, "unit": "mg", "per": "100 g", "note": "1 gema ≈ 185 mg"},
+        {"food": "Fígado", "amount": 380, "unit": "mg", "per": "100 g"},
+        {"food": "Camarão", "amount": 195, "unit": "mg", "per": "100 g"},
+        {"food": "Queijo curado", "amount": 100, "unit": "mg", "per": "100 g"}
+      ],
+      "deficiency": "Não existe por via alimentar — o corpo produz o que precisa independentemente da dieta.",
+      "excess": "Na maioria das pessoas o efeito no LDL é pequeno e amortecido pela produção própria do fígado. Num hiper-respondedor, o LDL pode subir de forma notável (muitas vezes o HDL sobe também); o sinal a vigiar é o painel lipídico (ApoB/LDL), não os mg de colesterol comidos.",
+      "tips": [
+        "Não vale a pena restringir ovos por causa do colesterol por si só — o que importa mais é o que os acompanha (vegetais e azeite vs. carne processada e pão refinado)",
+        "Gordura saturada tem um efeito muito mais consistente no LDL do que o colesterol da dieta — é aí que compensa focar",
+        "Se tens uma dieta rica em ovos/marisco/vísceras, um painel lipídico com ApoB de vez em quando resolve a dúvida de seres ou não hiper-respondedor"
+      ],
+      "fact": "O corpo fabrica 3 a 6 vezes mais colesterol por dia do que uma dieta normal fornece — por isso o fígado reduz a produção própria quando comes mais, e vice-versa.",
       "sections": [],
-      "references": []
+      "references": [
+        "2015-2020 Dietary Guidelines for Americans — Advisory Committee Scientific Report",
+        "2025-2030 Dietary Guidelines for Americans"
+      ]
     },
     "choline_mg": {
       "summary": "Nutriente essencial (semelhante às vitaminas B) necessário em grande quantidade. Faz o acetilcolina e impede a gordura de ficar presa no fígado.",

@@ -221,9 +221,17 @@ maximising overall health. Defaults (all tunable in the `targets` tab):
 | Kind | Meaning | Examples | UI |
 |---|---|---|---|
 | **reach** | hit a floor | protein, fibre, all vitamins & most minerals, potassium, calcium, iron, magnesium, omega-3 | ring/bar fills toward 100%; under = amber, met = green |
-| **limit** | stay under a ceiling | sodium, added_sugar, saturated_fat, trans_fat, cholesterol | bar green under ceiling, red over |
+| **limit** | stay under a ceiling | sodium, added_sugar, saturated_fat, trans_fat | bar green under ceiling, red over |
 | **window** | stay near a value | calories | on-target green, under/over shaded |
 | **derived** | computed, shown for context | energy_balance | neutral |
+
+Note: `cholesterol_mg` is intentionally **not** a `limit` — the fixed 300 mg/day
+cap was dropped by the 2015-2020 DGA once the evidence showed dietary cholesterol
+is a weak, individually-variable predictor of serum LDL-C for most people (serum
+LDL tracks hepatic LDL-receptor activity, driven far more by saturated fat than by
+cholesterol intake). It's still tracked per meal and shown in the app's Context
+section (amount only, no ceiling/colour), since "as low as practical" isn't a
+number to code against.
 
 ### 4.4 Micro reference defaults (seed the `targets` tab, `source=rda`)
 
