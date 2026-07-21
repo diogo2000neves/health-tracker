@@ -210,6 +210,15 @@ def ground(items: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str,
         return items, {"grounded": 0, "total": len(items), "keys_from_fdc": 0,
                        "detail": [{"name": it.get("name"), "source": "model",
                                    "reason": "fdc_rate_limited"} for it in items]}
+    except _FDC_LOOKUP_ERRORS as exc:
+        # A single bad search query (e.g. a 400 from FDC on a malformed/edge-case
+        # item name) must not crash the whole meal — this call must "never raise"
+        # exactly like the per-item fdc.get_food() lookup below already doesn't.
+        # 2026-07-21: an uncaught HTTPError here killed the launchd process mid-run.
+        log.warning("  ground: FDC candidate search failed — keeping model estimates: %s", exc)
+        return items, {"grounded": 0, "total": len(items), "keys_from_fdc": 0,
+                       "detail": [{"name": it.get("name"), "source": "model",
+                                   "reason": "fdc_error"} for it in items]}
 
     chosen = _match_with_model(items, candidates)
 

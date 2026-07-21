@@ -10,6 +10,15 @@ survive trailing prose" logic that took a few production failures to get right.
 The image(s) are NOT passed as CLI flags — the prompt names the on-disk paths and
 the CLI's own Read tool opens them (HEIC included, verified). So a call is just a
 prompt string plus model/effort/timeout knobs.
+
+Tool access is locked to Read (--allowedTools): every prompt here only ever needs it
+to open the image(s). Headless `-p` can't prompt for permission, so an unrequested
+tool call auto-denies and fails the whole call — which is exactly what happened in
+production on 2026-07-21 (right after pinning to claude-sonnet-5): the model
+spontaneously tried `Bash("rm -rf /tmp/nutriimg")` as unsolicited "cleanup" (the
+caller already deletes the temp images itself in a `finally`), got denied, and the
+meal was skipped. Locking the tool list turns that failure mode into "can't happen"
+instead of "hope the model doesn't wander."
 """
 from __future__ import annotations
 
@@ -48,7 +57,8 @@ def call_claude_json(prompt: str, *, model: str, effort: str,
     try:
         proc = subprocess.run(
             [CLAUDE_BIN, "-p", prompt, "--model", model,
-             "--effort", effort, "--output-format", "json"],
+             "--effort", effort, "--output-format", "json",
+             "--allowedTools", "Read"],
             capture_output=True, text=True, timeout=timeout_s,
         )
     except subprocess.TimeoutExpired as exc:
