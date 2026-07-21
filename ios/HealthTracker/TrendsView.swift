@@ -34,6 +34,11 @@ struct TrendsView: View {
                 }
             }
             .navigationTitle("Tendências")
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    SyncIndicator(isRefreshing: store.isRefreshing)
+                }
+            }
         }
         .task { await store.load() }
     }

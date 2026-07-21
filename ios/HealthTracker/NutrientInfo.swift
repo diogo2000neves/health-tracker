@@ -81,8 +81,18 @@ final class InfoStore {
     private(set) var loaded = false
     private var loading = false
 
-    /// Fetch once and cache. Non-critical: on failure it stays empty (nutrients show
-    /// "em breve") and a later open retries.
+    init() {
+        // Seed from disk so the screen has content instantly; `loaded` stays false
+        // so loadIfNeeded() still makes its one network attempt this session and
+        // can pick up a change to the write-ups instead of pinning the cache forever.
+        if let cached = APIClient.shared.cachedNutrients() {
+            byKey = cached.nutrients
+        }
+    }
+
+    /// Refresh from the network once per session; non-critical, so a failure is
+    /// silent either way — on a cold cache the screen just keeps showing "em breve",
+    /// and with a disk cache already loaded it simply keeps that content on screen.
     func loadIfNeeded() async {
         if loaded || loading { return }
         loading = true

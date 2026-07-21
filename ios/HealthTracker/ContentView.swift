@@ -15,18 +15,35 @@ import SwiftUI
 @MainActor
 @Observable
 final class TodayStore {
+    /// Seeded from disk at init, so the very first frame already has yesterday's
+    /// (or this morning's) numbers on screen — never a blank spinner on a second
+    /// launch, only on the very first one ever.
     var response: TodayResponse?
     var errorMessage: String?
+    /// True only while there is nothing at all to show yet (fresh install, empty
+    /// cache). Once `response` is populated, later reloads never set this again.
     var isLoading = false
+    /// True while a reload runs behind data that's already on screen — drives a
+    /// small, unobtrusive indicator instead of blocking the view.
+    var isRefreshing = false
+
+    init() {
+        response = APIClient.shared.cachedToday()
+    }
 
     func load() async {
-        isLoading = true
-        defer { isLoading = false }
+        let hadResponse = response != nil
+        if hadResponse { isRefreshing = true } else { isLoading = true }
+        defer { isLoading = false; isRefreshing = false }
         do {
             response = try await APIClient.shared.today()
             errorMessage = nil
         } catch {
-            errorMessage = error.localizedDescription
+            // A background refresh failing (e.g. a cold-start 503 that outlasted the
+            // retries) just leaves the last-known-good data on screen — the user
+            // never sees this. Only surface the error when there's nothing cached
+            // at all to fall back to.
+            if !hadResponse { errorMessage = error.localizedDescription }
         }
     }
 }
@@ -37,17 +54,23 @@ final class TrendsStore {
     var response: DailyResponse?
     var errorMessage: String?
     var isLoading = false
+    var isRefreshing = false
+
+    init() {
+        response = APIClient.shared.cachedDaily()
+    }
 
     func load() async {
-        isLoading = true
-        defer { isLoading = false }
+        let hadResponse = response != nil
+        if hadResponse { isRefreshing = true } else { isLoading = true }
+        defer { isLoading = false; isRefreshing = false }
         do {
             let today = Date()
             let from = Calendar.current.date(byAdding: .day, value: -90, to: today)!
             response = try await APIClient.shared.daily(from: Self.iso(from), to: Self.iso(today))
             errorMessage = nil
         } catch {
-            errorMessage = error.localizedDescription
+            if !hadResponse { errorMessage = error.localizedDescription }
         }
     }
 
@@ -106,6 +129,19 @@ struct RootView: View {
 }
 
 // MARK: - Shared small views
+
+/// A quiet toolbar spinner for a background refresh happening behind data that's
+/// already on screen — never blocks, never shows an error, just fades in and out.
+struct SyncIndicator: View {
+    let isRefreshing: Bool
+
+    var body: some View {
+        ProgressView()
+            .controlSize(.small)
+            .opacity(isRefreshing ? 1 : 0)
+            .animation(.easeInOut(duration: 0.2), value: isRefreshing)
+    }
+}
 
 /// A centred loading / error placeholder shared by the tabs.
 struct LoadingOrError: View {

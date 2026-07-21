@@ -53,6 +53,11 @@ struct NutrientsView: View {
                 }
             }
             .navigationTitle("Nutrientes")
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    SyncIndicator(isRefreshing: store.isRefreshing)
+                }
+            }
         }
         .task { await store.load() }
         .task { await info.loadIfNeeded() }

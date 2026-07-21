@@ -29,6 +29,9 @@ struct TodayView: View {
             }
             .navigationTitle("Hoje")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    SyncIndicator(isRefreshing: store.isRefreshing)
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         showProfile = true

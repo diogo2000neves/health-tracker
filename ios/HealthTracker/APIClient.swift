@@ -58,7 +58,29 @@ struct APIClient {
         return try await get("nutrients", query: [])
     }
 
+    // MARK: - Disk-cached last-known-good (read synchronously at store init, so the
+    // UI has something to show before the first network round trip even starts).
+
+    func cachedToday() -> TodayResponse? {
+        useSampleData ? nil : DiskCache.load(TodayResponse.self, as: "today")
+    }
+
+    func cachedDaily() -> DailyResponse? {
+        useSampleData ? nil : DiskCache.load(DailyResponse.self, as: "daily")
+    }
+
+    func cachedNutrients() -> NutrientInfoResponse? {
+        useSampleData ? nil : DiskCache.load(NutrientInfoResponse.self, as: "nutrients")
+    }
+
     // MARK: - Internals
+
+    /// Retry pacing for a single logical request. The Cloud Run backend scales to
+    /// zero when idle, so the first hit after a while cold-starts the instance and
+    /// intermittently answers with a 503 while it does — riding through that here
+    /// with a couple of quick, silent retries means the caller never has to
+    /// manually tap "tentar de novo" three times to get in.
+    private static let retryDelaysNs: [UInt64] = [0, 700_000_000, 1_800_000_000]
 
     private func get<T: Decodable>(_ path: String, query: [URLQueryItem]) async throws -> T {
         var url = Config.baseURL.appending(path: path)
@@ -68,11 +90,38 @@ struct APIClient {
         request.setValue(Config.authToken, forHTTPHeaderField: "X-Auth-Token")
         request.cachePolicy = .reloadIgnoringLocalCacheData  // always the live sheet
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else { throw APIError.notHTTP }
-        guard http.statusCode == 200 else { throw APIError.badStatus(http.statusCode) }
+        var lastError: Error = APIError.notHTTP
+        for (attempt, delay) in Self.retryDelaysNs.enumerated() {
+            let isLastAttempt = attempt == Self.retryDelaysNs.count - 1
+            if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let http = response as? HTTPURLResponse else { throw APIError.notHTTP }
+                guard http.statusCode == 200 else {
+                    lastError = APIError.badStatus(http.statusCode)
+                    if Self.isRetryableStatus(http.statusCode), !isLastAttempt { continue }
+                    throw lastError
+                }
+                let decoded = try JSONDecoder().decode(T.self, from: data)
+                DiskCache.save(data, as: path)
+                return decoded
+            } catch {
+                lastError = error
+                if Self.isRetryableNetworkError(error), !isLastAttempt { continue }
+                throw error
+            }
+        }
+        throw lastError
+    }
 
-        return try JSONDecoder().decode(T.self, from: data)
+    private static func isRetryableStatus(_ code: Int) -> Bool {
+        code == 503 || code == 502 || code == 504
+    }
+
+    private static func isRetryableNetworkError(_ error: Error) -> Bool {
+        guard let urlError = error as? URLError else { return false }
+        return [.timedOut, .networkConnectionLost, .cannotConnectToHost, .dnsLookupFailed]
+            .contains(urlError.code)
     }
 
     /// DEBUG-only: render the whole app against bundled sample data by launching
