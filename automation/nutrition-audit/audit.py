@@ -133,22 +133,19 @@ KNOWN_SCOPES = [
 
 log = logging.getLogger("nutrition-audit")
 
-# Third estimator (Gemini 3.1 Pro) — OPTIONAL and disagreement-gated, OFF by default.
-# The local `gemini` CLI is hard-blocked for individual Gemini Code Assist tiers
-# ("IneligibleTierError ... migrate to Antigravity"), so a subscription CLI call cannot
-# work headlessly. To actually use a third model you need a path valid for your account
-# (e.g. a BILLED Gemini API key — gemini-3.1-pro-preview has no free tier) wired into
-# gemini_estimate.estimate, then set AUDIT_ENABLE_THIRD=1. Until then the pipeline runs
-# Gemini(row) + Claude, which is complete on its own.
-if os.environ.get("AUDIT_ENABLE_THIRD"):
-    try:
-        import gemini_estimate
-        if gemini_estimate.available():
-            _THIRD_ESTIMATOR = gemini_estimate.estimate
-        else:
-            log.info("AUDIT_ENABLE_THIRD set but gemini estimator unavailable — third off")
-    except Exception as _exc:  # noqa: BLE001
-        log.warning("third estimator not wired: %s", _exc)
+# Third estimator (a deliberate Gemini opinion) via the `agy` Antigravity CLI on the
+# personal subscription — verified working headless. Wires in automatically when agy is
+# installed; without it the pipeline is Gemini(row) + Claude, which is complete on its
+# own. (The legacy `gemini` CLI is hard-blocked for individual tiers — IneligibleTierError
+# "migrate to Antigravity" — which is why this goes through agy.)
+try:
+    import gemini_estimate
+    if gemini_estimate.available():
+        _THIRD_ESTIMATOR = gemini_estimate.estimate
+    else:
+        log.info("agy CLI not found — third estimator off (set AGY_BIN to enable)")
+except Exception as _exc:  # noqa: BLE001
+    log.warning("third estimator not wired: %s", _exc)
 
 
 # -- auth & clients ------------------------------------------------------------

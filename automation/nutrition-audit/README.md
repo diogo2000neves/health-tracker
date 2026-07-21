@@ -148,20 +148,36 @@ same OAuth client as the rest of the system but its own token with `spreadsheets
 | `FDC_API_KEY` | `DEMO_KEY` | USDA key. **DEMO_KEY is capped at ~30 req/hour** — get a free key (instant, no billing) at <https://fdc.nal.usda.gov/api-key-signup.html> and export it to lift the cap to ~1000/hour. |
 | `FDC_MATCH_MODEL` / `FDC_MATCH_EFFORT` | `sonnet` / `low` | Model + effort for the light FDC-matching call (text ranking — cheap). |
 | `AUDIT_THIRD_MODEL_DISAGREEMENT` | `0.25` | Divergence above which the third estimator is invoked. |
-| `GEMINI_BIN` / `GEMINI_CLI_MODEL` | `gemini` / `gemini-3.1-pro-preview` | The third estimator's CLI binary + model (see below). |
+| `AGY_BIN` / `AGY_MODEL` | `~/.local/bin/agy` / `gemini-3.5-flash-high` | The third estimator's CLI binary + model (see below). |
 | `AUDIT_CLAUDE_TIMEOUT_S` *(via each stage)* | `900` | Per-call timeout for the heavy image estimate/adjudication calls. |
 | `HEALTH_SPREADSHEET_ID`, `HEALTH_TZ`, `CLAUDE_BIN` | see code | Overrides the backend also honours. |
 
-### The third model (Gemini 3.1 Pro)
+### The third model (a deliberate Gemini opinion, via `agy`)
 
-`gemini_estimate.py` shells out to the local **`gemini` CLI** — subscription-backed,
-exactly like the `claude` CLI, **no API key**. It auto-wires when the `gemini` binary
-is on PATH (`audit.py` checks `gemini_estimate.available()`), and stays off otherwise.
-It reuses the identical independent-estimate prompt, so Gemini and Claude answer the
-same question; it hands images to the CLI as `@<path>` refs and runs
-`--approval-mode yolo` so an unattended run never blocks on a tool prompt. If your CLI
-uses different flags/model ids, override `GEMINI_BIN` / `GEMINI_CLI_MODEL` or adjust the
-argv in `gemini_estimate.py`. (The CLI must be logged in to your subscription.)
+`gemini_estimate.py` shells out to the local **`agy` (Antigravity) CLI** —
+subscription-backed like the `claude` CLI, **no API key**. It auto-wires when `agy` is
+installed and reuses the identical independent-estimate prompt, so Gemini and Claude
+answer the same question.
+
+*Why `agy` and not `gemini`:* Google retired individual sign-in on the legacy
+`@google/gemini-cli` — it fails with `IneligibleTierError … migrate to Antigravity`.
+`agy` is the supported terminal client for individual subscriptions.
+
+*Why `gemini-3.5-flash-high` and not 3.1-pro:* `backend/ingest/main.py` documents that
+3.1-pro is **older** and **loses to 3.5-flash on multimodal understanding** (MMMU-Pro) —
+and this workload is photos of food. The original diagnosis was also that Gemini's errors
+here are a **speed tax, not incompetence** (cloud ingest runs flash rushed under a ~105 s
+deadline), so running the same family at **high** effort with no deadline makes this a
+genuinely *deliberate* Gemini opinion, decorrelated from the rushed ingest one. Override
+with `AGY_MODEL` (`agy models` lists ids; `gemini-3.1-pro-high` is available).
+
+*Verified invocation:* `agy -p <prompt> --model <id> --print-timeout 15m
+--dangerously-skip-permissions`. The effort level is part of the model id, not a flag.
+The skip-permissions flag is required because **headless agy auto-denies tool
+permissions** (it can't prompt), so `read_file` on the photo would be refused; blast
+radius is limited by running with `cwd` = the throwaway photo temp dir. If you'd prefer
+not to auto-approve, add a scoped `permissions.allow` rule (e.g. `read_file(<tmp dir>)`)
+in agy's `settings.json` instead and drop the flag.
 
 ## Running it by hand
 
