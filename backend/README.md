@@ -81,7 +81,7 @@ Health Tracker/
 
 - `POST /process` — internal Cloud Tasks worker: **all** analysis + the row insert.
   Nothing waits on it, so it's stubborn: for the first 6 of the queue's 8 attempts
-  it calls only `gemini-3.5-flash`, retrying it and then returning 5xx so the queue
+  it calls only `gemini-3.6-flash`, retrying it and then returning 5xx so the queue
   re-runs it after a backoff — ~30 shots at the best model over ~11 minutes before
   anything weaker may answer. Only on the last 2 attempts does it walk the rest of
   the chain (a flash-lite row beats a stub), and only on the very last does it

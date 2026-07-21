@@ -10,15 +10,19 @@ Why `agy` and not `gemini`: Google retired individual sign-in on the legacy
 The Antigravity CLI (`agy`) is the supported terminal client for individual
 subscriptions and runs headless with `-p`.
 
-MODEL CHOICE — deliberately gemini-3.5-flash at HIGH effort, not 3.1-pro:
+MODEL CHOICE — deliberately gemini-3.6-flash at HIGH effort, not 3.1-pro:
   * backend/ingest/main.py documents that gemini-3.1-pro-preview is OLDER than
-    gemini-3.5-flash and LOSES to it on multimodal understanding (MMMU-Pro) — and this
+    the Flash line and LOSES to it on multimodal understanding (MMMU-Pro) — and this
     workload is photos of food, i.e. exactly multimodal.
   * The original diagnosis was that Gemini's errors here are a SPEED tax, not
     incompetence: cloud ingest runs flash rushed under a ~105 s deadline. Running the
     same-family model at HIGH effort with no deadline makes this a genuinely DELIBERATE
     second Gemini opinion, decorrelated from the rushed ingest one — which is what makes
     it worth adjudicating against.
+  * gemini-3.6-flash (released 2026-07-21) is the successor to gemini-3.5-flash and is
+    now cloud ingest's primary model (see DEFAULT_MODELS in main.py), so the "same
+    family as ingest's primary" rationale means this should track it, not stay pinned
+    to the previous generation.
 Override with AGY_MODEL (e.g. "gemini-3.1-pro-preview") if you want a different one.
 """
 from __future__ import annotations
@@ -46,9 +50,10 @@ def _default_bin() -> str:
 
 
 AGY_BIN = os.environ.get("AGY_BIN", _default_bin())
-# Verified against `agy models`: effort is part of the id (…-high/-medium/-low), not a
-# separate flag. gemini-3.1-pro-high is also available if you ever want to switch.
-MODEL = os.environ.get("AGY_MODEL", "gemini-3.5-flash-high")
+# Verified against `agy models` (2026-07-21): effort is part of the id
+# (…-high/-medium/-low), not a separate flag. gemini-3.1-pro-high is also available if
+# you ever want to switch.
+MODEL = os.environ.get("AGY_MODEL", "gemini-3.6-flash-high")
 TIMEOUT_S = int(os.environ.get("AGY_TIMEOUT_S", "900"))
 # agy's own headless wait; its default is 5m, which would cut off a high-effort call on
 # a complex plate. Keep it at/above our subprocess timeout.

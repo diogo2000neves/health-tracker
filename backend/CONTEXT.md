@@ -259,11 +259,11 @@ into the `analysis` tab, driven entirely by the registry's `causal` field.
   Tasks** job (queue `meal-ingest`, europe-west1) and returns `202` in a couple of
   seconds. All analysis is on `/process`. Two facts forced this: the iPhone
   Shortcut fails the whole log if the HTTP call is slow, and the model worth
-  waiting for (`gemini-3.5-flash`) is exactly the one that's frequently
+  waiting for (`gemini-3.6-flash`) is exactly the one that's frequently
   overloaded. They can't be reconciled on one request, so the request no longer
   tries.
 - **The queue's retry window is a patience budget** (`_worker_kwargs`): for the
-  first 6 of its 8 attempts the worker calls **only `gemini-3.5-flash`**, retrying
+  first 6 of its 8 attempts the worker calls **only `gemini-3.6-flash`**, retrying
   it within the attempt and then 5xx-ing so Cloud Tasks re-runs it after a backoff
   — ~30 shots at the best model over ~11 min before anything weaker may answer.
   Walking the chain on every attempt would defeat the ordering: attempt 1 would
@@ -445,13 +445,18 @@ token is read-only across `sleep`, `health_metrics_and_measurements` and
   `gen-lang-client-0757945342`. This is what makes it **€0**.
 - Free tier ≈ 1,500 requests/day, **Flash models only**. Google may use free-tier
   data to improve their products (accepted).
-- **Model fallback chain** (`GEMINI_MODELS` env):
-  `gemini-3.1-flash-lite → gemini-3.5-flash → gemini-3-flash-preview`.
-  flash-lite goes **first** deliberately: the bigger Flash models 503 on most
-  free-tier calls (10–40 s of wasted fallback latency), and a *consistent*
-  estimator produces cleaner day-to-day trend deltas than a mix of models with
-  different biases. If every model fails, the photo is archived and an
-  `analysis failed` stub row is logged — a meal is never silently lost.
+- **Model fallback chain** (`GEMINI_MODELS` env, see `DEFAULT_MODELS` in
+  `ingest/main.py`):
+  `gemini-3.6-flash → gemini-3.5-flash-lite → gemini-3.5-flash`. Best model
+  first, deliberately: since the ack-then-analyse rewrite nothing waits on
+  `/process` any more, so accuracy leads over speed — the queue's retry window
+  (see §3/`_worker_kwargs`) is spent holding out for `gemini-3.6-flash` before
+  weaker models get a turn. (This section previously said flash-lite went
+  first for latency reasons; that was the pre-rewrite design and is stale —
+  the current order is documented and enforced by
+  `test_default_chain_is_best_first_and_free_tier`.) If every model fails, the
+  photo is archived and an `analysis failed` stub row is logged — a meal is
+  never silently lost.
 - Output is enforced with a typed `response_schema` (structured JSON), not
   prompt-format begging, with a `reasoning` field generated FIRST so the model
   works through scale and hidden fats before committing to numbers — that

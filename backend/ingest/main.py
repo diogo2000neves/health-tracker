@@ -180,25 +180,30 @@ _READ_LAST_COL = _col_letter_for(len(daily_headers()) + 40)
 # BEST model first — accuracy over speed, because nothing waits on this any more:
 # analysis happens entirely in the background worker (see /ingest), so a slow or
 # overloaded model costs patience, never a request timeout.
-# gemini-3.5-flash is the model we actually want the numbers from. flash-lite is
-# the steady fallback (across the 2026-07-12/13 incidents it was the one that
-# never hung); gemini-3-flash-preview is a last resort so an outage on both still
-# lands a real row instead of a stub.
+# gemini-3.6-flash is the model we actually want the numbers from (released
+# 2026-07-21, successor to 3.5-flash: cheaper output and ~17% fewer output
+# tokens for the same task). gemini-3.5-flash-lite is the steady fallback
+# (successor to 3.1-flash-lite, same role); gemini-3.5-flash is the last
+# resort — the previous generation's primary, kept alive and distinct from the
+# top two so an outage on both still lands a real row instead of a stub.
+# (gemini-3-flash-preview, the old last resort, was retired by Google on
+# 2026-06-25 — it no longer answers at all, which is why this chain moved up
+# a generation on 2026-07-21 rather than just swapping the dead entry.)
 # Pro is deliberately NOT here, and paying for it would be a DOWNGRADE — don't
 # "upgrade" this chain without re-reading the numbers (verified 2026-07-16):
 #   * gemini-3.1-pro-preview has NO free tier at all (structural, not a quota
 #     blip): a live call 429s with "check your plan and billing details".
-#   * It is also OLDER than gemini-3.5-flash (May 2026) and LOSES to it on
-#     multimodal understanding (MMMU-Pro ~+3.1% to Flash) — which is precisely
-#     this workload: photos of food and scale screenshots. Pro leads only on
-#     text reasoning, which we don't do here.
-#   * It costs MORE ($2/$12 per 1M vs $1.50/$9) and is ~2.6x slower.
+#   * It is also OLDER than the Flash line and LOSES to it on multimodal
+#     understanding (MMMU-Pro) — which is precisely this workload: photos of
+#     food and scale screenshots. Pro leads only on text reasoning, which we
+#     don't do here.
+#   * It costs MORE per 1M tokens and is meaningfully slower.
 # Enabling billing to reach it would also end the free tier on that project and
 # needs a $10 prepay — and Cloud free-trial/Welcome credits are explicitly barred
 # from the Gemini API, so it cannot be paid for with credits.
 # The chain is NOT walked top-to-bottom on every try — see _worker_kwargs: the
 # fallbacks stay locked until the queue's retry window is nearly spent.
-DEFAULT_MODELS = "gemini-3.5-flash,gemini-3.1-flash-lite,gemini-3-flash-preview"
+DEFAULT_MODELS = "gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.5-flash"
 # Per-model retries once we're walking the chain (patience spent, get a row).
 DEFAULT_RETRIES = 3
 # Per-attempt retries while we're still holding out for the first model.
@@ -1447,14 +1452,14 @@ def _worker_kwargs(attempt: int) -> Dict[str, Any]:
     The queue's retry window is a *patience budget*, and the point of this
     function is to spend it on the best model instead of settling early. Walking
     the chain top-to-bottom on every attempt would defeat the ordering entirely:
-    the first attempt would drop to flash-lite within seconds of a 3.5-flash
+    the first attempt would drop to flash-lite within seconds of a 3.6-flash
     hiccup and answer with the weaker model, and the remaining seven attempts —
     the patience — would never be used at all.
 
     So: every attempt but the last few calls ONLY the first model, retrying it
     within the attempt and then handing back a 5xx so Cloud Tasks re-runs us after
     a backoff. With the queue's 8 attempts and 5→120 s backoff that is ~30 shots
-    at gemini-3.5-flash spread over ~11 minutes (measured) before anything weaker
+    at gemini-3.6-flash spread over ~11 minutes (measured) before anything weaker
     is allowed to answer — at a peak of ~6 calls/min, which is what keeps us clear
     of the free tier's ~10 RPM (see DEFAULT_BACKOFF_BASE).
 

@@ -271,12 +271,12 @@ def test_backoff_is_exponential_capped_and_jittered(monkeypatch):
 
 
 def test_default_chain_is_best_first_and_free_tier():
-    # 3.5-flash is the model we want the numbers from; flash-lite is the steady
-    # fallback (2026-07-12/13 incidents). Nothing waits on this now, so accuracy
-    # leads. No Pro (429s on the free key).
+    # 3.6-flash is the model we want the numbers from; 3.5-flash-lite is the
+    # steady fallback. Nothing waits on this now, so accuracy leads. No Pro
+    # (429s on the free key).
     chain = ingest.DEFAULT_MODELS.split(",")
-    assert chain[0] == "gemini-3.5-flash"
-    assert chain[1] == "gemini-3.1-flash-lite"
+    assert chain[0] == "gemini-3.6-flash"
+    assert chain[1] == "gemini-3.5-flash-lite"
     assert not any("pro" in m for m in chain)
 
 
