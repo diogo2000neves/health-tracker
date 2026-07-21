@@ -29,8 +29,10 @@ struct TodayView: View {
             }
             .navigationTitle("Hoje")
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    SyncIndicator(isRefreshing: store.isRefreshing)
+                if store.isRefreshing {
+                    ToolbarItem(placement: .topBarLeading) {
+                        SyncIndicator()
+                    }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {

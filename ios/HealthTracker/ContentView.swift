@@ -131,15 +131,15 @@ struct RootView: View {
 // MARK: - Shared small views
 
 /// A quiet toolbar spinner for a background refresh happening behind data that's
-/// already on screen — never blocks, never shows an error, just fades in and out.
+/// already on screen — never blocks, never shows an error. Callers must wrap its
+/// ToolbarItem in `if isRefreshing` rather than just toggling this view's opacity:
+/// an unstyled toolbar item still gets the system's circular "glass" background
+/// even at opacity 0, which would leave an empty circle sitting in the bar forever.
+/// Omitting the ToolbarItem entirely when not refreshing removes that chrome too.
 struct SyncIndicator: View {
-    let isRefreshing: Bool
-
     var body: some View {
         ProgressView()
             .controlSize(.small)
-            .opacity(isRefreshing ? 1 : 0)
-            .animation(.easeInOut(duration: 0.2), value: isRefreshing)
     }
 }
 

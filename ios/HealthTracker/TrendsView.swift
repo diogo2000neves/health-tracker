@@ -35,8 +35,10 @@ struct TrendsView: View {
             }
             .navigationTitle("Tendências")
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    SyncIndicator(isRefreshing: store.isRefreshing)
+                if store.isRefreshing {
+                    ToolbarItem(placement: .topBarLeading) {
+                        SyncIndicator()
+                    }
                 }
             }
         }

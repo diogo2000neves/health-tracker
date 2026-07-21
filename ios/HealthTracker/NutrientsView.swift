@@ -54,8 +54,10 @@ struct NutrientsView: View {
             }
             .navigationTitle("Nutrientes")
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    SyncIndicator(isRefreshing: store.isRefreshing)
+                if store.isRefreshing {
+                    ToolbarItem(placement: .topBarLeading) {
+                        SyncIndicator()
+                    }
                 }
             }
         }
