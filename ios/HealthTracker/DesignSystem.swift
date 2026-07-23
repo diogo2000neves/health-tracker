@@ -389,6 +389,35 @@ struct WeekDots: View {
     }
 }
 
+/// Limit-ceiling history for a DAILY-LIMIT nutrient: one dot per completed day.
+/// A dot is:
+///  • green  — the day stayed within the limit (v ≤ ceiling);
+///  • yellow — the day was close to the limit, between `nearThreshold` × ceiling
+///    and the ceiling;
+///  • red    — the day exceeded the ceiling, so over-consume alert.
+/// The near threshold defaults to 0.8, matching the app's consistent boundary for
+/// "near the ceiling" across all nutrient views.
+struct LimitDots: View {
+    var values: [Double]        // this nutrient, per completed day, oldest first
+    var ceiling: Double
+    var nearThreshold: Double = 0.8
+    var dot: CGFloat = 8
+
+    var body: some View {
+        HStack(spacing: 5) {
+            ForEach(Array(values.enumerated()), id: \.offset) { _, v in
+                let over = ceiling > 0 && v > ceiling
+                let near = !over && ceiling > 0 && v >= nearThreshold * ceiling
+                let color: Color = over ? Palette.critical
+                    : (near ? Palette.warning : Palette.good)
+                Circle()
+                    .fill(color)
+                    .frame(width: dot, height: dot)
+            }
+        }
+    }
+}
+
 /// The reserves view for a CUMULATIVE nutrient: the bar fills to the rolling AVERAGE
 /// (coloured by the average's status, so a low today reads calm), and a faint marker
 /// shows where today alone landed — the single-day dip or spike against the buffer.

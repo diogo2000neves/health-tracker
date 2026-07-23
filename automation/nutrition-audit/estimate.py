@@ -71,7 +71,11 @@ camera angle. If there is no reliable reference, say so and widen uncertainty.
 not visible: absorbed cooking oil/butter (anything fried/sauteed/roasted), \
 sauces/dressings soaked in, added sugar/syrup. Hidden fats are the single biggest \
 calorie error - never skip them. List absorbed oil/butter as its OWN item with its \
-own gram estimate, so it can be priced accurately later.
+own gram estimate, so it can be priced accurately later. \
+Cooked starches (rice, pasta, grains, legumes, potatoes, starchy vegetables) \
+absorb significant water during cooking — weigh/estimate the cooked, plated portion \
+in front of you, not a dry-equivalent guess. A portion that looks like "a cup of \
+cooked rice" is ~200 g, not the ~50 g dry weight it was before cooking.
 3) IDENTIFY - commit to the most specific identification the image supports (exact \
 cut, fat level, cooking method, white vs brown, etc.). Split composite plates into \
 separate items. Read any visible nutrition label and scale it to the portion - a \

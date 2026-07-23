@@ -18,9 +18,10 @@ import Foundation
 /// home section is decided by its target (see `NutrientCatalog.members`), so it tracks
 /// the backend's kinetics rather than a second, drift-prone copy of the taxonomy.
 enum NutrientSection: String, CaseIterable, Identifiable {
-    case diarios     // daily floor — repõe todos os dias (consistency is the story)
-    case reservas    // rolling floor — o corpo acumula (read the multi-day average)
-    case vigiar      // a ceiling to respect — dietary limits + toxicity ULs (crosscuts)
+    case diarios        // daily floor — repõe todos os dias (consistency is the story)
+    case reservas       // rolling floor — o corpo acumula (read the multi-day average)
+    case dailyLimits    // dietary limits — sodium, added sugar, sat/trans fat (stay under)
+    case safetyCeilings // toxicity ULs — vitamins/minerals with a reachable upper limit
 
     var id: String { rawValue }
 
@@ -28,7 +29,8 @@ enum NutrientSection: String, CaseIterable, Identifiable {
         switch self {
         case .diarios:  return "Diários"
         case .reservas: return "Reservas"
-        case .vigiar:   return "A vigiar"
+        case .dailyLimits: return "Limites diários"
+        case .safetyCeilings: return "Tetos de segurança"
         }
     }
 
@@ -37,7 +39,8 @@ enum NutrientSection: String, CaseIterable, Identifiable {
         switch self {
         case .diarios:  return "Repõe todos os dias — o que conta é a consistência"
         case .reservas: return "O corpo acumula — olha para a média, não para um só dia"
-        case .vigiar:   return "Teto de segurança — o objetivo é ficar abaixo"
+        case .dailyLimits: return "O objetivo é ficar abaixo do máximo, todos os dias"
+        case .safetyCeilings: return "Vitaminas e minerais com teto de toxicidade — raramente um risco real à mesa"
         }
     }
 
@@ -45,7 +48,8 @@ enum NutrientSection: String, CaseIterable, Identifiable {
         switch self {
         case .diarios:  return "sun.max.fill"
         case .reservas: return "archivebox.fill"
-        case .vigiar:   return "shield.lefthalf.filled"
+        case .dailyLimits: return "exclamationmark.triangle.fill"
+        case .safetyCeilings: return "shield.lefthalf.filled"
         }
     }
 }
@@ -125,9 +129,10 @@ enum NutrientCatalog {
     /// always matches the backend's kinetics:
     ///  - `diarios`  — a floor to reach on a daily horizon (not body-banked);
     ///  - `reservas` — a floor to reach on a rolling horizon (body-banked);
-    ///  - `vigiar`   — carries a ceiling to respect (a dietary limit OR a toxicity UL).
-    ///    This is cross-cutting on purpose: iron is a reserve AND a ceiling to watch,
-    ///    so it appears in both `reservas` and `vigiar`.
+    ///  - `dailyLimits` — a dietary limit to stay under (sodium, sugar, sat/trans fat);
+    ///  - `safetyCeilings` — a toxicity upper limit on a reach/window nutrient.
+    ///    This is cross-cutting: iron is a reserve with a UL, so it appears in both
+    ///    `reservas` and `safetyCeilings`.
     static func members(_ section: NutrientSection,
                         targets: [String: Target]) -> [NutrientDef] {
         all.filter { def in
@@ -135,7 +140,8 @@ enum NutrientCatalog {
             switch section {
             case .diarios:  return t.kind != Target.Kind.limit && !t.isRolling
             case .reservas: return t.kind != Target.Kind.limit && t.isRolling
-            case .vigiar:   return t.kind == Target.Kind.limit || t.upperLimit != nil
+            case .dailyLimits: return t.kind == Target.Kind.limit
+            case .safetyCeilings: return t.upperLimit != nil
             }
         }
     }

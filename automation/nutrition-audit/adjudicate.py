@@ -92,7 +92,12 @@ angle) and decide the best-supported weight; lower confidence when you had to.
 4) HIDDEN COMPONENTS (union) — absorbed cooking oil/butter, soaked-in sauces/ \
 dressings, added sugar/syrup are the biggest calorie errors and are usually errors of \
 OMISSION. If ANY estimate flagged one AND it is physically plausible for what you see, \
-KEEP it as its own item. Do not drop it just because another estimate missed it.
+KEEP it as its own item. Do not drop it just because another estimate missed it. \
+Cooked starches (rice, pasta, grains, legumes, potatoes, starchy vegetables) \
+absorb significant water during cooking — the same principle applies in reverse: \
+estimates that anchor on a dry-weight-looking portion will underestimate the actual \
+cooked, plated weight by 2-3×. When reconciling, favour the estimate whose gram \
+weights are consistent with cooked, as-served portions.
 5) MACROS — for each reconciled item give protein/carbs/fat for the final grams, then \
 calories; sanity-check calories ~= 4*protein + 4*carbs + 9*fat (within ~10%).
 6) MICRONUTRIENTS — for each reconciled item fill its `nutrients` map from that food's \

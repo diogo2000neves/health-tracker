@@ -72,7 +72,8 @@ struct NutrientsView: View {
                 CeilingAlertCard(response: r) { selected = $0 }
                 LensSection(section: .diarios, response: r) { selected = $0 }
                 LensSection(section: .reservas, response: r) { selected = $0 }
-                VigiarCard(response: r) { selected = $0 }
+                DailyLimitsCard(response: r) { selected = $0 }
+                SafetyCeilingsCard(response: r) { selected = $0 }
                 ContextCard(response: r) { selected = $0 }
             }
             .padding(16)
@@ -100,7 +101,8 @@ private func sectionAccent(_ section: NutrientSection) -> Color {
     switch section {
     case .diarios:  return Palette.accent
     case .reservas: return Palette.muscle
-    case .vigiar:   return Palette.warning
+    case .dailyLimits: return Palette.warning
+    case .safetyCeilings: return Palette.critical
     }
 }
 
@@ -110,12 +112,14 @@ private struct NutrientHeaderCard: View {
     let response: TodayResponse
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 4) {
             metTile(.diarios)
             divider
             metTile(.reservas)
             divider
-            watchTile
+            limitTile
+            divider
+            ceilingTile
         }
         .card()
     }
@@ -140,15 +144,29 @@ private struct NutrientHeaderCard: View {
         .frame(maxWidth: .infinity)
     }
 
-    private var watchTile: some View {
-        let n = watchCount
+    private var limitTile: some View {
+        let n = limitCount
         return VStack(spacing: 3) {
-            Image(systemName: NutrientSection.vigiar.systemImage).font(.footnote)
+            Image(systemName: NutrientSection.dailyLimits.systemImage).font(.footnote)
                 .foregroundStyle(n > 0 ? Palette.warning : Palette.good)
             Text("\(n)")
                 .font(.system(size: 22, weight: .bold, design: .rounded)).monospacedDigit()
                 .foregroundStyle(n > 0 ? Palette.warningText : Palette.goodText)
-            Text(n == 0 ? "tudo em folga" : "a vigiar")
+            Text(n == 0 ? "limites ok" : "limites")
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var ceilingTile: some View {
+        let n = ceilingCount
+        return VStack(spacing: 3) {
+            Image(systemName: NutrientSection.safetyCeilings.systemImage).font(.footnote)
+                .foregroundStyle(n > 0 ? Palette.warning : Palette.good)
+            Text("\(n)")
+                .font(.system(size: 22, weight: .bold, design: .rounded)).monospacedDigit()
+                .foregroundStyle(n > 0 ? Palette.warningText : Palette.goodText)
+            Text(n == 0 ? "tetos ok" : "tetos")
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
@@ -160,8 +178,15 @@ private struct NutrientHeaderCard: View {
         return (met, defs.count)
     }
 
-    private var watchCount: Int {
-        NutrientCatalog.members(.vigiar, targets: response.targets).reduce(0) { acc, def in
+    private var limitCount: Int {
+        NutrientCatalog.members(.dailyLimits, targets: response.targets).reduce(0) { acc, def in
+            guard let rd = reading(def, response) else { return acc }
+            return acc + ((rd.isNearCeiling || rd.isOverCeiling) ? 1 : 0)
+        }
+    }
+
+    private var ceilingCount: Int {
+        NutrientCatalog.members(.safetyCeilings, targets: response.targets).reduce(0) { acc, def in
             guard let rd = reading(def, response) else { return acc }
             return acc + ((rd.isNearCeiling || rd.isOverCeiling) ? 1 : 0)
         }
@@ -175,7 +200,8 @@ private struct CeilingAlertCard: View {
     let onSelect: (NutrientDef) -> Void
 
     private var breaches: [NutrientDef] {
-        NutrientCatalog.members(.vigiar, targets: response.targets)
+        (NutrientCatalog.members(.dailyLimits, targets: response.targets)
+         + NutrientCatalog.members(.safetyCeilings, targets: response.targets))
             .filter { reading($0, response)?.isOverCeiling ?? false }
     }
 
@@ -332,50 +358,33 @@ private struct NutrientRow: View {
     }
 }
 
-// MARK: - A vigiar — limits + toxicity ceilings
+// MARK: - Limites diários — dietary ceilings with history
 
-private struct VigiarCard: View {
+private struct DailyLimitsCard: View {
     let response: TodayResponse
     let onSelect: (NutrientDef) -> Void
 
     var body: some View {
-        let defs = NutrientCatalog.members(.vigiar, targets: response.targets)
-        let limits = defs.filter { response.targets[$0.key]?.kind == Target.Kind.limit }
-        let tetos  = defs.filter { response.targets[$0.key]?.kind != Target.Kind.limit }
+        let defs = NutrientCatalog.members(.dailyLimits, targets: response.targets)
         if !defs.isEmpty {
             VStack(alignment: .leading, spacing: 16) {
-                SectionTitle(section: .vigiar)
-                if !limits.isEmpty {
-                    cluster("Limites diários", limits) { LimitRow(def: $0, response: response) }
-                }
-                if !tetos.isEmpty {
-                    cluster("Tetos de segurança", tetos) { TetoRow(def: $0, response: response) }
+                SectionTitle(section: .dailyLimits)
+                VStack(spacing: 16) {
+                    ForEach(defs) { def in
+                        LimitRow(def: def, response: response)
+                            .contentShape(Rectangle())
+                            .onTapGesture { onSelect(def) }
+                    }
                 }
             }
             .card()
         }
     }
-
-    @ViewBuilder
-    private func cluster<Row: View>(_ title: String, _ defs: [NutrientDef],
-                                    @ViewBuilder row: @escaping (NutrientDef) -> Row) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(title.uppercased())
-                .font(.caption2.weight(.semibold)).tracking(0.5)
-                .foregroundStyle(.secondary).padding(.horizontal, 4)
-            VStack(spacing: 16) {
-                ForEach(defs) { def in
-                    row(def)
-                        .contentShape(Rectangle())
-                        .onTapGesture { onSelect(def) }
-                }
-            }
-        }
-    }
 }
 
-/// A pure dietary limit (sodium, added sugar, sat/trans fat, cholesterol): a daily
-/// budget, shown filling toward its ceiling.
+/// A pure dietary limit (sodium, added sugar, sat/trans fat): a daily budget shown
+/// filling toward its ceiling, with a 7-day history indicating which days stayed
+/// under, nearly hit, or exceeded the limit.
 private struct LimitRow: View {
     let def: NutrientDef
     let response: TodayResponse
@@ -394,7 +403,48 @@ private struct LimitRow: View {
                     Text(rd.label).font(.caption2.weight(.medium)).foregroundStyle(rd.fill)
                 }
                 TargetBar(fraction: ceiling > 0 ? rd.today / ceiling : 0, fill: rd.fill, height: 8)
+                // 7-day history: which days stayed within the limit
+                if rd.daysCounted > 0 {
+                    HStack(spacing: 10) {
+                        LimitDots(values: rd.dailyHistory, ceiling: ceiling)
+                        caption("\(limitCleanDays(rd, ceiling))/\(rd.daysCounted) dias dentro do limite")
+                        Spacer(minLength: 0)
+                    }
+                }
             }
+        }
+    }
+
+    private func caption(_ text: String) -> some View {
+        Text(text).font(.caption2).foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func limitCleanDays(_ rd: NutrientReading, _ ceiling: Double) -> Int {
+        rd.dailyHistory.filter { ceiling > 0 && $0 <= ceiling }.count
+    }
+}
+
+// MARK: - Tetos de segurança — toxicity ULs
+
+private struct SafetyCeilingsCard: View {
+    let response: TodayResponse
+    let onSelect: (NutrientDef) -> Void
+
+    var body: some View {
+        let defs = NutrientCatalog.members(.safetyCeilings, targets: response.targets)
+        if !defs.isEmpty {
+            VStack(alignment: .leading, spacing: 16) {
+                SectionTitle(section: .safetyCeilings)
+                VStack(spacing: 16) {
+                    ForEach(defs) { def in
+                        TetoRow(def: def, response: response)
+                            .contentShape(Rectangle())
+                            .onTapGesture { onSelect(def) }
+                    }
+                }
+            }
+            .card()
         }
     }
 }

@@ -128,16 +128,23 @@ struct TodayMeal: Decodable, Identifiable, Hashable {
     let proteinG: Double
     let carbsG: Double
     let fatG: Double
+    let photoUrl: String?
     let items: [MealItem]
 
     // datetime is unique per meal (down to the second) — a stable list identity.
     var id: String { datetime }
+
+    /// Space-separated photo URLs from the backend (one per image uploaded).
+    var photoURLs: [URL] {
+        (photoUrl ?? "").split(separator: " ").compactMap { URL(string: String($0)) }
+    }
 
     enum CodingKeys: String, CodingKey {
         case datetime, time, foods, note, template, calories, items
         case proteinG = "protein_g"
         case carbsG = "carbs_g"
         case fatG = "fat_g"
+        case photoUrl = "photo_url"
     }
 }
 

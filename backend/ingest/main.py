@@ -424,6 +424,7 @@ RECOMP_DEFICIT = 0.125         # calorie target centre: 12.5% below measured TDE
 CALORIE_WINDOW_HALF = 0.075    # window is centre ±7.5% of TDEE => a 5%-20% deficit
 PROTEIN_G_PER_KG = 2.0         # hero metric: 2.0 g per kg body weight (~140 g)
 FAT_G_PER_KG = 0.8             # floor for hormonal health
+FAT_CEILING_MULTIPLIER = 1.25  # ceiling = floor × 1.25 (~1.0 g/kg)
 FIBER_G_PER_1000KCAL = 14.0    # standard fibre recommendation
 LIMIT_ENERGY_FRACTION = 0.10   # added sugar & saturated fat ceilings: 10% of energy
 # Fallbacks when the sheet has no measured history yet, so day one still has sane
@@ -2051,7 +2052,8 @@ def _derive_targets(
                      "ceiling": r10(cal_ceil), "unit": "kcal", "source": SRC_MEASURED},
         "protein_g": {"kind": TARGET_REACH, "floor": rg(protein), "unit": "g",
                       "source": SRC_MEASURED},
-        "fat_g": {"kind": TARGET_REACH, "floor": rg(fat), "unit": "g",
+        "fat_g": {"kind": TARGET_WINDOW, "floor": rg(fat),
+                  "ceiling": rg(fat * FAT_CEILING_MULTIPLIER), "unit": "g",
                   "source": SRC_MEASURED},
         "carbs_g": {"kind": TARGET_WINDOW, "floor": rg(carbs * 0.9),
                     "ceiling": rg(carbs * 1.1), "unit": "g", "source": SRC_MEASURED},
@@ -2228,6 +2230,7 @@ def _today_meals_out(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "foods": str(row.get("foods") or "").strip(),
             "note": str(row.get("note") or "").strip(),
             "template": str(row.get("template") or "").strip(),
+            "photo_url": str(row.get("photo_url") or "").strip(),
             **macros,
             "items": _normalize_items(_parse_items_cell(row.get("items"))),
         })

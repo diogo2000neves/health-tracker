@@ -73,6 +73,7 @@ struct TodayView: View {
 
 private struct CalorieHeroCard: View {
     let response: TodayResponse
+    @State private var showDetail = false
 
     var body: some View {
         let consumed = response.consumed("calories")
@@ -101,6 +102,12 @@ private struct CalorieHeroCard: View {
             }
         }
         .card(padding: 20)
+        .contentShape(Rectangle())
+        .onTapGesture { showDetail = true }
+        .sheet(isPresented: $showDetail) {
+            MacroDetailSheet(response: response, key: "calories",
+                            title: "Calorias", unit: "kcal", color: color)
+        }
     }
 
     @ViewBuilder
@@ -155,15 +162,17 @@ private struct MacroRing: View {
     let color: Color
     let response: TodayResponse
     var size: CGFloat = 90
+    @State private var showDetail = false
 
     var body: some View {
         let consumed = response.consumed(key)
         let target = response.targets[key]
         let goal = target?.goal ?? 0
         let status = target.map { MetricStatus.of($0, consumed: consumed) }
+        let fill = status?.fill ?? Palette.neutral
         VStack(spacing: 8) {
             Ring(progress: goal > 0 ? consumed / goal : 0,
-                 color: status?.fill ?? Palette.neutral,
+                 color: fill,
                  lineWidth: size * 0.12) {
                 VStack(spacing: -2) {
                     Text("\(Int(consumed.rounded()))")
@@ -181,6 +190,12 @@ private struct MacroRing: View {
             }
         }
         .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+        .onTapGesture { showDetail = true }
+        .sheet(isPresented: $showDetail) {
+            MacroDetailSheet(response: response, key: key,
+                            title: title, unit: "g", color: fill)
+        }
     }
 }
 
@@ -358,6 +373,14 @@ private struct MealDetailSheet: View {
     var body: some View {
         NavigationStack {
             List {
+                // Photo(s) from the meal log
+                let photos = meal.photoURLs
+                if !photos.isEmpty {
+                    Section {
+                        PhotoStrip(urls: photos)
+                    }
+                }
+
                 Section {
                     ForEach(meal.items) { item in
                         VStack(alignment: .leading, spacing: 3) {
@@ -369,6 +392,21 @@ private struct MealDetailSheet: View {
                             }
                             Text("\(Int(item.calories.rounded())) kcal · P \(Int(item.proteinG.rounded())) · H \(Int(item.carbsG.rounded())) · G \(Int(item.fatG.rounded()))")
                                 .font(.caption).foregroundStyle(.secondary)
+
+                            // Micronutrients present in this item
+                            let micros = item.nutrients
+                                .filter { !$0.value.isZero }
+                                .compactMap { (key, val) -> (NutrientDef, Double)? in
+                                    NutrientCatalog.byKey[key].map { ($0, val) }
+                                }
+                                .sorted { $0.0.key < $1.0.key }
+                            if !micros.isEmpty {
+                                Divider().padding(.vertical, 4)
+                                Label("Micronutrientes", systemImage: "microbe")
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                NutrientChips(micros: micros)
+                            }
                         }
                         .padding(.vertical, 2)
                     }
@@ -380,6 +418,170 @@ private struct MealDetailSheet: View {
                 }
             }
             .navigationTitle(meal.foods)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Fechar") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+}
+
+/// Horizontally scrolling photo strip for the meal log images.
+private struct PhotoStrip: View {
+    let urls: [URL]
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(urls, id: \.self) { url in
+                    AsyncImage(url: url) { phase in
+                        switch phase {
+                        case .success(let img):
+                            img.resizable().scaledToFill()
+                                .frame(width: 240, height: 180)
+                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        case .failure:
+                            Image(systemName: "photo.badge.exclamationmark")
+                                .font(.title2).foregroundStyle(.secondary)
+                                .frame(width: 240, height: 180)
+                                .background(Palette.track, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        case .empty:
+                            ProgressView()
+                                .frame(width: 240, height: 180)
+                        @unknown default:
+                            EmptyView()
+                        }
+                    }
+                }
+            }
+        }
+        .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+    }
+}
+
+/// Compact chip grid showing which micronutrients a food item is a meaningful source of.
+private struct NutrientChips: View {
+    let micros: [(NutrientDef, Double)]
+
+    var body: some View {
+        FlowLayout(spacing: 4) {
+            ForEach(micros, id: \.0.id) { def, val in
+                Text("\(def.label) \(def.amount(val))")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Palette.track, in: Capsule())
+            }
+        }
+    }
+}
+
+/// Drill-down for a macro ring: shows which foods contributed the most of this macro.
+private struct MacroDetailSheet: View {
+    let response: TodayResponse
+    let key: String
+    let title: String
+    let unit: String
+    let color: Color
+    @Environment(\.dismiss) private var dismiss
+
+    private struct Contributor: Identifiable {
+        let id = UUID()
+        let name: String
+        let time: String
+        let amount: Double
+    }
+
+    private var contributors: [Contributor] {
+        var out: [Contributor] = []
+        for meal in response.meals {
+            for item in meal.items {
+                let amount: Double = {
+                    switch key {
+                    case "calories": return item.calories
+                    case "protein_g": return item.proteinG
+                    case "carbs_g": return item.carbsG
+                    case "fat_g": return item.fatG
+                    default: return 0
+                    }
+                }()
+                if amount > 0 {
+                    out.append(Contributor(name: item.name, time: meal.time, amount: amount))
+                }
+            }
+        }
+        return out.sorted { $0.amount > $1.amount }
+    }
+
+    private let macroUnit: String
+
+    init(response: TodayResponse, key: String, title: String, unit: String, color: Color) {
+        self.response = response
+        self.key = key
+        self.title = title
+        self.unit = unit
+        self.color = color
+        // Calories are shown in kcal; macros in g.
+        self.macroUnit = key == "calories" ? "kcal" : "g"
+    }
+
+    var body: some View {
+        let contribs = contributors
+        let consumed = response.consumed(key)
+        let target = response.targets[key]
+        let goal = target?.goal ?? 0
+        let maxAmount = contribs.map(\.amount).max() ?? 1
+
+        NavigationStack {
+            List {
+                Section {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Text(title).font(.headline)
+                            Spacer()
+                            Text("\(Int(consumed.rounded())) \(unit)")
+                                .font(.system(size: 30, weight: .bold, design: .rounded))
+                                .monospacedDigit()
+                                .foregroundStyle(color)
+                        }
+                        TargetBar(fraction: goal > 0 ? consumed / goal : 0, fill: color, height: 10)
+                        Text("de \(Int(goal.rounded())) \(unit) hoje")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+
+                if contribs.isEmpty {
+                    Section {
+                        Text("Nenhum alimento de hoje contribuiu para \(title.lowercased()).")
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Section("Origem hoje") {
+                        ForEach(contribs) { c in
+                            VStack(spacing: 6) {
+                                HStack {
+                                    Text(c.name.capitalized).font(.subheadline)
+                                    Text(c.time).font(.caption).foregroundStyle(.tertiary)
+                                    Spacer()
+                                    Text("\(Int(c.amount.rounded()))")
+                                        .font(.subheadline.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                    Text(macroUnit)
+                                        .font(.caption2).foregroundStyle(.tertiary)
+                                }
+                                TargetBar(fraction: maxAmount > 0 ? c.amount / maxAmount : 0,
+                                          fill: color, height: 6)
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                }
+            }
+            .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
