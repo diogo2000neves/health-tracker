@@ -58,6 +58,19 @@ struct APIClient {
         return try await get("nutrients", query: [])
     }
 
+    /// The latest weekly coaching report. Read-only — the strong model wrote it on the
+    /// Mac; `status == "pending"` until the first Sunday run has landed.
+    func weeklyInsights() async throws -> WeeklyInsightsResponse {
+        if useSampleData { return SampleData.weeklyInsights }
+        return try await get("insights/weekly", query: [], cacheAs: "insights_weekly")
+    }
+
+    /// Today's next-meal plates. `status == "pending"` until the afternoon run lands.
+    func nextMeal() async throws -> NextMealResponse {
+        if useSampleData { return SampleData.nextMeal }
+        return try await get("insights/next-meal", query: [], cacheAs: "insights_next_meal")
+    }
+
     /// Hand-correct one ingredient's numbers on an already-logged meal (e.g. the AI
     /// overestimated a food's protein). Returns the updated meal; the caller still
     /// refetches `today()` afterward (see TodayStore.load) to keep the day's totals
@@ -89,6 +102,14 @@ struct APIClient {
         useSampleData ? nil : DiskCache.load(NutrientInfoResponse.self, as: "nutrients")
     }
 
+    func cachedWeeklyInsights() -> WeeklyInsightsResponse? {
+        useSampleData ? nil : DiskCache.load(WeeklyInsightsResponse.self, as: "insights_weekly")
+    }
+
+    func cachedNextMeal() -> NextMealResponse? {
+        useSampleData ? nil : DiskCache.load(NextMealResponse.self, as: "insights_next_meal")
+    }
+
     // MARK: - Internals
 
     /// Retry pacing for a single logical request. The Cloud Run backend scales to
@@ -106,6 +127,18 @@ struct APIClient {
         request.setValue(Config.authToken, forHTTPHeaderField: "X-Auth-Token")
         request.cachePolicy = .reloadIgnoringLocalCacheData  // always the live sheet
         return try await send(request, cacheAs: path)
+    }
+
+    /// As `get`, but caches under an explicit slash-free name — for a path like
+    /// "insights/weekly" whose slash would otherwise become a bad file path on disk.
+    private func get<T: Decodable>(_ path: String, query: [URLQueryItem],
+                                   cacheAs: String) async throws -> T {
+        var url = Config.baseURL.appending(path: path)
+        if !query.isEmpty { url.append(queryItems: query) }
+        var request = URLRequest(url: url)
+        request.setValue(Config.authToken, forHTTPHeaderField: "X-Auth-Token")
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        return try await send(request, cacheAs: cacheAs)
     }
 
     /// A mutation (currently just /meals/edit — the app's first non-GET call).

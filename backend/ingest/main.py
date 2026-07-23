@@ -3074,3 +3074,208 @@ def nutrients():
     if not _authorized(request):
         return jsonify({"error": "unauthorized"}), 401
     return jsonify(_nutrient_info()), 200
+
+
+# =============================================================================
+# Weekly insights & next-meal coach (Phase 2)
+#
+# The DETERMINISTIC analysis (the Diagnosis, the food vocabulary, the portion math)
+# lives in ingest/insights.py and is served read-only here — this is the single
+# source of truth for the nutrition science, reused instead of re-derived. The
+# STRONG-model narration runs on the local Mac (automation/insights/), which fetches
+# `/insights/diagnose` + `/insights/food-profile`, writes the narrative and plates to
+# the `weekly_reports` / `next_meal` tabs, and those are what `/insights/weekly` and
+# `/insights/next-meal` serve back. No model ever runs on a request path here.
+# =============================================================================
+
+WEEKLY_TAB = "weekly_reports"
+NEXT_MEAL_TAB = "next_meal"
+# The food vocabulary looks back four whole weeks — long enough to know what the user
+# actually eats, short enough to reflect current habits.
+PROFILE_WINDOW_DAYS = 28
+
+NUTRIENT_POLICY_FILE = os.path.join(os.path.dirname(__file__), "nutrient_policy.json")
+
+
+@functools.lru_cache(maxsize=1)
+def _insights_mod():
+    """The deterministic insights core, loaded by file path so it resolves the same
+    whether main.py is imported as a package in the container or by file path in the
+    test suite. Pure stdlib, so importing it is free and never fatal."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(__file__), "insights.py")
+    spec = importlib.util.spec_from_file_location("insights", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@functools.lru_cache(maxsize=1)
+def _nutrient_policy() -> Dict[str, Any]:
+    """The 'genuine issue vs non-problem' rules. Never fatal: a missing/invalid file
+    degrades to defaults-only (every nutrient judged on the built-in defaults)."""
+    try:
+        with open(NUTRIENT_POLICY_FILE, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        app.logger.exception("nutrient_policy.json missing or invalid")
+        return {"defaults": {}, "nutrients": {}}
+    return data if isinstance(data, dict) else {"defaults": {}, "nutrients": {}}
+
+
+def _resolved_targets_and_basis() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """The full target set (RDA + user edits + measured macros, stamped with kinetics)
+    and its basis — exactly what `/today` computes, factored out so every insights
+    endpoint reads the identical science."""
+    daily_rows = _rows_as_dicts(_read_tab(DAILY_TAB))
+    derived, basis = _derive_targets(daily_rows)
+    targets = _with_kinetics(_resolve_targets(derived, _targets_from_grid(
+        _read_targets_grid())))
+    return targets, basis
+
+
+def _window_meals(all_rows: List[Dict[str, Any]], start: str, end: str
+                  ) -> List[Dict[str, Any]]:
+    """Meal rows whose civil day falls in [start, end] (inclusive, ISO dates)."""
+    return [r for r in all_rows if start <= str(r.get("datetime", ""))[:10] <= end]
+
+
+def _diagnosis_for(ref_day: str, window_days: int) -> Dict[str, Any]:
+    """The deterministic Diagnosis for the `window_days` completed days before
+    `ref_day`, reusing the tested `_history_window` for the per-day intake and the raw
+    window meals for attribution/coverage. `prev_days` is the window before it, so the
+    Diagnosis can read each nutrient's week-over-week trend."""
+    all_rows = _all_meal_rows()
+    ref = datetime.fromisoformat(ref_day).date()
+    start = (ref - timedelta(days=window_days)).isoformat()
+    end = (ref - timedelta(days=1)).isoformat()
+    days = _history_window(all_rows, ref_day, window_days)
+    prev_ref = (ref - timedelta(days=window_days)).isoformat()
+    prev_days = _history_window(all_rows, prev_ref, window_days)
+    targets, basis = _resolved_targets_and_basis()
+    return _insights_mod().build_diagnosis(
+        ref_day=ref_day, window_days=window_days, days=days, prev_days=prev_days,
+        window_meals=_window_meals(all_rows, start, end),
+        targets=targets, basis=basis, policy=_nutrient_policy())
+
+
+@app.get("/insights/diagnose")
+def insights_diagnose():
+    """The Diagnosis JSON for a window (default: the last 7 completed days). The local
+    generator's data source, and the debug view for eyeballing the deterministic
+    analysis against a real week before any model call. `?date=` reviews another week's
+    end; `?window=` overrides the length."""
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    day = request.args.get("date") or datetime.now(_tz()).date().isoformat()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        return jsonify({"error": "date must be YYYY-MM-DD"}), 400
+    try:
+        window = max(1, min(31, int(request.args.get("window", NUTRIENT_HISTORY_DAYS))))
+    except (TypeError, ValueError):
+        window = NUTRIENT_HISTORY_DAYS
+    return jsonify(_diagnosis_for(day, window)), 200
+
+
+@app.get("/insights/food-profile")
+def insights_food_profile():
+    """The user's food vocabulary over the last four weeks: what they eat, when, a
+    typical portion, and each food's per-gram nutrient density. Powers both the swap
+    suggestions and the next-meal portion math."""
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    all_rows = _all_meal_rows()
+    ref = datetime.now(_tz()).date()
+    start = (ref - timedelta(days=PROFILE_WINDOW_DAYS)).isoformat()
+    profile = _insights_mod().build_food_profile(
+        _window_meals(all_rows, start, ref.isoformat()), NUTRIENT_KEYS)
+    return jsonify({"generated_for": ref.isoformat(),
+                    "window_days": PROFILE_WINDOW_DAYS, "foods": profile}), 200
+
+
+@app.get("/insights/next-meal-context")
+def insights_next_meal_context():
+    """The deterministic inputs for a next-meal suggestion: the day's remaining budget,
+    which nutrients are still short today, and — per shortfall — the foods the user
+    already eats that are densest in it, with the gram range that would close the gap.
+    The model turns these into palatable plates; the numbers are ours."""
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    now = datetime.now(_tz())
+    day = now.date().isoformat()
+    all_rows = _all_meal_rows()
+    consumed = _todays_consumed([r for r in all_rows
+                                 if str(r.get("datetime", "")).startswith(day)])
+    targets, _ = _resolved_targets_and_basis()
+    start = (now.date() - timedelta(days=PROFILE_WINDOW_DAYS)).isoformat()
+    ins = _insights_mod()
+    profile = ins.build_food_profile(_window_meals(all_rows, start, day), NUTRIENT_KEYS)
+    ctx = ins.next_meal_context(
+        consumed=consumed, targets=targets,
+        focus_key=request.args.get("focus") or None,
+        food_profile=profile, slot=ins._meal_slot(now.isoformat()))
+    return jsonify(ctx), 200
+
+
+def _read_cached_rows(tab: str) -> List[Dict[str, Any]]:
+    """A derived/observation insights tab as dicts, or [] if it doesn't exist yet
+    (the local generator hasn't run) — so the app degrades to a 'pending' state
+    instead of erroring."""
+    try:
+        return _rows_as_dicts(_read_tab(tab))
+    except Exception:
+        return []
+
+
+def _loads_or(raw: Any, default: Any) -> Any:
+    try:
+        return json.loads(raw) if raw else default
+    except (TypeError, ValueError):
+        return default
+
+
+@app.get("/insights/weekly")
+def insights_weekly():
+    """The latest cached weekly report for the app. Read-only — the strong model wrote
+    it on the Mac. `status: pending` until the first Sunday run has landed."""
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    rows = [r for r in _read_cached_rows(WEEKLY_TAB) if str(r.get("week_start") or "")]
+    if not rows:
+        return jsonify({"status": "pending", "report": None}), 200
+    latest = max(rows, key=lambda r: str(r.get("week_start")))
+    return jsonify({
+        "status": str(latest.get("status") or "generated"),
+        "week_start": latest.get("week_start"),
+        "generated_at": latest.get("generated_at"),
+        "window_start": latest.get("window_start"),
+        "window_end": latest.get("window_end"),
+        "focus_key": latest.get("focus_key") or None,
+        "prior_focus_key": latest.get("prior_focus_key") or None,
+        "prior_focus_delta": _loads_or(latest.get("prior_focus_delta"), None),
+        "coverage_note": latest.get("coverage_note") or "",
+        "report": _loads_or(latest.get("report_json"), None),
+        "diagnosis": _loads_or(latest.get("diagnosis_json"), None),
+    }), 200
+
+
+@app.get("/insights/next-meal")
+def insights_next_meal():
+    """Today's cached next-meal plates for the app. `status: pending` until the day's
+    afternoon run has landed (or if the Mac was offline)."""
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    today = datetime.now(_tz()).date().isoformat()
+    todays = [r for r in _read_cached_rows(NEXT_MEAL_TAB)
+              if str(r.get("date") or "") == today]
+    if not todays:
+        return jsonify({"status": "pending", "plates": []}), 200
+    latest = todays[-1]
+    return jsonify({
+        "status": str(latest.get("status") or "generated"),
+        "date": latest.get("date"),
+        "generated_at": latest.get("generated_at"),
+        "focus_key": latest.get("focus_key") or None,
+        "snapshot": _loads_or(latest.get("snapshot_json"), {}),
+        "plates": _loads_or(latest.get("plates_json"), []),
+    }), 200

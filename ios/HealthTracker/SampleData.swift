@@ -20,6 +20,10 @@ enum SampleData {
     static let daily: DailyResponse = decode(DailyResponse.self, from: dailyJSON())
     static let nutrients: NutrientInfoResponse = decode(NutrientInfoResponse.self,
                                                         from: nutrientsJSON())
+    static let weeklyInsights: WeeklyInsightsResponse = decode(WeeklyInsightsResponse.self,
+                                                               from: weeklyJSON())
+    static let nextMeal: NextMealResponse = decode(NextMealResponse.self,
+                                                   from: nextMealJSON())
 
     // MARK: - /nutrients (a few populated examples; the rest render "em breve")
 
@@ -338,6 +342,98 @@ enum SampleData {
     private static func round(_ x: Double) -> Double { x.rounded() }
     private static func round1(_ x: Double) -> Double { (x * 10).rounded() / 10 }
     private static func round2(_ x: Double) -> Double { (x * 100).rounded() / 100 }
+
+    // MARK: - /insights/weekly (a full, realistic Sunday review)
+
+    private static func weeklyJSON() -> [String: Any] {
+        [
+            "status": "generated",
+            "week_start": "2026-07-19",
+            "generated_at": "2026-07-19T09:00:00",
+            "window_start": "2026-07-12",
+            "window_end": "2026-07-18",
+            "focus_key": "saturated_fat_g",
+            "prior_focus_delta": ["key": "omega3_g", "prev": 0.9, "now": 1.3,
+                                  "pct": 44, "direction": "up", "toward_target": true],
+            "coverage_note": "Boa cobertura de dados esta semana.",
+            "report": [
+                "headline": "Semana forte: proteína cravada e ómega-3 a subir — só a "
+                    + "gordura saturada é que pede atenção.",
+                "wins": [
+                    ["title": "Proteína no ponto",
+                     "detail": "Bateste a meta em 6 dos 7 dias — é isto que protege o "
+                        + "músculo enquanto perdes gordura."],
+                    ["title": "Ómega-3 a subir",
+                     "detail": "As sardinhas de terça e sexta fizeram a diferença."],
+                ],
+                "focus": [
+                    "key": "saturated_fat_g", "label": "Gordura saturada",
+                    "why": "Ficaste cerca de 28% acima do teto em 5 dos 7 dias.",
+                    "attribution": "68% vem do chouriço nas refeições de sábado e domingo.",
+                    "severity": "high",
+                ],
+                "swap": [
+                    "from": "chouriço", "to": "peito de peru fumado",
+                    "why": "Mantém o salgado de que gostas com cerca de 1/5 da gordura "
+                        + "saturada.",
+                ],
+                "continuity": "O ómega-3 subiu 44% desde domingo passado — continua com "
+                    + "o peixe 2x/semana.",
+                "encouragement": "Uma troca só e a semana fica redonda. Vais lá "
+                    + "facilmente.",
+            ],
+        ]
+    }
+
+    // MARK: - /insights/next-meal (three ranked plates)
+
+    private static func nextMealJSON() -> [String: Any] {
+        func item(_ food: String, _ lo: Int, _ hi: Int, new: Bool = false) -> [String: Any] {
+            ["food": food, "grams_low": lo, "grams_high": hi, "new": new]
+        }
+        func cover(_ key: String, _ label: String, _ note: String) -> [String: Any] {
+            ["key": key, "label": label, "note": note]
+        }
+        return [
+            "status": "generated",
+            "date": "2026-07-19",
+            "generated_at": "2026-07-19T17:32:00",
+            "focus_key": "saturated_fat_g",
+            "plates": [
+                [
+                    "rank": 1, "recommended": true,
+                    "title": "Salmão no forno com brócolos e arroz",
+                    "items": [item("salmão", 140, 170), item("brócolos", 120, 150),
+                              item("arroz", 60, 90)],
+                    "covers": [cover("omega3_g", "Ómega-3", "fecha a semana"),
+                               cover("protein_g", "Proteína", "+38 g")],
+                    "calories": 640, "protein_g": 42,
+                    "why": "Fecha o ómega-3 da semana e a proteína de hoje, com comida "
+                        + "que já comes.",
+                ],
+                [
+                    "rank": 2, "recommended": false,
+                    "title": "Omelete de 3 ovos com espinafres e queijo fresco",
+                    "items": [item("ovos", 150, 180), item("espinafres", 80, 120),
+                              item("queijo fresco", 60, 80)],
+                    "covers": [cover("protein_g", "Proteína", "+30 g"),
+                               cover("vitamin_d_ug", "Vitamina D", "")],
+                    "calories": 480, "protein_g": 33,
+                    "why": "Rápida e rica em proteína; os espinafres puxam pelo ferro.",
+                ],
+                [
+                    "rank": 3, "recommended": false,
+                    "title": "Bowl de grão com atum e legumes",
+                    "items": [item("grão", 120, 150), item("atum", 80, 100),
+                              item("edamame", 60, 90, new: true), item("azeite", 10, 15)],
+                    "covers": [cover("fiber_g", "Fibra", "+9 g"),
+                               cover("protein_g", "Proteína", "+28 g")],
+                    "calories": 560, "protein_g": 31,
+                    "why": "Fibra e proteína numa tigela; o grão mantém-te saciado.",
+                ],
+            ],
+        ]
+    }
 
     private static func decode<T: Decodable>(_ type: T.Type, from dict: [String: Any]) -> T {
         let data = try! JSONSerialization.data(withJSONObject: dict)

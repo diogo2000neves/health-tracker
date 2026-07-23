@@ -15,6 +15,9 @@ COPY ingest/main.py .
 # The per-nutrient reference knowledge base served by GET /nutrients. Loaded from
 # the module's own directory, so it must sit next to main.py in the image.
 COPY ingest/nutrient_info.json .
+# The deterministic insights core and its policy config, needed by /insights/*.
+COPY ingest/insights.py .
+COPY ingest/nutrient_policy.json .
 
 ENV PORT=8080
 # 300s timeout: strongest-first model chain with per-model retries can legitimately

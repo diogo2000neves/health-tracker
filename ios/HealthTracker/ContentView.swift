@@ -88,6 +88,7 @@ final class TrendsStore {
 struct RootView: View {
     @State private var today = TodayStore()
     @State private var trends = TrendsStore()
+    @State private var insights = InsightsStore()
     @State private var showProfile = false
     @State private var selection = 0
     @Environment(\.scenePhase) private var scenePhase
@@ -100,18 +101,23 @@ struct RootView: View {
             Tab("Nutrientes", systemImage: "leaf.fill", value: 1) {
                 NutrientsView(store: today)
             }
-            Tab("Tendências", systemImage: "chart.xyaxis.line", value: 2) {
+            Tab("Coach", systemImage: "sparkles", value: 2) {
+                InsightsView(store: insights)
+            }
+            Tab("Tendências", systemImage: "chart.xyaxis.line", value: 3) {
                 TrendsView(store: trends, today: today)
             }
         }
         .task {
             await today.load()
             await trends.load()
+            await insights.load()
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 Task { await today.load() }
                 Task { await trends.load() }
+                Task { await insights.load() }
             }
         }
         .sheet(isPresented: $showProfile) {
