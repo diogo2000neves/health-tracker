@@ -65,16 +65,16 @@ struct TodayView: View {
                     }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    HStack(spacing: 12) {
-                        Button { showCalendar = true } label: {
-                            Image(systemName: "calendar")
+                    Button { showCalendar = true } label: {
+                        Image(systemName: "calendar")
+                    }
+                }
+                if !isHistorical {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button { showProfile = true } label: {
+                            Image(systemName: "person.crop.circle")
                         }
-                        if !isHistorical {
-                            Button { showProfile = true } label: {
-                                Image(systemName: "person.crop.circle")
-                            }
-                            .accessibilityLabel("Perfil e objetivos")
-                        }
+                        .accessibilityLabel("Perfil e objetivos")
                     }
                 }
             }
