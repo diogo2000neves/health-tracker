@@ -14,11 +14,29 @@ struct TodayView: View {
     let store: TodayStore
     @Binding var showProfile: Bool
 
+    // Historical date browsing state
+    @State private var showCalendar = false
+    @State private var pickerDate = Date()
+    @State private var historicalDate: Date?
+    @State private var historicalResponse: TodayResponse?
+    @State private var isHistoricalLoading = false
+
+    private var isHistorical: Bool { historicalResponse != nil }
+    private var activeResponse: TodayResponse? { historicalResponse ?? store.response }
+
     var body: some View {
         NavigationStack {
             ZStack {
                 Palette.screen.ignoresSafeArea()
-                if let response = store.response {
+                if isHistoricalLoading {
+                    VStack(spacing: 12) {
+                        Spacer()
+                        ProgressView().controlSize(.large)
+                        Text("A carregar…")
+                            .font(.subheadline).foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                } else if let response = activeResponse {
                     content(response)
                 } else {
                     LoadingOrError(isLoading: store.isLoading,
@@ -27,24 +45,92 @@ struct TodayView: View {
                     }
                 }
             }
-            .navigationTitle("Hoje")
+            .navigationTitle(isHistorical ? prettyDate(historicalResponse!.date) : "Hoje")
             .toolbar {
-                if store.isRefreshing {
+                if store.isRefreshing && !isHistorical {
                     ToolbarItem(placement: .topBarLeading) {
                         SyncIndicator()
                     }
                 }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showProfile = true
-                    } label: {
-                        Image(systemName: "person.crop.circle")
+                if isHistorical {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button {
+                            withAnimation { backToToday() }
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "arrow.left")
+                                Text("Hoje").fontWeight(.medium)
+                            }
+                        }
                     }
-                    .accessibilityLabel("Perfil e objetivos")
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    HStack(spacing: 12) {
+                        Button { showCalendar = true } label: {
+                            Image(systemName: "calendar")
+                        }
+                        if !isHistorical {
+                            Button { showProfile = true } label: {
+                                Image(systemName: "person.crop.circle")
+                            }
+                            .accessibilityLabel("Perfil e objetivos")
+                        }
+                    }
                 }
             }
         }
         .task { await store.load() }
+        .sheet(isPresented: $showCalendar) {
+            NavigationStack {
+                DatePicker("Data", selection: $pickerDate,
+                           in: ...Date(), displayedComponents: .date)
+                    .datePickerStyle(.graphical)
+                    .padding()
+                    .navigationTitle("Ver dia")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Cancelar") { showCalendar = false }
+                        }
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("OK") {
+                                showCalendar = false
+                                historicalDate = pickerDate
+                                loadHistorical(pickerDate)
+                            }
+                        }
+                    }
+            }
+            .presentationDetents([.medium])
+        }
+    }
+
+    private func backToToday() {
+        historicalResponse = nil
+        historicalDate = nil
+        isHistoricalLoading = false
+    }
+
+    private func loadHistorical(_ date: Date) {
+        isHistoricalLoading = true
+        historicalResponse = nil
+        let iso = Self.iso(date)
+        Task {
+            do {
+                historicalResponse = try await APIClient.shared.today(date: iso)
+            } catch {
+                backToToday()
+            }
+            isHistoricalLoading = false
+        }
+    }
+
+    private static func iso(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.calendar = Calendar(identifier: .gregorian)
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: date)
     }
 
     @ViewBuilder
@@ -61,11 +147,11 @@ struct TodayView: View {
                 MacrosCard(response: r)
                 EnergyBalanceCard(response: r)
                 FlagsCard(response: r)
-                MealsCard(meals: r.meals, store: store)
+                MealsCard(meals: r.meals, store: store, isReadOnly: isHistorical)
             }
             .padding(16)
         }
-        .refreshable { await store.load() }
+        .refreshable { if !isHistorical { await store.load() } }
     }
 }
 
@@ -296,6 +382,7 @@ private struct FlagsCard: View {
 private struct MealsCard: View {
     let meals: [TodayMeal]
     let store: TodayStore
+    let isReadOnly: Bool
     @State private var selected: TodayMeal?
 
     var body: some View {
@@ -303,7 +390,8 @@ private struct MealsCard: View {
             SectionHeader(title: "Refeições", systemImage: "fork.knife")
 
             if meals.isEmpty {
-                Text("Ainda nada hoje. Regista uma refeição e ela aparece aqui.")
+                Text(isReadOnly ? "Nenhuma refeição registada neste dia."
+                     : "Ainda nada hoje. Regista uma refeição e ela aparece aqui.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -324,7 +412,7 @@ private struct MealsCard: View {
         }
         .card()
         .sheet(item: $selected) { meal in
-            MealDetailSheet(meal: meal, store: store)
+            MealDetailSheet(meal: meal, store: store, isReadOnly: isReadOnly)
         }
     }
 }
@@ -372,13 +460,15 @@ private struct MealRow: View {
 	    /// already-open sheet immediately, without waiting for `store` to refetch.
 	    @State private var meal: TodayMeal
 	    let store: TodayStore
+	    let isReadOnly: Bool
 	    @Environment(\.dismiss) private var dismiss
 	    @State private var editTarget: EditTarget?
 	    @State private var nutrientTarget: NutrientTarget?
 
-	    init(meal: TodayMeal, store: TodayStore) {
+	    init(meal: TodayMeal, store: TodayStore, isReadOnly: Bool = false) {
 	        self._meal = State(initialValue: meal)
 	        self.store = store
+	        self.isReadOnly = isReadOnly
 	    }
 
 	    /// One food item being corrected, identified by its position in `meal.items`
@@ -418,16 +508,18 @@ private struct MealRow: View {
 	                            HStack {
 	                                Text("\(Int(item.calories.rounded())) kcal · P \(Int(item.proteinG.rounded())) · H \(Int(item.carbsG.rounded())) · G \(Int(item.fatG.rounded()))")
 	                                    .font(.caption).foregroundStyle(.secondary)
-	                                Spacer()
-	                                Button("Editar") {
-	                                    editTarget = EditTarget(id: index, item: item)
+	                                if !isReadOnly {
+	                                    Spacer()
+	                                    Button("Editar") {
+	                                        editTarget = EditTarget(id: index, item: item)
+	                                    }
+	                                    .font(.caption.weight(.semibold))
+	                                    .buttonStyle(.bordered)
+	                                    .controlSize(.small)
+	                                    .tint(Palette.accent)
+	                                    .fixedSize()
+	                                    .accessibilityLabel("Corrigir \(item.name)")
 	                                }
-	                                .font(.caption.weight(.semibold))
-	                                .buttonStyle(.bordered)
-	                                .controlSize(.small)
-	                                .tint(Palette.accent)
-	                                .fixedSize()
-	                                .accessibilityLabel("Corrigir \(item.name)")
 	                            }
 	                        }
 	                        .padding(.vertical, 2)
@@ -588,7 +680,7 @@ private struct EditMealItemSheet: View {
 }
 
 /// Horizontally scrolling photo strip for the meal log images.
-struct PhotoStrip: View {
+private struct PhotoStrip: View {
     let urls: [URL]
 
     var body: some View {
@@ -624,7 +716,7 @@ struct PhotoStrip: View {
 /// food item — every catalogued nutrient listed with its amount. Tapping an item
 /// in the meal detail sheet opens this instead of cluttering the list with inline
 /// chips.
-struct ItemNutrientSheet: View {
+private struct ItemNutrientSheet: View {
     let item: MealItem
     let title: String
     @Environment(\.dismiss) private var dismiss
@@ -687,7 +779,7 @@ struct ItemNutrientSheet: View {
 }
 
 /// Drill-down for a macro ring: shows which foods contributed the most of this macro.
-struct MacroDetailSheet: View {
+private struct MacroDetailSheet: View {
     let response: TodayResponse
     let key: String
     let title: String
