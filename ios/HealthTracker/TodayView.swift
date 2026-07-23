@@ -408,23 +408,27 @@ private struct MealRow: View {
 
 	                Section {
 	                    ForEach(Array(meal.items.enumerated()), id: \.offset) { index, item in
-	                        VStack(alignment: .leading, spacing: 3) {
+	                        VStack(alignment: .leading, spacing: 4) {
 	                            HStack {
 	                                Text(item.name.capitalized).fontWeight(.medium)
 	                                Spacer()
 	                                Text("\(Int(item.portionG.rounded())) g")
 	                                    .foregroundStyle(.secondary)
-	                                Button {
+	                            }
+	                            HStack {
+	                                Text("\(Int(item.calories.rounded())) kcal · P \(Int(item.proteinG.rounded())) · H \(Int(item.carbsG.rounded())) · G \(Int(item.fatG.rounded()))")
+	                                    .font(.caption).foregroundStyle(.secondary)
+	                                Spacer()
+	                                Button("Editar") {
 	                                    editTarget = EditTarget(id: index, item: item)
-	                                } label: {
-	                                    Image(systemName: "pencil.circle")
 	                                }
-	                                .buttonStyle(.plain)
-	                                .foregroundStyle(.secondary)
+	                                .font(.caption.weight(.semibold))
+	                                .buttonStyle(.bordered)
+	                                .controlSize(.small)
+	                                .tint(Palette.accent)
+	                                .fixedSize()
 	                                .accessibilityLabel("Corrigir \(item.name)")
 	                            }
-	                            Text("\(Int(item.calories.rounded())) kcal · P \(Int(item.proteinG.rounded())) · H \(Int(item.carbsG.rounded())) · G \(Int(item.fatG.rounded()))")
-	                                .font(.caption).foregroundStyle(.secondary)
 	                        }
 	                        .padding(.vertical, 2)
 	                        .contentShape(Rectangle())
@@ -484,6 +488,9 @@ private struct EditMealItemSheet: View {
     @State private var portion: String
     @State private var isSaving = false
     @State private var errorMessage: String?
+    @FocusState private var focusedField: Field?
+
+    private enum Field: Hashable { case calories, protein, carbs, fat, portion }
 
     init(datetime: String, itemIndex: Int, item: MealItem, onSaved: @escaping (TodayMeal) -> Void) {
         self.datetime = datetime
@@ -500,12 +507,16 @@ private struct EditMealItemSheet: View {
     var body: some View {
         NavigationStack {
             List {
-                Section(item.name.capitalized) {
-                    numberRow("Calorias", "kcal", $calories)
-                    numberRow("Proteína", "g", $protein)
-                    numberRow("Hidratos", "g", $carbs)
-                    numberRow("Gordura", "g", $fat)
-                    numberRow("Porção", "g", $portion)
+                Section {
+                    numberRow("Calorias", "kcal", $calories, .calories)
+                    numberRow("Proteína", "g", $protein, .protein)
+                    numberRow("Hidratos", "g", $carbs, .carbs)
+                    numberRow("Gordura", "g", $fat, .fat)
+                    numberRow("Porção", "g", $portion, .portion)
+                } header: {
+                    Text(item.name.capitalized)
+                } footer: {
+                    Text("Escreve os valores corretos para este alimento — vão substituir a estimativa da IA e recalcular os totais da refeição.")
                 }
                 if let errorMessage {
                     Section {
@@ -513,7 +524,7 @@ private struct EditMealItemSheet: View {
                     }
                 }
             }
-            .navigationTitle("Corrigir item")
+            .navigationTitle("Corrigir \(item.name.capitalized)")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -524,24 +535,29 @@ private struct EditMealItemSheet: View {
                         ProgressView()
                     } else {
                         Button("Guardar") { Task { await save() } }
+                            .fontWeight(.semibold)
                     }
                 }
             }
             .disabled(isSaving)
         }
         .presentationDetents([.medium])
+        .onAppear { focusedField = .calories }
     }
 
     @ViewBuilder
-    private func numberRow(_ label: String, _ unit: String, _ value: Binding<String>) -> some View {
-        LabeledContent(label) {
-            HStack(spacing: 4) {
-                TextField(unit, text: value)
-                    .keyboardType(.decimalPad)
-                    .multilineTextAlignment(.trailing)
-                    .frame(width: 70)
-                Text(unit).foregroundStyle(.secondary)
-            }
+    private func numberRow(_ label: String, _ unit: String, _ value: Binding<String>,
+                           _ field: Field) -> some View {
+        HStack {
+            Text(label)
+            Spacer()
+            TextField("0", text: value)
+                .keyboardType(.decimalPad)
+                .multilineTextAlignment(.trailing)
+                .textFieldStyle(.roundedBorder)
+                .focused($focusedField, equals: field)
+                .frame(width: 90)
+            Text(unit).foregroundStyle(.secondary).font(.caption)
         }
     }
 
@@ -572,7 +588,7 @@ private struct EditMealItemSheet: View {
 }
 
 /// Horizontally scrolling photo strip for the meal log images.
-private struct PhotoStrip: View {
+struct PhotoStrip: View {
     let urls: [URL]
 
     var body: some View {
@@ -608,7 +624,7 @@ private struct PhotoStrip: View {
 /// food item — every catalogued nutrient listed with its amount. Tapping an item
 /// in the meal detail sheet opens this instead of cluttering the list with inline
 /// chips.
-private struct ItemNutrientSheet: View {
+struct ItemNutrientSheet: View {
     let item: MealItem
     let title: String
     @Environment(\.dismiss) private var dismiss
@@ -671,7 +687,7 @@ private struct ItemNutrientSheet: View {
 }
 
 /// Drill-down for a macro ring: shows which foods contributed the most of this macro.
-private struct MacroDetailSheet: View {
+struct MacroDetailSheet: View {
     let response: TodayResponse
     let key: String
     let title: String

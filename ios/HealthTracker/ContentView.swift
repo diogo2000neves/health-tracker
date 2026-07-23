@@ -103,6 +103,9 @@ struct RootView: View {
             Tab("Tendências", systemImage: "chart.xyaxis.line", value: 2) {
                 TrendsView(store: trends, today: today)
             }
+            Tab("Histórico", systemImage: "calendar", value: 3) {
+                HistoryView()
+            }
         }
         .task {
             await today.load()
