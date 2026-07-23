@@ -361,26 +361,29 @@ struct TargetBar: View {
 
 // MARK: - Kinetics lenses
 
-/// The consistency record for a NON-CUMULATIVE nutrient: one dot per completed day,
-/// filled green when that day hit the floor, hollow when it fell short. The whole
-/// point of the daily lens — for a nutrient the body can't store, what matters isn't a
-/// single big day, it's how many days in a row you actually hit it.
+/// The consistency record for a NON-CUMULATIVE nutrient: one dot per completed day.
+/// A dot is:
+///  • green  — the day hit the floor (goal met);
+///  • yellow — the day ended close, between `closeThreshold` × floor and the floor;
+///  • red    — the day was far from the goal, below `closeThreshold` × floor.
+/// The close threshold defaults to 0.6, matching the app's consistent boundary for
+/// "close but not there yet" across all nutrient views.
 struct WeekDots: View {
     var values: [Double]        // this nutrient, per completed day, oldest first
     var floor: Double
+    var closeThreshold: Double = 0.6
     var dot: CGFloat = 8
 
     var body: some View {
         HStack(spacing: 5) {
             ForEach(Array(values.enumerated()), id: \.offset) { _, v in
                 let met = floor > 0 && v >= floor
+                let close = !met && floor > 0 && v >= closeThreshold * floor
+                let color: Color = met ? Palette.good
+                    : (close ? Palette.warning : Palette.critical)
                 Circle()
-                    .fill(met ? Palette.good : Palette.track)
+                    .fill(color)
                     .frame(width: dot, height: dot)
-                    .overlay(
-                        Circle().strokeBorder(
-                            met ? Color.clear : Palette.neutral.opacity(0.45),
-                            lineWidth: 1))
             }
         }
     }

@@ -37,7 +37,6 @@ struct NutrientsView: View {
     let store: TodayStore
     @State private var info = InfoStore()
     @State private var selected: NutrientDef?
-    @State private var lens: NutrientLens = .historico
 
     var body: some View {
         NavigationStack {
@@ -71,12 +70,8 @@ struct NutrientsView: View {
             VStack(spacing: 16) {
                 NutrientHeaderCard(response: r)
                 CeilingAlertCard(response: r) { selected = $0 }
-                Picker("Vista", selection: $lens) {
-                    ForEach(NutrientLens.allCases) { Text($0.title).tag($0) }
-                }
-                .pickerStyle(.segmented)
-                LensSection(section: .diarios, response: r, lens: lens) { selected = $0 }
-                LensSection(section: .reservas, response: r, lens: lens) { selected = $0 }
+                LensSection(section: .diarios, response: r) { selected = $0 }
+                LensSection(section: .reservas, response: r) { selected = $0 }
                 VigiarCard(response: r) { selected = $0 }
                 ContextCard(response: r) { selected = $0 }
             }
@@ -233,14 +228,18 @@ private struct SectionTitle: View {
 private struct LensSection: View {
     let section: NutrientSection
     let response: TodayResponse
-    let lens: NutrientLens
     let onSelect: (NutrientDef) -> Void
+    @State private var lens: NutrientLens = .historico
 
     var body: some View {
         let defs = NutrientCatalog.members(section, targets: response.targets)
         if !defs.isEmpty {
             VStack(alignment: .leading, spacing: 14) {
                 SectionTitle(section: section)
+                Picker("Vista", selection: $lens) {
+                    ForEach(NutrientLens.allCases) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
                 VStack(spacing: 18) {
                     ForEach(defs) { def in
                         NutrientRow(def: def, section: section, response: response, lens: lens)
