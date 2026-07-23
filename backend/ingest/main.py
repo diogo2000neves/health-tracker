@@ -3198,22 +3198,37 @@ def insights_next_meal_context():
     """The deterministic inputs for a next-meal suggestion: the day's remaining budget,
     which nutrients are still short today, and — per shortfall — the foods the user
     already eats that are densest in it, with the gram range that would close the gap.
-    The model turns these into palatable plates; the numbers are ours."""
+    The model turns these into palatable plates; the numbers are ours.
+
+    When `?v2=1` is passed, returns the enhanced context (with today's meals and meal
+    timing profile) for the dynamic next-slot AI generation."""
     if not _authorized(request):
         return jsonify({"error": "unauthorized"}), 401
     now = datetime.now(_tz())
     day = now.date().isoformat()
     all_rows = _all_meal_rows()
-    consumed = _todays_consumed([r for r in all_rows
-                                 if str(r.get("datetime", "")).startswith(day)])
+    today_rows = [r for r in all_rows if str(r.get("datetime", "")).startswith(day)]
+    consumed = _todays_consumed(today_rows)
     targets, _ = _resolved_targets_and_basis()
     start = (now.date() - timedelta(days=PROFILE_WINDOW_DAYS)).isoformat()
+    window_meals = _window_meals(all_rows, start, day)
     ins = _insights_mod()
-    profile = ins.build_food_profile(_window_meals(all_rows, start, day), NUTRIENT_KEYS)
-    ctx = ins.next_meal_context(
-        consumed=consumed, targets=targets,
-        focus_key=request.args.get("focus") or None,
-        food_profile=profile, slot=ins._meal_slot(now.isoformat()))
+    profile = ins.build_food_profile(window_meals, NUTRIENT_KEYS)
+
+    is_v2 = request.args.get("v2") == "1"
+    if is_v2:
+        ctx = ins.next_meal_context_v2(
+            consumed=consumed, targets=targets,
+            focus_key=request.args.get("focus") or None,
+            food_profile=profile,
+            today_rows=today_rows, window_meals=window_meals,
+            window_days=PROFILE_WINDOW_DAYS,
+            current_time=now.strftime("%H:%M"))
+    else:
+        ctx = ins.next_meal_context(
+            consumed=consumed, targets=targets,
+            focus_key=request.args.get("focus") or None,
+            food_profile=profile, slot=ins._meal_slot(now.isoformat()))
     return jsonify(ctx), 200
 
 
@@ -3279,3 +3294,286 @@ def insights_next_meal():
         "snapshot": _loads_or(latest.get("snapshot_json"), {}),
         "plates": _loads_or(latest.get("plates_json"), []),
     }), 200
+
+
+# =============================================================================
+# Gemini-powered on-demand generation (replaces the local claude CLI).
+# These endpoints call Gemini API directly so the feature works without the Mac.
+# =============================================================================
+
+# File cache dir for generated reports (Cloud Run has a writable /tmp).
+_INSIGHTS_CACHE_DIR = "/tmp/health-tracker-cache"
+
+
+def _cache_path(name: str) -> str:
+    os.makedirs(_INSIGHTS_CACHE_DIR, exist_ok=True)
+    return os.path.join(_INSIGHTS_CACHE_DIR, name)
+
+
+def _write_cache(name: str, data: dict) -> None:
+    try:
+        with open(_cache_path(name), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except OSError:
+        pass  # non-fatal — generation succeeded, caching is best-effort
+
+
+def _read_cache(name: str) -> dict | None:
+    try:
+        with open(_cache_path(name), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+@functools.lru_cache(maxsize=1)
+def _narrator_mod():
+    import importlib.util
+    path = os.path.join(os.path.dirname(__file__), "narrator.py")
+    spec = importlib.util.spec_from_file_location("narrator", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _gemini_available() -> bool:
+    return bool(os.environ.get("GEMINI_API_KEY"))
+
+
+_PROFILE_WINDOW_DAYS_NARRATOR = 28
+
+
+def _get_current_focus() -> Optional[str]:
+    """Read the latest focus from the weekly reports sheet tab."""
+    rows = [r for r in _read_cached_rows(WEEKLY_TAB)
+            if r.get("week_start")]
+    if not rows:
+        return None
+    last = max(rows, key=lambda r: str(r.get("week_start")))
+    return str(last.get("focus_key") or "") or None
+
+
+def _today_key() -> str:
+    return datetime.now(_tz()).date().isoformat()
+
+
+def _today_meal_rows() -> List[Dict[str, Any]]:
+    today = _today_key()
+    return [r for r in _all_meal_rows()
+            if str(r.get("datetime", "")).startswith(today)]
+
+
+@app.post("/insights/generate-weekly")
+def insights_generate_weekly():
+    """On-demand weekly report generation via Gemini API.
+
+    Generates the Sunday coaching review with diagnosis + food profile + continuity.
+    Uses the Gemini narrator (not local claude) so this works without the Mac.
+    Can be called by Cloud Scheduler on Sundays at 09:00.
+
+    Returns the generated report, or errors if Gemini API is not configured.
+    """
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    if not _gemini_available():
+        return jsonify({"error": "GEMINI_API_KEY not configured"}), 503
+
+    now = datetime.now(_tz())
+    week_start = (now - timedelta(days=(now.weekday() + 1) % 7)).date().isoformat()
+
+    try:
+        diagnosis = _diagnosis_for(week_start, 7)
+        profile = _insights_mod().build_food_profile(
+            _window_meals(_all_meal_rows(),
+                          (datetime.fromisoformat(week_start).date() -
+                           timedelta(days=_PROFILE_WINDOW_DAYS_NARRATOR)).isoformat(),
+                          week_start),
+            NUTRIENT_KEYS)
+
+        if diagnosis.get("window", {}).get("days_logged", 0) < 4:
+            return jsonify({
+                "status": "skipped",
+                "reason": f"only {diagnosis['window']['days_logged']} logged days — "
+                          f"too thin for a confident report",
+            }), 200
+
+        # Resolve continuity: compare this week's value against last report's focus.
+        continuity = None
+        prior_rows = [r for r in _read_cached_rows(WEEKLY_TAB) if r.get("week_start")]
+        if prior_rows:
+            last = max(prior_rows, key=lambda r: str(r.get("week_start")))
+            pk = str(last.get("focus_key") or "").strip()
+            try:
+                prev_val = float(last.get("focus_value"))
+            except (TypeError, ValueError):
+                prev_val = None
+            if pk and prev_val and prev_val > 0:
+                # Find current value for this key in the diagnosis nutrients.
+                now_val = None
+                kind = "reach"
+                for n in diagnosis.get("nutrients", []):
+                    if n.get("key") == pk:
+                        now_val = n.get("mean")
+                        kind = n.get("kind", "reach")
+                        break
+                if not now_val:
+                    # Maybe it's in the adherence block (a macro like protein, fiber).
+                    adh = diagnosis.get("adherence", {}).get(pk, {})
+                    now_val = adh.get("mean") if isinstance(adh, dict) else None
+
+                if now_val and now_val > 0:
+                    pct = round(100 * (now_val - prev_val) / prev_val)
+                    up = now_val > prev_val
+                    toward = (up and kind != "limit") or (not up and kind == "limit")
+                    continuity = {
+                        "key": pk, "prev": prev_val, "now": now_val,
+                        "pct": pct,
+                        "direction": "up" if up else "down" if now_val < prev_val else "flat",
+                        "toward_target": toward,
+                    }
+
+        narrator = _narrator_mod()
+        report = narrator.narrate_weekly(diagnosis, profile, continuity)
+
+        # Build the full response and cache it.
+        result = {
+            "status": "generated",
+            "week_start": week_start,
+            "generated_at": now.isoformat(timespec="seconds"),
+            "window_start": diagnosis.get("window", {}).get("start"),
+            "window_end": diagnosis.get("window", {}).get("end"),
+            "focus_key": (report.get("focus", {}) or {}).get("key")
+                         or (diagnosis.get("ranked_issues") or [""])[0],
+            "prior_focus_delta": continuity,
+            "coverage_note": diagnosis.get("coverage_note", ""),
+            "report": report,
+        }
+        _write_cache("weekly_report", result)
+        return jsonify(result), 200
+
+    except Exception as exc:
+        app.logger.exception("weekly generation failed")
+        return jsonify({"status": "error", "error": str(exc)}), 500
+
+
+@app.post("/insights/generate-next-meal")
+def insights_generate_next_meal():
+    """On-demand next-meal generation via Gemini API.
+
+    Builds the enhanced context (current time, today's meals, meal timing profile,
+    remaining budget, shortfall candidates) and calls Gemini to determine the next
+    slot AND generate 3 meal options for that slot.
+
+    The AI decides the next slot dynamically based on:
+    - Current time of day
+    - What meals have been logged today
+    - The user's historical meal timing patterns (from 28-day history)
+    - Remaining calorie/protein budget
+    - Today's shortfall nutrients
+
+    Returns the generated plates, or errors if Gemini is not configured.
+    """
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    if not _gemini_available():
+        return jsonify({"error": "GEMINI_API_KEY not configured"}), 503
+
+    now = datetime.now(_tz())
+    today = now.date().isoformat()
+    current_time = now.strftime("%H:%M")
+
+    try:
+        # Gather data.
+        all_rows = _all_meal_rows()
+        today_rows = [r for r in all_rows
+                      if str(r.get("datetime", "")).startswith(today)]
+        consumed = _todays_consumed(today_rows)
+        targets, basis = _resolved_targets_and_basis()
+        profile_start = (now.date() - timedelta(days=_PROFILE_WINDOW_DAYS_NARRATOR)).isoformat()
+        window_meals = _window_meals(all_rows, profile_start, today)
+        focus_key = _get_current_focus()
+
+        ins = _insights_mod()
+        food_profile = ins.build_food_profile(window_meals, NUTRIENT_KEYS)
+
+        # Build enhanced context with timing profile and today's meals.
+        context = ins.next_meal_context_v2(
+            consumed=consumed, targets=targets,
+            focus_key=focus_key,
+            food_profile=food_profile,
+            today_rows=today_rows,
+            window_meals=window_meals,
+            window_days=_PROFILE_WINDOW_DAYS_NARRATOR,
+            current_time=current_time,
+        )
+
+        if not context.get("candidates"):
+            return jsonify({
+                "status": "skipped",
+                "reason": "nothing short today — no next-meal suggestion needed.",
+                "context": context,
+            }), 200
+
+        narrator = _narrator_mod()
+        result = narrator.assemble_next_meal(context, food_profile)
+
+        # Cache the result.
+        cache_entry = {
+            "date": today,
+            "generated_at": now.isoformat(timespec="seconds"),
+            "focus_key": focus_key,
+            "next_slot": result.get("next_slot"),
+            "reasoning": result.get("reasoning"),
+            "plates": result.get("plates", []),
+            "snapshot": {
+                "current_time": current_time,
+                "calories_left": context.get("calories_left"),
+                "protein_left_g": context.get("protein_left_g"),
+                "today_meals": context.get("today_meals", []),
+            },
+        }
+        _write_cache("next_meal", cache_entry)
+
+        return jsonify({
+            "status": "generated",
+            "date": today,
+            "generated_at": cache_entry["generated_at"],
+            "focus_key": focus_key,
+            "next_slot": result.get("next_slot"),
+            "reasoning": result.get("reasoning"),
+            "plates": result.get("plates", []),
+        }), 200
+
+    except Exception as exc:
+        app.logger.exception("next-meal generation failed")
+        return jsonify({"status": "error", "error": str(exc)}), 500
+
+
+@app.get("/insights/next-meal/v2")
+def insights_next_meal_v2():
+    """Enhanced next-meal endpoint: returns cached on-demand result, or pending.
+
+    Unlike the sheet-based `/insights/next-meal`, this reads the cache written by
+    `POST /insights/generate-next-meal`. The iOS app should call this after
+    generating, or call `POST /insights/generate-next-meal` directly.
+
+    Returns:
+      - Cached result if available for today (status: "generated")
+      - Or status "pending" if no cached result exists yet
+    """
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    today = _today_key()
+    cached = _read_cache("next_meal")
+    if cached and cached.get("date") == today:
+        return jsonify({
+            "status": "generated",
+            "date": cached.get("date"),
+            "generated_at": cached.get("generated_at"),
+            "focus_key": cached.get("focus_key"),
+            "next_slot": cached.get("next_slot"),
+            "reasoning": cached.get("reasoning"),
+            "plates": cached.get("plates", []),
+        }), 200
+    return jsonify({"status": "pending", "plates": []}), 200
+

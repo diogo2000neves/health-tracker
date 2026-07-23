@@ -65,10 +65,27 @@ struct APIClient {
         return try await get("insights/weekly", query: [], cacheAs: "insights_weekly")
     }
 
-    /// Today's next-meal plates. `status == "pending"` until the afternoon run lands.
+    /// Today's next-meal plates from the file cache (v2 endpoint).
+    /// `status == "pending"` if on-demand generation hasn't been run yet.
     func nextMeal() async throws -> NextMealResponse {
         if useSampleData { return SampleData.nextMeal }
-        return try await get("insights/next-meal", query: [], cacheAs: "insights_next_meal")
+        return try await get("insights/next-meal/v2", query: [], cacheAs: "insights_next_meal")
+    }
+
+    /// Trigger on-demand generation of next-meal suggestions via Gemini API.
+    /// Returns immediately with the generated plates (may take 5-15s on first call).
+    func generateNextMeal() async throws -> NextMealResponse {
+        if useSampleData { return SampleData.nextMeal }
+        var url = Config.baseURL.appending(path: "insights/generate-next-meal")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue(Config.authToken, forHTTPHeaderField: "X-Auth-Token")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        // Longer timeout for the Gemini API call (may take 30s).
+        let timeout: TimeInterval = 45
+        request.timeoutInterval = timeout
+        return try await send(request, cacheAs: nil)
     }
 
     /// Hand-correct one ingredient's numbers on an already-logged meal (e.g. the AI

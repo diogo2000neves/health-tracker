@@ -482,7 +482,8 @@ def categorize_food(name: str) -> str:
 
 
 def _meal_slot(datetime_str: str) -> str:
-    """breakfast / lunch / dinner / snack from the meal's local hour."""
+    """breakfast / morning_snack / lunch / afternoon_snack / dinner from the meal's
+    local hour. Distinguishes morning vs afternoon snacks for the timing profile."""
     hour = 0
     try:
         hour = int(str(datetime_str)[11:13])
@@ -494,7 +495,9 @@ def _meal_slot(datetime_str: str) -> str:
         return "lunch"
     if 18 <= hour < 23:
         return "dinner"
-    return "snack"
+    if 15 <= hour < 18:
+        return "afternoon_snack"
+    return "morning_snack"  # 0-5 or 23+
 
 
 def build_food_profile(window_meals: Sequence[Dict[str, Any]],
@@ -611,6 +614,173 @@ def next_meal_context(*, consumed: Dict[str, float], targets: Dict[str, Dict[str
 
     return {
         "slot": slot,
+        "calories_left": round(cal_left),
+        "protein_left_g": round(prot_left),
+        "focus_key": focus_key,
+        "shortfalls_today": ordered[:4],
+        "candidates": candidates,
+    }
+
+
+# -- Meal timing profile (for dynamic next-slot detection) ---------------------
+
+def _slot_time_hour(datetime_str: str) -> Optional[int]:
+    """Extract the hour from a datetime string for timing analysis."""
+    try:
+        return int(str(datetime_str)[11:13])
+    except (ValueError, IndexError):
+        return None
+
+
+def build_meal_timing_profile(window_meals: Sequence[Dict[str, Any]],
+                               window_days: int) -> Dict[str, Any]:
+    """Build a profile of the user's typical meal timing over the window.
+
+    Returns a dict like:
+    {
+      "breakfast": {"pct": 0.90, "typical_time": "08:15", "times_eaten": 25},
+      "lunch": {"pct": 0.95, "typical_time": "13:00", "times_eaten": 27},
+      "dinner": {"pct": 0.90, "typical_time": "20:00", "times_eaten": 25},
+      "morning_snack": {"pct": 0.25, "typical_time": "10:30", "times_eaten": 7},
+      "afternoon_snack": {"pct": 0.40, "typical_time": "16:30", "times_eaten": 11}
+    }
+
+    Used by the AI to decide which meal slot is next for the user.
+    """
+    slot_data: Dict[str, List[int]] = {
+        "breakfast": [], "morning_snack": [], "lunch": [],
+        "afternoon_snack": [], "dinner": [],
+    }
+
+    days_with_slot: Dict[str, set] = {
+        s: set() for s in slot_data
+    }
+
+    for row in window_meals:
+        if not _is_real_meal(row):
+            continue
+        slot = _meal_slot(row.get("datetime", ""))
+        hour = _slot_time_hour(row.get("datetime", ""))
+        day = str(row.get("datetime", ""))[:10]
+        if slot not in slot_data:
+            continue
+        if hour is not None:
+            slot_data[slot].append(hour)
+        if day:
+            days_with_slot[slot].add(day)
+
+    window_days = max(window_days, 1)
+    profile: Dict[str, Any] = {}
+    for slot, hours in slot_data.items():
+        times_eaten = len(hours)
+        pct = round(times_eaten / max(len(days_with_slot[slot]), 1) if days_with_slot[slot] else 0, 2)
+        # Clamp pct: if they ate it on 90% of days where they had that slot...
+        # Actually, use unique days for pct
+        unique_days = len(days_with_slot[slot])
+        pct = round(unique_days / window_days, 2) if window_days > 0 else 0.0
+        typical = ""
+        if hours:
+            avg_hour = statistics.mean(hours)
+            mins = int((avg_hour - int(avg_hour)) * 60)
+            typical = f"{int(avg_hour):02d}:{mins:02d}" if avg_hour >= 5 else ""
+
+        profile[slot] = {
+            "pct": min(pct, 1.0),
+            "typical_time": typical,
+            "times_eaten": times_eaten,
+        }
+    return profile
+
+
+def build_today_meals_summary(today_rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Build a summary of today's logged meals for the AI context.
+
+    Returns list like:
+    [{"time": "08:15", "slot": "breakfast", "foods": "aveia, banana, leite",
+      "calories": 420, "protein_g": 18}]
+    """
+    summary: List[Dict[str, Any]] = []
+    for row in today_rows:
+        if not _is_real_meal(row):
+            continue
+        dt = str(row.get("datetime", ""))
+        time_str = dt[11:16] if len(dt) >= 16 else ""
+        slot = _meal_slot(dt)
+        # Collect food names from items.
+        item_names = []
+        for item in _parse_items(row.get("items")):
+            name = _norm_name(item.get("name"))
+            if name:
+                item_names.append(name)
+
+        summary.append({
+            "time": time_str,
+            "slot": slot,
+            "foods": ", ".join(item_names[:5]) if item_names else "",
+            "calories": round(_num(row.get("calories"))),
+            "protein_g": round(_num(row.get("protein_g")), 1),
+        })
+    summary.sort(key=lambda m: m["time"])
+    return summary
+
+
+def next_meal_context_v2(*, consumed: Dict[str, float],
+                          targets: Dict[str, Dict[str, Any]],
+                          focus_key: Optional[str],
+                          food_profile: Sequence[Dict[str, Any]],
+                          today_rows: Sequence[Dict[str, Any]],
+                          window_meals: Sequence[Dict[str, Any]],
+                          window_days: int,
+                          current_time: str) -> Dict[str, Any]:
+    """Enhanced next-meal context that includes the user's timing patterns and
+    today's logged meals so the AI can determine the next slot dynamically.
+
+    Returns the full context dict for the narrator's `assemble_next_meal()` call.
+    """
+    # Same shortfall/candidate logic as next_meal_context().
+    cal_t = targets.get("calories", {})
+    cal_left = max(0.0, (cal_t.get("ceiling") or cal_t.get("floor") or 0) - _num(consumed.get("calories")))
+    prot_t = targets.get("protein_g", {})
+    prot_left = max(0.0, (prot_t.get("floor") or 0) - _num(consumed.get("protein_g")))
+
+    shortfalls: List[str] = []
+    for key, target in targets.items():
+        if target.get("kind") == "limit" or key in _PURE_MACROS:
+            continue
+        floor = target.get("floor")
+        if floor and _num(consumed.get(key)) < DEFICIT_RATIO * floor:
+            shortfalls.append(key)
+
+    ordered = ([focus_key] if focus_key and focus_key in [t for t in targets] else []) + \
+              [k for k in shortfalls if k != focus_key]
+
+    candidates: Dict[str, List[Dict[str, Any]]] = {}
+    for key in ordered[:4]:
+        floor = targets.get(key, {}).get("floor") or 0
+        gap = max(0.0, floor - _num(consumed.get(key)))
+        if gap <= 0:
+            continue
+        ranked = sorted(
+            (f for f in food_profile if f.get("density_per_g", {}).get(key, 0) > 0),
+            key=lambda f: f["density_per_g"][key], reverse=True)[:6]
+        rows = []
+        for f in ranked:
+            rng = portion_range(gap, f["density_per_g"][key], f.get("cal_per_g", 0), cal_left)
+            if rng:
+                rows.append({"food": f["food"], "category": f["category"],
+                             "grams_low": rng[0], "grams_high": rng[1],
+                             "times_eaten": f["times_eaten"]})
+        if rows:
+            candidates[key] = rows
+
+    # Build timing profile and today's meals summary.
+    meal_pattern = build_meal_timing_profile(window_meals, window_days)
+    today_meals = build_today_meals_summary(today_rows)
+
+    return {
+        "current_time": current_time,
+        "today_meals": today_meals,
+        "meal_pattern": meal_pattern,
         "calories_left": round(cal_left),
         "protein_left_g": round(prot_left),
         "focus_key": focus_key,

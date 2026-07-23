@@ -22,6 +22,8 @@ final class InsightsStore {
     var errorMessage: String?
     var isLoading = false
     var isRefreshing = false
+    /// True while the Gemini API is generating next-meal suggestions (5-15s).
+    var isGeneratingNextMeal = false
 
     init() {
         weekly = APIClient.shared.cachedWeeklyInsights()
@@ -33,19 +35,71 @@ final class InsightsStore {
         if had { isRefreshing = true } else { isLoading = true }
         defer { isLoading = false; isRefreshing = false }
 
-        // The weekly review is the primary payload; the next-meal cache is best-effort
-        // and must never block or error the review (the Mac may not have run today).
+        // The weekly review is the primary payload (still reads from sheets cache).
         async let weeklyResult = APIClient.shared.weeklyInsights()
-        async let mealResult = APIClient.shared.nextMeal()
         do {
             weekly = try await weeklyResult
             errorMessage = nil
         } catch {
             if !had { errorMessage = error.localizedDescription }
         }
-        if let meal = try? await mealResult { nextMeal = meal }
+
+        // Load cached next-meal (instant — from file cache on the backend).
+        var needsRegeneration = false
+        if let meal = try? await APIClient.shared.nextMeal() {
+            nextMeal = meal
+            // Stale check: regenerate if cached is 2+ hours old (meal may have been logged).
+            if let genAt = meal.generatedAt {
+                needsRegeneration = isOlderThanHours(genAt, hours: 2)
+            } else {
+                needsRegeneration = true
+            }
+        } else {
+            needsRegeneration = true
+        }
+
+        if needsRegeneration && !isGeneratingNextMeal {
+            Task { await generateNextMeal() }
+        }
+    }
+
+    /// Check if a backend-generated timestamp string is older than N hours.
+    private func isOlderThanHours(_ timestamp: String, hours: Int) -> Bool {
+        let parser = DateFormatter()
+        parser.calendar = Calendar(identifier: .gregorian)
+        parser.locale = Locale(identifier: "en_US_POSIX")
+        parser.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        guard let date = parser.date(from: String(timestamp.prefix(19))) else {
+            return true  // can't parse → regenerate
+        }
+        return -date.timeIntervalSinceNow > Double(hours) * 3600
+    }
+
+    /// Generates fresh next-meal suggestions via Gemini API on the backend.
+    /// The AI determines the next meal slot based on current time, today's meals,
+    /// and the user's historical eating patterns.
+    func generateNextMeal() async {
+        guard !isGeneratingNextMeal else { return }  // don't double-trigger
+        isGeneratingNextMeal = true
+        defer { isGeneratingNextMeal = false }
+        do {
+            nextMeal = try await APIClient.shared.generateNextMeal()
+        } catch {
+            // Silently fail — the weekly review or cached result remains visible.
+        }
+    }
+
+    /// Call after a meal is logged to regenerate next-meal suggestions for the
+    /// updated remaining budget.
+    func mealWasLogged() {
+        // The backend's `generate-next-meal` reads live data, so we just
+        // need to re-trigger. The existing cached result may be stale now.
+        Task {
+            await generateNextMeal()
+        }
     }
 }
+
 
 // MARK: - Screen
 
@@ -101,7 +155,10 @@ struct InsightsView: View {
 
                 HeadlineCard(text: report.headline)
 
-                NextMealButton(response: store.nextMeal) { showPlates = true }
+                NextMealButton(response: store.nextMeal,
+                               isGenerating: store.isGeneratingNextMeal) {
+                    showPlates = true
+                }
 
                 if !report.wins.isEmpty {
                     WinsCard(wins: report.wins)
@@ -133,14 +190,30 @@ struct InsightsView: View {
         ContentUnavailableView {
             Label("O teu resumo está a chegar", systemImage: "sparkles")
         } description: {
-            Text("Todos os domingos preparo uma análise da tua semana — o que está a "
-                 + "bombar e o próximo passo. Volta cá no domingo.")
+            if store.isGeneratingNextMeal {
+                Text("A gerar sugestões para a tua próxima refeição…")
+            } else {
+                Text("Todos os domingos preparo uma análise da tua semana — o que está a "
+                     + "bombar e o próximo passo. Até lá, tenho ideias para o que comeres.")
+            }
         } actions: {
-            if store.nextMeal?.isReady == true {
+            if store.isGeneratingNextMeal {
+                ProgressView()
+                    .controlSize(.regular)
+            } else if let nm = store.nextMeal, nm.isReady {
                 Button {
                     showPlates = true
                 } label: {
-                    Label("Ver ideias para hoje", systemImage: "fork.knife")
+                    let slot = nm.slotLabel.map { "Ver ideias para \($0)" }
+                        ?? "Ver ideias para hoje"
+                    Label(slot, systemImage: "fork.knife")
+                }
+                .buttonStyle(.borderedProminent)
+            } else if !store.isGeneratingNextMeal {
+                Button {
+                    Task { await store.generateNextMeal() }
+                } label: {
+                    Label("Gerar sugestões", systemImage: "sparkles")
                 }
                 .buttonStyle(.borderedProminent)
             }
@@ -220,6 +293,7 @@ struct HeadlineCard: View {
 
 struct NextMealButton: View {
     let response: NextMealResponse?
+    let isGenerating: Bool
     let action: () -> Void
 
     var body: some View {
@@ -227,12 +301,18 @@ struct NextMealButton: View {
             HStack(spacing: 14) {
                 ZStack {
                     Circle().fill(Palette.accent.opacity(0.15)).frame(width: 46, height: 46)
-                    Image(systemName: "fork.knife")
-                        .font(.title3.weight(.semibold))
-                        .foregroundStyle(Palette.accentText)
+                    if isGenerating {
+                        ProgressView()
+                            .controlSize(.small)
+                            .tint(Palette.accentText)
+                    } else {
+                        Image(systemName: "fork.knife")
+                            .font(.title3.weight(.semibold))
+                            .foregroundStyle(Palette.accentText)
+                    }
                 }
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("O que como a seguir?")
+                    Text(title)
                         .font(.headline)
                         .foregroundStyle(.primary)
                     Text(subtitle)
@@ -247,9 +327,19 @@ struct NextMealButton: View {
             .card()
         }
         .buttonStyle(.plain)
+        .disabled(isGenerating)
+    }
+
+    private var title: String {
+        if isGenerating { return "A gerar sugestões…" }
+        if let r = response, r.isReady, let slot = r.slotLabel {
+            return "O que como a seguir? · \(slot)"
+        }
+        return "O que como a seguir?"
     }
 
     private var subtitle: String {
+        if isGenerating { return "A analisar os teus dados com IA" }
         guard let r = response, r.isReady else { return "A preparar as ideias de hoje…" }
         let n = r.plates.count
         return "\(n) \(n == 1 ? "ideia" : "ideias") com o que já comes"
@@ -442,6 +532,20 @@ struct NextMealSheet: View {
                 if let r = response, r.isReady {
                     ScrollView {
                         VStack(spacing: 16) {
+                            // Show the AI-determined slot header.
+                            if let slot = r.slotLabel {
+                                HStack(spacing: 8) {
+                                    Image(systemName: "clock.fill")
+                                        .font(.caption)
+                                        .foregroundStyle(Palette.accent)
+                                    Text("Sugestões para \(slot.lowercased())")
+                                        .font(.subheadline.weight(.medium))
+                                        .foregroundStyle(.secondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 4)
+                            }
+
                             ForEach(r.plates.sorted { $0.rank < $1.rank }) { plate in
                                 PlateCard(plate: plate)
                             }
@@ -459,8 +563,8 @@ struct NextMealSheet: View {
                     ContentUnavailableView {
                         Label("Ainda a preparar", systemImage: "fork.knife")
                     } description: {
-                        Text("As ideias para hoje aparecem ao fim da tarde. Se estiveres "
-                             + "com fome antes disso, regista o que comeres e eu ajusto.")
+                        Text("As sugestões estão a ser geradas com IA para a tua próxima "
+                             + "refeição. Vai demorar só uns segundos.")
                     }
                 }
             }
@@ -477,10 +581,8 @@ struct NextMealSheet: View {
 
     private func generatedStamp(_ r: NextMealResponse) -> String? {
         guard let at = r.generatedAt else { return nil }
-        // "…até às 17:32" — honest about the snapshot time, since a late-logged meal
-        // makes the suggestion slightly stale (an accepted trade of local generation).
         let time = String(at.suffix(8).prefix(5))
-        return time.contains(":") ? "Baseado no que registaste até às \(time)" : nil
+        return time.contains(":") ? "Gerado às \(time)" : nil
     }
 }
 

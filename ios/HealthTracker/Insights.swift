@@ -123,21 +123,32 @@ struct FoodSwap: Decodable, Hashable {
     let why: String
 }
 
-// MARK: - GET /insights/next-meal
+// MARK: - GET /insights/next-meal (v2 — dynamic slot)
 
 struct NextMealResponse: Decodable {
     let status: String
     let date: String?
     let generatedAt: String?
     let focusKey: String?
+    /// The meal slot the AI determined is next, e.g. "pequeno-almoço", "almoço",
+    /// "jantar", "lanche da manhã", "lanche da tarde".
+    let nextSlot: String?
     let plates: [Plate]
 
     var isReady: Bool { status != "pending" && !plates.isEmpty }
+
+    /// A localized label for the next slot, or nil if unknown.
+    var slotLabel: String? {
+        guard let s = nextSlot else { return nil }
+        // Normalize and return the AI-written Portuguese label as-is.
+        return s.prefix(1).uppercased() + s.dropFirst()
+    }
 
     enum CodingKeys: String, CodingKey {
         case status, date, plates
         case generatedAt = "generated_at"
         case focusKey = "focus_key"
+        case nextSlot = "next_slot"
     }
 
     init(from decoder: Decoder) throws {
@@ -146,6 +157,7 @@ struct NextMealResponse: Decodable {
         date = try c.decodeIfPresent(String.self, forKey: .date)
         generatedAt = try c.decodeIfPresent(String.self, forKey: .generatedAt)
         focusKey = try c.decodeIfPresent(String.self, forKey: .focusKey)
+        nextSlot = try c.decodeIfPresent(String.self, forKey: .nextSlot)
         plates = try c.decodeIfPresent([Plate].self, forKey: .plates) ?? []
     }
 }
