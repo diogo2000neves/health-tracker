@@ -170,10 +170,14 @@ def ensure_tab(sheets, title: str, headers: List[str]) -> None:
 
 def read_rows(sheets, title: str) -> List[Dict[str, Any]]:
     last = _col_letter(40)
-    values = (sheets.spreadsheets().values()
-              .get(spreadsheetId=SHEET_ID, range=f"{title}!A1:{last}",
-                   valueRenderOption="UNFORMATTED_VALUE")
-              .execute().get("values", []))
+    try:
+        values = (sheets.spreadsheets().values()
+                  .get(spreadsheetId=SHEET_ID, range=f"{title}!A1:{last}",
+                       valueRenderOption="UNFORMATTED_VALUE")
+                  .execute().get("values", []))
+    except Exception:
+        # Tab doesn't exist yet (first run) — not an error.
+        return []
     if len(values) < 2:
         return []
     return [dict(zip(values[0], row)) for row in values[1:]]
@@ -183,11 +187,15 @@ def upsert_row(sheets, title: str, headers: List[str], key_col: str,
                row: Dict[str, Any]) -> None:
     """Update the row whose `key_col` matches, else append. Keeps history for keyed
     tabs (weekly_reports on week_start, next_meal on date)."""
+    ensure_tab(sheets, title, headers)
     last = _col_letter(len(headers) - 1)
-    values = (sheets.spreadsheets().values()
-              .get(spreadsheetId=SHEET_ID, range=f"{title}!A1:{last}",
-                   valueRenderOption="UNFORMATTED_VALUE")
-              .execute().get("values", []))
+    try:
+        values = (sheets.spreadsheets().values()
+                  .get(spreadsheetId=SHEET_ID, range=f"{title}!A1:{last}",
+                       valueRenderOption="UNFORMATTED_VALUE")
+                  .execute().get("values", []))
+    except Exception:
+        values = []
     out = [row.get(h) for h in headers]
     idx = None
     if values:
