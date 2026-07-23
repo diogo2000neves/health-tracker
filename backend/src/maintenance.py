@@ -30,7 +30,7 @@ SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 MEALS_HEADERS = [
     "datetime", "foods", "items", "calories",
     "protein_g", "carbs_g", "fat_g", "confidence", "model", "photo_url",
-    "portion_g", "image_sha", "note", "template",
+    "portion_g", "image_sha", "note", "template", "edited_at",
 ]
 
 TEMPLATES_TAB = "templates"

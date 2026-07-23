@@ -66,21 +66,29 @@ struct NutrientsView: View {
 
     @ViewBuilder
     private func content(_ r: TodayResponse) -> some View {
-        ScrollView {
-            VStack(spacing: 16) {
-                NutrientHeaderCard(response: r)
-                CeilingAlertCard(response: r) { selected = $0 }
-                LensSection(section: .diarios, response: r) { selected = $0 }
-                LensSection(section: .reservas, response: r) { selected = $0 }
-                DailyLimitsCard(response: r) { selected = $0 }
-                SafetyCeilingsCard(response: r) { selected = $0 }
-                ContextCard(response: r) { selected = $0 }
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(spacing: 16) {
+                    NutrientHeaderCard(response: r) { id in
+                        withAnimation { proxy.scrollTo(id, anchor: .top) }
+                    }
+                    CeilingAlertCard(response: r) { selected = $0 }
+                    LensSection(section: .diarios, response: r) { selected = $0 }
+                        .id("diarios")
+                    LensSection(section: .reservas, response: r) { selected = $0 }
+                        .id("reservas")
+                    DailyLimitsCard(response: r) { selected = $0 }
+                        .id("limites")
+                    SafetyCeilingsCard(response: r) { selected = $0 }
+                        .id("toxicidade")
+                    ContextCard(response: r) { selected = $0 }
+                }
+                .padding(16)
             }
-            .padding(16)
-        }
-        .refreshable { await store.load() }
-        .sheet(item: $selected) { def in
-            NutrientDetailSheet(def: def, response: r, info: info)
+            .refreshable { await store.load() }
+            .sheet(item: $selected) { def in
+                NutrientDetailSheet(def: def, response: r, info: info)
+            }
         }
     }
 }
@@ -110,12 +118,13 @@ private func sectionAccent(_ section: NutrientSection) -> Color {
 
 private struct NutrientHeaderCard: View {
     let response: TodayResponse
+    let scrollTo: (String) -> Void
 
     var body: some View {
         HStack(spacing: 4) {
-            metTile(.diarios)
+            metTile(.diarios, id: "diarios")
             divider
-            metTile(.reservas)
+            metTile(.reservas, id: "reservas")
             divider
             limitTile
             divider
@@ -128,7 +137,7 @@ private struct NutrientHeaderCard: View {
         Rectangle().fill(Palette.track).frame(width: 1, height: 44)
     }
 
-    private func metTile(_ section: NutrientSection) -> some View {
+    private func metTile(_ section: NutrientSection, id: String) -> some View {
         let (met, total) = tally(section)
         let color: Color = (total > 0 && met == total) ? Palette.goodText
             : (total > 0 && Double(met) >= Double(total) * 0.5) ? Palette.warningText
@@ -142,6 +151,8 @@ private struct NutrientHeaderCard: View {
             Text(section.title).font(.caption2).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+        .onTapGesture { scrollTo(id) }
     }
 
     private var limitTile: some View {
@@ -152,10 +163,12 @@ private struct NutrientHeaderCard: View {
             Text("\(n)")
                 .font(.system(size: 22, weight: .bold, design: .rounded)).monospacedDigit()
                 .foregroundStyle(n > 0 ? Palette.warningText : Palette.goodText)
-            Text(n == 0 ? "limites ok" : "limites")
+            Text("Limites")
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+        .onTapGesture { scrollTo("limites") }
     }
 
     private var ceilingTile: some View {
@@ -166,10 +179,12 @@ private struct NutrientHeaderCard: View {
             Text("\(n)")
                 .font(.system(size: 22, weight: .bold, design: .rounded)).monospacedDigit()
                 .foregroundStyle(n > 0 ? Palette.warningText : Palette.goodText)
-            Text(n == 0 ? "tetos ok" : "tetos")
+            Text("Toxicidade")
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+        .onTapGesture { scrollTo("toxicidade") }
     }
 
     private func tally(_ section: NutrientSection) -> (Int, Int) {

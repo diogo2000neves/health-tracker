@@ -123,14 +123,18 @@ TARGETS_TAB = "targets"
 # the row totals the daily job rolls up. `model` records which AI analysed the
 # photo (audit); `image_sha` powers de-duplication; `template` records which
 # measured template supplied the numbers (blank = estimated from the photo).
-# Schema changes (add/remove a column) must be mirrored in src/maintenance.py so
-# existing rows are realigned.
+# `edited_at` is set the moment a user hand-corrects an item via /meals/edit — it
+# marks the row so the local audit job (automation/nutrition-audit/audit.py) skips
+# it instead of clobbering the correction with a fresh photo re-estimate.
+# Schema changes (add/remove a column) must be mirrored in src/maintenance.py and
+# in automation/nutrition-audit/audit.py's own MEALS_HEADERS so existing rows are
+# realigned and the audit job keeps writing the same shape back.
 MEALS_HEADERS = [
     "datetime", "foods", "items", "calories",
     "protein_g", "carbs_g", "fat_g", "confidence", "model", "photo_url",
-    "portion_g", "image_sha", "note", "template",
+    "portion_g", "image_sha", "note", "template", "edited_at",
 ]
-LAST_COL = chr(ord("A") + len(MEALS_HEADERS) - 1)  # "N"
+LAST_COL = chr(ord("A") + len(MEALS_HEADERS) - 1)  # "O"
 
 # Meals the user has weighed on a real scale. `items` holds the SAME
 # per-ingredient JSON shape as meals, so a template is just a canonical, measured
@@ -1129,20 +1133,29 @@ def _body_row(body: Dict[str, float], measured: datetime) -> Dict[str, Any]:
     return row
 
 
-def _meal_from_items(items: List[Dict[str, Any]], confidence: Any,
-                     model: str) -> Dict[str, Any]:
-    """Assemble the meal record (row totals = sum over items)."""
+def _meal_totals(items: List[Dict[str, Any]]) -> Dict[str, float]:
+    """A meal row's flat columns = the sum of its items, for every numeric column a
+    row carries. Shared by fresh ingest (_meal_from_items) and a user's later
+    hand-correction (/meals/edit) so both derive totals the same way."""
     def total(key: str) -> float:
         return round(sum(i[key] for i in items), 1)
 
     return {
-        "items": items,
-        "foods": ", ".join(i["name"] for i in items) if items else "not food",
         "portion_g": total("portion_g"),
         "calories": total("calories"),
         "protein_g": total("protein_g"),
         "carbs_g": total("carbs_g"),
         "fat_g": total("fat_g"),
+    }
+
+
+def _meal_from_items(items: List[Dict[str, Any]], confidence: Any,
+                     model: str) -> Dict[str, Any]:
+    """Assemble the meal record (row totals = sum over items)."""
+    return {
+        "items": items,
+        "foods": ", ".join(i["name"] for i in items) if items else "not food",
+        **_meal_totals(items),
         "confidence": _round_num(confidence, 2),
         "model": model,
     }
@@ -1193,6 +1206,23 @@ def _meal_row_index(values: List[List[Any]], image_sha: str) -> Optional[int]:
     for n, r in enumerate(values[1:], start=2):
         foods = str(r[foods_i] if len(r) > foods_i else "").strip().lower()
         if len(r) > sha_i and str(r[sha_i]) == image_sha and foods not in NON_MEALS:
+            return n
+    return None
+
+
+def _meal_row_index_by_datetime(values: List[List[Any]], when: str) -> Optional[int]:
+    """1-based sheet row of the meal with this exact `datetime` (a meal's id, as
+    shown to and sent back by the app), or None. Used by /meals/edit — unlike
+    _meal_row_index this looks up by the meal's own identity, not a photo hash."""
+    if not values:
+        return None
+    header = values[0]
+    try:
+        dt_i = header.index("datetime")
+    except ValueError:
+        return None
+    for n, r in enumerate(values[1:], start=2):
+        if len(r) > dt_i and str(r[dt_i]) == when:
             return n
     return None
 
@@ -2231,6 +2261,7 @@ def _today_meals_out(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "note": str(row.get("note") or "").strip(),
             "template": str(row.get("template") or "").strip(),
             "photo_url": str(row.get("photo_url") or "").strip(),
+            "edited": bool(str(row.get("edited_at") or "").strip()),
             **macros,
             "items": _normalize_items(_parse_items_cell(row.get("items"))),
         })
@@ -2841,6 +2872,76 @@ def daily():
 
     return jsonify({"from": start, "to": end, "count": len(days),
                     "blocks": wanted, "days": days}), 200
+
+
+# Item fields a hand correction may overwrite. portion_g is informational only in
+# v1 — editing it does not rescale the other fields, it's just another number the
+# user can type a correction into.
+_EDITABLE_ITEM_FIELDS = ("calories", "protein_g", "carbs_g", "fat_g", "portion_g")
+
+
+@app.post("/meals/edit")
+def edit_meal():
+    """Hand-correct one ingredient of an already-logged meal (e.g. the AI
+    overestimated a food's protein). The meal's row totals are re-derived from its
+    items afterwards (_meal_totals) so they never drift from what the item list
+    actually adds up to.
+
+    Only the touched columns are written (items + the 5 macro/portion totals +
+    edited_at) — model, image_sha, photo_url, note and template are left completely
+    alone, so this can never resurrect a stub or break de-duplication.
+
+    Stamps `edited_at`, which marks the row so the local audit job
+    (nutrition-audit/audit.py) skips it instead of overwriting the correction with a
+    fresh photo re-estimate next time it runs.
+
+    Body: {"datetime": "<meal id, as returned by /today>", "item_index": <int>,
+           "calories"?, "protein_g"?, "carbs_g"?, "fat_g"?, "portion_g"?}
+    — each numeric field is optional; only the ones given change.
+    """
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    body = request.get_json(silent=True) or {}
+    when = str(body.get("datetime") or "").strip()
+    if not when:
+        return jsonify({"error": "datetime is required"}), 400
+    try:
+        item_index = int(body.get("item_index"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "item_index must be an integer"}), 400
+
+    values = _read_tab(MEALS_TAB)
+    rownum = _meal_row_index_by_datetime(values, when)
+    if rownum is None:
+        return jsonify({"error": f"no meal at datetime={when}"}), 404
+    row = dict(zip(values[0], values[rownum - 1]))
+
+    items = _parse_items_cell(row.get("items"))
+    if not 0 <= item_index < len(items):
+        return jsonify({"error": f"item_index {item_index} out of range "
+                                  f"(meal has {len(items)} item(s))"}), 400
+
+    for key in _EDITABLE_ITEM_FIELDS:
+        if key in body:
+            items[item_index][key] = _round_num(body[key])
+    items = _normalize_items(items)
+
+    updates: Dict[str, Any] = {
+        "items": json.dumps(items, ensure_ascii=False),
+        **_meal_totals(items),
+        "edited_at": datetime.now(_tz()).isoformat(timespec="seconds"),
+    }
+    data = [
+        {"range": f"{MEALS_TAB}!{_col_letter(MEALS_HEADERS.index(col))}{rownum}",
+         "values": [[value]]}
+        for col, value in updates.items()
+    ]
+    _execute(lambda: _sheets().spreadsheets().values().batchUpdate(
+        spreadsheetId=_sid(), body={"valueInputOption": "RAW", "data": data}))
+
+    meal_out = _today_meals_out([{**row, **updates}])
+    return jsonify(meal_out[0] if meal_out else {"datetime": when, **updates}), 200
 
 
 @app.get("/meals")

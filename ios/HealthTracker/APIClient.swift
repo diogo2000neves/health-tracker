@@ -58,6 +58,22 @@ struct APIClient {
         return try await get("nutrients", query: [])
     }
 
+    /// Hand-correct one ingredient's numbers on an already-logged meal (e.g. the AI
+    /// overestimated a food's protein). Returns the updated meal; the caller still
+    /// refetches `today()` afterward (see TodayStore.load) to keep the day's totals
+    /// and rings in sync rather than hand-mutating the immutable response structs.
+    func editMealItem(datetime: String, itemIndex: Int, calories: Double? = nil,
+                      protein: Double? = nil, carbs: Double? = nil, fat: Double? = nil,
+                      portionG: Double? = nil) async throws -> TodayMeal {
+        var body: [String: Any] = ["datetime": datetime, "item_index": itemIndex]
+        if let calories { body["calories"] = calories }
+        if let protein { body["protein_g"] = protein }
+        if let carbs { body["carbs_g"] = carbs }
+        if let fat { body["fat_g"] = fat }
+        if let portionG { body["portion_g"] = portionG }
+        return try await post("meals/edit", body: body)
+    }
+
     // MARK: - Disk-cached last-known-good (read synchronously at store init, so the
     // UI has something to show before the first network round trip even starts).
 
@@ -89,7 +105,25 @@ struct APIClient {
         var request = URLRequest(url: url)
         request.setValue(Config.authToken, forHTTPHeaderField: "X-Auth-Token")
         request.cachePolicy = .reloadIgnoringLocalCacheData  // always the live sheet
+        return try await send(request, cacheAs: path)
+    }
 
+    /// A mutation (currently just /meals/edit — the app's first non-GET call).
+    /// Retried the same way as `get`: every edit here is an absolute overwrite, not
+    /// a delta, so re-applying one after a lost response is harmless.
+    private func post<T: Decodable>(_ path: String, body: [String: Any]) async throws -> T {
+        var request = URLRequest(url: Config.baseURL.appending(path: path))
+        request.httpMethod = "POST"
+        request.setValue(Config.authToken, forHTTPHeaderField: "X-Auth-Token")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        return try await send(request, cacheAs: nil)
+    }
+
+    /// Shared retry/decode loop for both GET and POST. `cacheAs` saves the raw
+    /// response to disk under that name (GET only — nothing here should ever be
+    /// read back as a POST's cached response).
+    private func send<T: Decodable>(_ request: URLRequest, cacheAs: String?) async throws -> T {
         var lastError: Error = APIError.notHTTP
         for (attempt, delay) in Self.retryDelaysNs.enumerated() {
             let isLastAttempt = attempt == Self.retryDelaysNs.count - 1
@@ -103,7 +137,7 @@ struct APIClient {
                     throw lastError
                 }
                 let decoded = try JSONDecoder().decode(T.self, from: data)
-                DiskCache.save(data, as: path)
+                if let cacheAs { DiskCache.save(data, as: cacheAs) }
                 return decoded
             } catch {
                 lastError = error

@@ -61,7 +61,7 @@ struct TodayView: View {
                 MacrosCard(response: r)
                 EnergyBalanceCard(response: r)
                 FlagsCard(response: r)
-                MealsCard(meals: r.meals)
+                MealsCard(meals: r.meals, store: store)
             }
             .padding(16)
         }
@@ -295,6 +295,7 @@ private struct FlagsCard: View {
 
 private struct MealsCard: View {
     let meals: [TodayMeal]
+    let store: TodayStore
     @State private var selected: TodayMeal?
 
     var body: some View {
@@ -323,7 +324,7 @@ private struct MealsCard: View {
         }
         .card()
         .sheet(item: $selected) { meal in
-            MealDetailSheet(meal: meal)
+            MealDetailSheet(meal: meal, store: store)
         }
     }
 }
@@ -366,66 +367,207 @@ private struct MealRow: View {
     }
 }
 
-private struct MealDetailSheet: View {
-    let meal: TodayMeal
+	private struct MealDetailSheet: View {
+	    /// Mutable so a saved correction (see EditMealItemSheet) shows up in this
+	    /// already-open sheet immediately, without waiting for `store` to refetch.
+	    @State private var meal: TodayMeal
+	    let store: TodayStore
+	    @Environment(\.dismiss) private var dismiss
+	    @State private var editTarget: EditTarget?
+	    @State private var nutrientTarget: NutrientTarget?
+
+	    init(meal: TodayMeal, store: TodayStore) {
+	        self._meal = State(initialValue: meal)
+	        self.store = store
+	    }
+
+	    /// One food item being corrected, identified by its position in `meal.items`
+	    /// (the id /meals/edit expects — item names are not guaranteed unique).
+	    private struct EditTarget: Identifiable {
+	        let id: Int
+	        let item: MealItem
+	    }
+
+	    /// An item tapped to see its full micronutrient profile.
+	    private struct NutrientTarget: Identifiable {
+	        let id: String      // item name is unique within a meal
+	        let item: MealItem
+	        let title: String
+	    }
+
+	    var body: some View {
+	        NavigationStack {
+	            List {
+	                // Photo(s) from the meal log
+	                let photos = meal.photoURLs
+	                if !photos.isEmpty {
+	                    Section {
+	                        PhotoStrip(urls: photos)
+	                    }
+	                }
+
+	                Section {
+	                    ForEach(Array(meal.items.enumerated()), id: \.offset) { index, item in
+	                        VStack(alignment: .leading, spacing: 3) {
+	                            HStack {
+	                                Text(item.name.capitalized).fontWeight(.medium)
+	                                Spacer()
+	                                Text("\(Int(item.portionG.rounded())) g")
+	                                    .foregroundStyle(.secondary)
+	                                Button {
+	                                    editTarget = EditTarget(id: index, item: item)
+	                                } label: {
+	                                    Image(systemName: "pencil.circle")
+	                                }
+	                                .buttonStyle(.plain)
+	                                .foregroundStyle(.secondary)
+	                                .accessibilityLabel("Corrigir \(item.name)")
+	                            }
+	                            Text("\(Int(item.calories.rounded())) kcal · P \(Int(item.proteinG.rounded())) · H \(Int(item.carbsG.rounded())) · G \(Int(item.fatG.rounded()))")
+	                                .font(.caption).foregroundStyle(.secondary)
+	                        }
+	                        .padding(.vertical, 2)
+	                        .contentShape(Rectangle())
+	                        .onTapGesture {
+	                            nutrientTarget = NutrientTarget(id: item.name, item: item, title: item.name.capitalized)
+	                        }
+	                    }
+	                } header: {
+	                    HStack(spacing: 4) {
+	                        Text("\(Int(meal.calories.rounded())) kcal · \(meal.time)")
+	                        if meal.edited {
+	                            Image(systemName: "pencil.circle.fill")
+	                                .accessibilityLabel("Corrigido manualmente")
+	                        }
+	                    }
+	                }
+	                if !meal.note.isEmpty {
+	                    Section("Nota") { Text(meal.note) }
+	                }
+	            }
+	            .navigationTitle(meal.foods)
+	            .navigationBarTitleDisplayMode(.inline)
+	            .toolbar {
+	                ToolbarItem(placement: .confirmationAction) {
+	                    Button("Fechar") { dismiss() }
+	                }
+	            }
+	        }
+	        .presentationDetents([.medium, .large])
+	        .sheet(item: $editTarget) { target in
+	            EditMealItemSheet(datetime: meal.datetime, itemIndex: target.id, item: target.item) { updated in
+	                meal = updated
+	                Task { await store.load() }
+	            }
+	        }
+	        .sheet(item: $nutrientTarget) { target in
+	            ItemNutrientSheet(item: target.item, title: target.title)
+	        }
+	    }
+	}
+
+/// Hand-correct one ingredient's numbers (e.g. the AI overestimated its protein).
+/// Direct macro entry: every field is a typed-in absolute value, not a delta —
+/// `portionG` is editable too but purely informational, it does not rescale the
+/// macros (see backend /meals/edit).
+private struct EditMealItemSheet: View {
+    let datetime: String
+    let itemIndex: Int
+    let item: MealItem
+    let onSaved: (TodayMeal) -> Void
+
     @Environment(\.dismiss) private var dismiss
+    @State private var calories: String
+    @State private var protein: String
+    @State private var carbs: String
+    @State private var fat: String
+    @State private var portion: String
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    init(datetime: String, itemIndex: Int, item: MealItem, onSaved: @escaping (TodayMeal) -> Void) {
+        self.datetime = datetime
+        self.itemIndex = itemIndex
+        self.item = item
+        self.onSaved = onSaved
+        _calories = State(initialValue: Self.format(item.calories))
+        _protein = State(initialValue: Self.format(item.proteinG))
+        _carbs = State(initialValue: Self.format(item.carbsG))
+        _fat = State(initialValue: Self.format(item.fatG))
+        _portion = State(initialValue: Self.format(item.portionG))
+    }
 
     var body: some View {
         NavigationStack {
             List {
-                // Photo(s) from the meal log
-                let photos = meal.photoURLs
-                if !photos.isEmpty {
+                Section(item.name.capitalized) {
+                    numberRow("Calorias", "kcal", $calories)
+                    numberRow("Proteína", "g", $protein)
+                    numberRow("Hidratos", "g", $carbs)
+                    numberRow("Gordura", "g", $fat)
+                    numberRow("Porção", "g", $portion)
+                }
+                if let errorMessage {
                     Section {
-                        PhotoStrip(urls: photos)
+                        Text(errorMessage).foregroundStyle(Palette.criticalText)
                     }
-                }
-
-                Section {
-                    ForEach(meal.items) { item in
-                        VStack(alignment: .leading, spacing: 3) {
-                            HStack {
-                                Text(item.name.capitalized).fontWeight(.medium)
-                                Spacer()
-                                Text("\(Int(item.portionG.rounded())) g")
-                                    .foregroundStyle(.secondary)
-                            }
-                            Text("\(Int(item.calories.rounded())) kcal · P \(Int(item.proteinG.rounded())) · H \(Int(item.carbsG.rounded())) · G \(Int(item.fatG.rounded()))")
-                                .font(.caption).foregroundStyle(.secondary)
-
-                            // Micronutrients present in this item
-                            let micros = item.nutrients
-                                .filter { !$0.value.isZero }
-                                .compactMap { (key, val) -> (NutrientDef, Double)? in
-                                    NutrientCatalog.byKey[key].map { ($0, val) }
-                                }
-                                .sorted { $0.0.key < $1.0.key }
-                            if !micros.isEmpty {
-                                Divider().padding(.vertical, 4)
-                                Label("Micronutrientes", systemImage: "microbe")
-                                    .font(.caption2.weight(.semibold))
-                                    .foregroundStyle(.secondary)
-                                NutrientChips(micros: micros)
-                            }
-                        }
-                        .padding(.vertical, 2)
-                    }
-                } header: {
-                    Text("\(Int(meal.calories.rounded())) kcal · \(meal.time)")
-                }
-                if !meal.note.isEmpty {
-                    Section("Nota") { Text(meal.note) }
                 }
             }
-            .navigationTitle(meal.foods)
+            .navigationTitle("Corrigir item")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancelar") { dismiss() }
+                }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Fechar") { dismiss() }
+                    if isSaving {
+                        ProgressView()
+                    } else {
+                        Button("Guardar") { Task { await save() } }
+                    }
                 }
             }
+            .disabled(isSaving)
         }
-        .presentationDetents([.medium, .large])
+        .presentationDetents([.medium])
+    }
+
+    @ViewBuilder
+    private func numberRow(_ label: String, _ unit: String, _ value: Binding<String>) -> some View {
+        LabeledContent(label) {
+            HStack(spacing: 4) {
+                TextField(unit, text: value)
+                    .keyboardType(.decimalPad)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 70)
+                Text(unit).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func save() async {
+        isSaving = true
+        errorMessage = nil
+        defer { isSaving = false }
+        do {
+            let updated = try await APIClient.shared.editMealItem(
+                datetime: datetime, itemIndex: itemIndex,
+                calories: Self.parse(calories), protein: Self.parse(protein),
+                carbs: Self.parse(carbs), fat: Self.parse(fat),
+                portionG: Self.parse(portion))
+            onSaved(updated)
+            dismiss()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private static func parse(_ text: String) -> Double? {
+        Double(text.replacingOccurrences(of: ",", with: "."))
+    }
+
+    private static func format(_ value: Double) -> String {
+        value.rounded() == value ? String(Int(value)) : String(format: "%.1f", value)
     }
 }
 
@@ -462,21 +604,69 @@ private struct PhotoStrip: View {
     }
 }
 
-/// Compact chip grid showing which micronutrients a food item is a meaningful source of.
-private struct NutrientChips: View {
-    let micros: [(NutrientDef, Double)]
+/// Drill-down for one ingredient: shows the full micronutrient profile of a single
+/// food item — every catalogued nutrient listed with its amount. Tapping an item
+/// in the meal detail sheet opens this instead of cluttering the list with inline
+/// chips.
+private struct ItemNutrientSheet: View {
+    let item: MealItem
+    let title: String
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        FlowLayout(spacing: 4) {
-            ForEach(micros, id: \.0.id) { def, val in
-                Text("\(def.label) \(def.amount(val))")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Palette.track, in: Capsule())
+        NavigationStack {
+            List {
+                Section {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("\(Int(item.portionG.rounded())) g")
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text("\(Int(item.calories.rounded())) kcal")
+                                .font(.subheadline.weight(.semibold).monospacedDigit())
+                        }
+                        Text("P \(Int(item.proteinG.rounded()))g · H \(Int(item.carbsG.rounded()))g · G \(Int(item.fatG.rounded()))g")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+
+                let micros = item.nutrients
+                    .filter { !$0.value.isZero }
+                    .compactMap { (key, val) -> (NutrientDef, Double)? in
+                        NutrientCatalog.byKey[key].map { ($0, val) }
+                    }
+                    .sorted { $0.0.key < $1.0.key }
+                if !micros.isEmpty {
+                    Section("Micronutrientes") {
+                        ForEach(micros, id: \.0.id) { def, val in
+                            HStack {
+                                Text(def.label)
+                                    .font(.subheadline)
+                                Spacer()
+                                Text(def.amount(val))
+                                    .font(.subheadline.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+
+                if micros.isEmpty {
+                    Section {
+                        Text("Este alimento não tem micronutrientes registados.")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Fechar") { dismiss() }
+                }
             }
         }
+        .presentationDetents([.medium, .large])
     }
 }
 

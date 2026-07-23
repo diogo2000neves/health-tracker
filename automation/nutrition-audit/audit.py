@@ -87,9 +87,9 @@ MEALS_TAB = "meals"
 MEALS_HEADERS = [
     "datetime", "foods", "items", "calories",
     "protein_g", "carbs_g", "fat_g", "confidence", "model", "photo_url",
-    "portion_g", "image_sha", "note", "template",
+    "portion_g", "image_sha", "note", "template", "edited_at",
 ]
-LAST_COL = chr(ord("A") + len(MEALS_HEADERS) - 1)  # "N"
+LAST_COL = chr(ord("A") + len(MEALS_HEADERS) - 1)  # "O"
 SHA_IDX = MEALS_HEADERS.index("image_sha")
 
 # A tab the audit job OWNS entirely (the cloud services never read or write it). One
@@ -289,7 +289,12 @@ def select_meals(rows: List[Dict[str, Any]], day: str,
                  force: bool = False) -> List[Dict[str, Any]]:
     """Photo meals logged on `day` (local civil date) that still need auditing:
     have a photo, are a real meal (parseable non-empty items, not a stub), are not a
-    measured template, and have not been audited yet (unless `force`)."""
+    measured template, and have not been audited yet (unless `force`).
+
+    A row the user hand-corrected via /meals/edit (edited_at set) is skipped the
+    same as an already-audited one: the ensemble's job is to guess well BEFORE a
+    human looks at the plate, not to second-guess a correction the human already
+    made by re-estimating from the photo and clobbering it."""
     out: List[Dict[str, Any]] = []
     for row in rows:
         dt = str(row.get("datetime") or "").strip()
@@ -309,6 +314,8 @@ def select_meals(rows: List[Dict[str, Any]], day: str,
             continue                                   # stub
         if is_audited(row) and not force:
             continue                                   # already done
+        if str(row.get("edited_at") or "").strip() and not force:
+            continue                                   # user hand-corrected — leave it
         try:
             items = json.loads(row.get("items") or "[]")
         except (json.JSONDecodeError, TypeError):

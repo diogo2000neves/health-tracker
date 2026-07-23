@@ -490,13 +490,14 @@ def test_template_fields_are_optional_in_the_schema():
 
 
 def test_meals_headers_mirror_maintenance():
-    # `note` (user's text) and `template` (which measured template supplied the
-    # numbers) are provenance columns. The two copies (ingest + maintenance) must
-    # stay identical or the schema sync corrupts existing rows.
+    # `note` (user's text), `template` (which measured template supplied the
+    # numbers) and `edited_at` (set by a user's hand correction) are provenance
+    # columns. The two copies (ingest + maintenance) must stay identical or the
+    # schema sync corrupts existing rows.
     from src import maintenance
-    assert ingest.MEALS_HEADERS[-2:] == ["note", "template"]
+    assert ingest.MEALS_HEADERS[-3:] == ["note", "template", "edited_at"]
     assert ingest.MEALS_HEADERS == maintenance.MEALS_HEADERS
-    assert ingest.LAST_COL == "N"
+    assert ingest.LAST_COL == "O"
     # the templates tab schema is mirrored too
     assert ingest.TEMPLATES_HEADERS == maintenance.TEMPLATES_HEADERS
 
@@ -1235,6 +1236,78 @@ def test_meals_totals_match_the_listed_meals(monkeypatch):
         "/meals?date=2026-07-18", headers=_HDR).get_json()
     assert body["totals"] == {"calories": 800.0, "protein_g": 50.0,
                               "carbs_g": 60.0, "fat_g": 25.0}
+
+
+# -- /meals/edit: hand-correcting one ingredient's numbers -----------------------
+_EDIT_ITEMS = [
+    {"name": "chicken", "portion_g": 120, "calories": 198,
+     "protein_g": 37, "carbs_g": 0, "fat_g": 4.3},
+    {"name": "white rice", "portion_g": 150, "calories": 195,
+     "protein_g": 4, "carbs_g": 42, "fat_g": 0.4},
+]
+_EDIT_GRID = [
+    ingest.MEALS_HEADERS,
+    ["2026-07-18T13:00:00+01:00", "chicken, white rice",
+     json.dumps(_EDIT_ITEMS), 393, 41, 42, 4.7,
+     0.9, "claude-audit:m | was:g", "http://photo", 270, "sha2", "", "", ""],
+]
+
+
+def _edit_api(monkeypatch, svc, grid=None):
+    monkeypatch.setattr(ingest, "_read_tab", lambda tab: grid or _EDIT_GRID)
+    monkeypatch.setattr(ingest, "_sheets", lambda: svc)
+    monkeypatch.setattr(ingest, "_sid", lambda: "sid")
+    monkeypatch.setenv("INGEST_TOKEN", "t")
+    return ingest.app.test_client()
+
+
+def test_edit_meal_requires_the_token():
+    assert ingest.app.test_client().post("/meals/edit", json={}).status_code == 401
+
+
+def test_edit_meal_404s_on_unknown_datetime(monkeypatch):
+    svc = _FakeSheetsSvc()
+    r = _edit_api(monkeypatch, svc).post("/meals/edit", headers=_HDR, json={
+        "datetime": "2099-01-01T00:00:00+01:00", "item_index": 0, "protein_g": 1,
+    })
+    assert r.status_code == 404
+    assert svc.value_batch_bodies == []
+
+
+def test_edit_meal_400s_on_out_of_range_item_index(monkeypatch):
+    svc = _FakeSheetsSvc()
+    r = _edit_api(monkeypatch, svc).post("/meals/edit", headers=_HDR, json={
+        "datetime": "2026-07-18T13:00:00+01:00", "item_index": 5, "protein_g": 1,
+    })
+    assert r.status_code == 400
+    assert svc.value_batch_bodies == []
+
+
+def test_edit_meal_recomputes_totals_and_stamps_edited_at(monkeypatch):
+    svc = _FakeSheetsSvc()
+    r = _edit_api(monkeypatch, svc).post("/meals/edit", headers=_HDR, json={
+        "datetime": "2026-07-18T13:00:00+01:00", "item_index": 0, "protein_g": 25,
+    })
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["protein_g"] == 29.0          # 25 (corrected) + 4 (rice, untouched)
+    assert body["calories"] == 393.0          # untouched field stays the same
+    assert body["edited"] is True
+    assert body["items"][0]["protein_g"] == 25.0
+    assert body["items"][1]["protein_g"] == 4.0   # other item untouched
+
+
+def test_edit_meal_only_writes_the_touched_columns(monkeypatch):
+    # model/image_sha/photo_url/note/template must never be part of this write —
+    # a hand correction must never be able to resurrect a stub or break dedup.
+    svc = _FakeSheetsSvc()
+    _edit_api(monkeypatch, svc).post("/meals/edit", headers=_HDR, json={
+        "datetime": "2026-07-18T13:00:00+01:00", "item_index": 0, "protein_g": 25,
+    })
+    assert len(svc.value_batch_bodies) == 1
+    data = svc.value_batch_bodies[0]["data"]
+    touched_cols = {d["range"].split("!")[1].rstrip("0123456789") for d in data}
+    assert touched_cols == {"C", "D", "E", "F", "G", "K", "O"}
 
 
 # -- targets: the per-metric goals (the foundation of the whole app) ------------

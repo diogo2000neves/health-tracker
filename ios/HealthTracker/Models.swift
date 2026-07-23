@@ -129,6 +129,9 @@ struct TodayMeal: Decodable, Identifiable, Hashable {
     let carbsG: Double
     let fatG: Double
     let photoUrl: String?
+    /// True once a user has hand-corrected an item via /meals/edit. Absent on an
+    /// older cached payload, so it defaults to false rather than failing to decode.
+    let edited: Bool
     let items: [MealItem]
 
     // datetime is unique per meal (down to the second) — a stable list identity.
@@ -140,11 +143,27 @@ struct TodayMeal: Decodable, Identifiable, Hashable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case datetime, time, foods, note, template, calories, items
+        case datetime, time, foods, note, template, calories, items, edited
         case proteinG = "protein_g"
         case carbsG = "carbs_g"
         case fatG = "fat_g"
         case photoUrl = "photo_url"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        datetime = try c.decode(String.self, forKey: .datetime)
+        time = try c.decode(String.self, forKey: .time)
+        foods = try c.decode(String.self, forKey: .foods)
+        note = try c.decode(String.self, forKey: .note)
+        template = try c.decode(String.self, forKey: .template)
+        calories = try c.decode(Double.self, forKey: .calories)
+        proteinG = try c.decode(Double.self, forKey: .proteinG)
+        carbsG = try c.decode(Double.self, forKey: .carbsG)
+        fatG = try c.decode(Double.self, forKey: .fatG)
+        photoUrl = try c.decodeIfPresent(String.self, forKey: .photoUrl)
+        edited = try c.decodeIfPresent(Bool.self, forKey: .edited) ?? false
+        items = try c.decode([MealItem].self, forKey: .items)
     }
 }
 
