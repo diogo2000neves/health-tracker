@@ -212,6 +212,18 @@ def _parse_items(raw: Any) -> List[Dict[str, Any]]:
     return parsed if isinstance(parsed, list) else []
 
 
+def _has_any_nutrients(meal: Dict[str, Any]) -> bool:
+    """True when any per-ingredient item carries a non-zero micronutrient — so that
+    zero-macro supplements (magnesium, vitamins, ...) survive the content filter and
+    contribute their micronutrients to the daily roll-up."""
+    for item in _parse_items(meal.get("items")):
+        nutrients = item.get("nutrients") or {}
+        for v in nutrients.values():
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+                return True
+    return False
+
+
 def daily_nutrition(meals: List[Dict[str, Any]], start: Optional[str],
                     cutoff_hour: int = DAY_CUTOFF_HOUR,
                     in_progress_day: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
@@ -246,8 +258,8 @@ def daily_nutrition(meals: List[Dict[str, Any]], start: Optional[str],
         if str(meal.get("foods") or "").strip().lower() in NON_MEALS:
             continue
         macros = {k: _num(meal.get(mk)) for k, mk in macro_fields.items()}
-        if max(macros.values()) <= 0:
-            continue  # zero-content rows carry no signal
+        if max(macros.values()) <= 0 and not _has_any_nutrients(meal):
+            continue  # zero-content rows carry no signal — unless they have micronutrients
         for k, v in macros.items():
             totals[day][k] += v
         for item in _parse_items(meal.get("items")):

@@ -94,7 +94,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import google.auth
-from flask import Flask, jsonify, request
+from flask import Flask, Response, abort, jsonify, request
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
@@ -1168,7 +1168,7 @@ def _day_totals(meal_rows: List[Dict[str, Any]]) -> Dict[str, float]:
         if str(row.get("foods") or "").strip().lower() in NON_MEALS:
             continue
         macros = {k: _round_num(row.get(k)) for k in totals}
-        if max(macros.values()) <= 0:
+        if max(macros.values()) <= 0 and not _has_any_nutrients(row):
             continue
         for k, v in macros.items():
             totals[k] += v
@@ -1177,6 +1177,18 @@ def _day_totals(meal_rows: List[Dict[str, Any]]) -> Dict[str, float]:
 
 def _is_stub(row: Dict[str, Any]) -> bool:
     return str(row.get("foods") or "").strip().lower() in NON_MEALS
+
+
+def _has_any_nutrients(row: Dict[str, Any]) -> bool:
+    """True when any per-ingredient item carries a non-zero micronutrient — so that
+    zero-macro supplements (magnesium, vitamins, ...) survive the content filter and
+    appear in the app and daily roll-up."""
+    for item in _parse_items_cell(row.get("items")):
+        nutrients = item.get("nutrients") or {}
+        for v in nutrients.values():
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+                return True
+    return False
 
 
 def _exact_duplicate(image_sha: str, note: str,
@@ -1556,7 +1568,15 @@ def archive_photos(images: List[Tuple[bytes, str]],
                                          resumable=False),
             fields="id,webViewLink",
         ))
-        out.append({"id": created.get("id", ""),
+        # Make the file publicly viewable so the iOS app can display it directly
+        # via thumbnail URL (no auth required). File IDs are random UUIDs, so
+        # this is effectively private-by-obscurity for meal photos.
+        fid = created.get("id", "")
+        if fid:
+            _execute(lambda fid=fid: _drive().permissions().create(
+                fileId=fid, body={"type": "anyone", "role": "reader"},
+            ))
+        out.append({"id": fid,
                     "url": created.get("webViewLink", ""), "mime": mime})
     return out
 
@@ -2194,7 +2214,7 @@ def _todays_consumed(rows: List[Dict[str, Any]]) -> Dict[str, float]:
         if _is_stub(row):
             continue
         macros = {k: _round_num(row.get(k)) for k in macro_keys}
-        if max(macros.values()) <= 0:
+        if max(macros.values()) <= 0 and not _has_any_nutrients(row):
             continue
         for k in macro_keys:
             totals[k] += macros[k]
@@ -2251,7 +2271,7 @@ def _today_meals_out(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if _is_stub(row):
             continue
         macros = {k: _round_num(row.get(k)) for k in macro_keys}
-        if max(macros.values()) <= 0:
+        if max(macros.values()) <= 0 and not _has_any_nutrients(row):
             continue
         when = str(row.get("datetime") or "")
         out.append({
@@ -2458,6 +2478,20 @@ def _extract_note() -> str:
 @app.get("/")
 def health():
     return "ok", 200
+
+
+@app.get("/meal-photo/<file_id>")
+def meal_photo(file_id: str):
+    """Proxy a meal photo from Drive so the iOS app's AsyncImage can display
+    it without needing to authenticate against Google directly."""
+    try:
+        meta = _execute(lambda fid=file_id: _drive().files().get(
+            fileId=fid, fields="mimeType"))
+        data = _execute(lambda fid=file_id: _drive().files().get_media(
+            fileId=fid))
+        return Response(data, mimetype=meta.get("mimeType", "image/jpeg"))
+    except Exception:
+        abort(404)
 
 
 def _resolve_templates(nut: Dict[str, Any], note: str, when: datetime,
@@ -2971,7 +3005,7 @@ def meals():
         if _is_stub(r):
             continue
         macros = {k: _round_num(r.get(k)) for k in macro_keys}
-        if max(macros.values()) <= 0:  # empty/zero row — as the totals treat it
+        if max(macros.values()) <= 0 and not _has_any_nutrients(r):
             continue
         when = str(r.get("datetime") or "")
         meals_out.append({

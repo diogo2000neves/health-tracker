@@ -138,8 +138,13 @@ struct TodayMeal: Decodable, Identifiable, Hashable {
     var id: String { datetime }
 
     /// Space-separated photo URLs from the backend (one per image uploaded).
+    /// Google Drive webViewLinks are converted to direct thumbnail URLs
+    /// so AsyncImage can render them.
     var photoURLs: [URL] {
-        (photoUrl ?? "").split(separator: " ").compactMap { URL(string: String($0)) }
+        (photoUrl ?? "").split(separator: " ").compactMap { piece in
+            guard let url = URL(string: String(piece)) else { return nil }
+            return url.driveThumbnailURL ?? url
+        }
     }
 
     enum CodingKeys: String, CodingKey {
@@ -198,5 +203,23 @@ struct MealItem: Decodable, Hashable, Identifiable {
         fatG = try c.decodeIfPresent(Double.self, forKey: .fatG) ?? 0
         // `nutrients` is omitted for a trace-free food — default to empty.
         nutrients = try c.decodeIfPresent([String: Double].self, forKey: .nutrients) ?? [:]
+    }
+}
+
+// MARK: - Backend photo proxy URL conversion
+
+private extension URL {
+    /// Converts a Google Drive webViewLink
+    /// (https://drive.google.com/file/d/FILE_ID/view) to a backend proxy URL
+    /// that AsyncImage can render without Google Drive auth.
+    var driveThumbnailURL: URL? {
+        let components = pathComponents
+        guard components.count >= 3,
+              let dIndex = components.firstIndex(of: "d"),
+              dIndex + 1 < components.count
+        else { return nil }
+        return Config.baseURL
+            .appending(path: "meal-photo")
+            .appending(path: components[dIndex + 1])
     }
 }
