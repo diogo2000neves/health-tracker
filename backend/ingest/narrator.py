@@ -42,8 +42,11 @@ log = logging.getLogger("narrator")
 
 # -- config --------------------------------------------------------------------
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_NARRATOR_MODEL", "gemini-2.0-flash")
-GEMINI_CRITIC_MODEL = os.environ.get("GEMINI_CRITIC_MODEL", "gemini-2.0-flash")
+# Default to the same model family the existing audit pipeline uses — the project's
+# Gemini API plan has quota for `gemini-3.6-flash` but **not** for `gemini-2.0-flash`
+# (that family is on a separate free-tier quota that was exhausted). Overridable.
+GEMINI_MODEL = os.environ.get("GEMINI_NARRATOR_MODEL", "gemini-3.6-flash")
+GEMINI_CRITIC_MODEL = os.environ.get("GEMINI_CRITIC_MODEL", "gemini-3.6-flash")
 GEMINI_TIMEOUT_S = int(os.environ.get("GEMINI_TIMEOUT_S", "90"))
 
 

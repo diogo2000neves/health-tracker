@@ -27,7 +27,7 @@ generates 3 appropriate plates. Portion *ranges* come from the backend
 (`portion_range`), never the model.
 
 **Required:** `GEMINI_API_KEY` env var on the backend. Model configurable via
-`GEMINI_NARRATOR_MODEL` (default `gemini-2.0-flash`).
+`GEMINI_NARRATOR_MODEL` (default `gemini-3.6-flash`).
 
 ### 2. Local script (automation fallback)
 

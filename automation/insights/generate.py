@@ -69,7 +69,7 @@ INGEST_TOKEN = os.environ.get("INGEST_TOKEN", "")
 
 # Gemini config — same env vars the backend narrator uses.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_NARRATOR_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_NARRATOR_MODEL", "gemini-3.6-flash")
 
 WEEKLY_TAB = "weekly_reports"
 NEXT_MEAL_TAB = "next_meal"
