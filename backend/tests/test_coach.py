@@ -835,3 +835,31 @@ class TestCoachEndpoints:
                                body="Corpo.")
         merged = feed_mod.merge_cards([weekly], [fresh], now=later)
         assert {c["kind"] for c in merged} == {"weekly_review", "check_in"}
+
+
+# -- quota handling ------------------------------------------------------------
+# The coach shares a free-tier allowance with the meal-analysis pipeline, so a 429 is
+# routine. It must read as "ask again shortly", never as an empty feed.
+
+import narrator                                                  # noqa: E402
+
+
+class TestQuota:
+    def test_the_wait_comes_from_the_api_not_a_guess(self):
+        detail = ('{"error": {"code": 429, "message": "Quota exceeded ... '
+                  'Please retry in 26.929601479s."}}')
+        assert narrator._retry_delay_s(detail, 0) == pytest.approx(27.93, abs=0.01)
+
+    def test_the_wait_is_capped(self):
+        assert narrator._retry_delay_s("Please retry in 600s.", 0) == \
+            narrator.QUOTA_MAX_WAIT_S
+
+    def test_a_message_without_a_hint_backs_off(self):
+        first = narrator._retry_delay_s("no hint here", 0)
+        second = narrator._retry_delay_s("no hint here", 1)
+        assert second > first
+
+    def test_a_quota_error_is_distinguishable_from_a_real_failure(self):
+        """`coach_generate` turns this one into a 503 so the queue retries, and every
+        other failure into a quiet, non-retried degradation."""
+        assert issubclass(narrator.GeminiQuotaError, narrator.GeminiError)

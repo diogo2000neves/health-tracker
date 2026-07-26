@@ -3963,15 +3963,30 @@ def coach_generate():
         state = store.read_state()
         existing = _read_feed_cards(now)
 
+        # A 429 from the shared free-tier quota is a "come back shortly", not a
+        # failure. `generate_cards` deliberately swallows model errors so one dead
+        # call can't take the whole feed down with it, so the reason is recorded here
+        # and turned into a 5xx below — which is what makes Cloud Tasks and Cloud
+        # Scheduler retry instead of leaving the user with a silently empty feed.
+        out_of_quota = {"hit": False}
+
         def narrate(facts: Dict[str, Any]) -> Dict[str, Any]:
             facts["memory"] = memory_mod.for_prompt(memory)
-            return narrator.narrate_cards(facts)
+            try:
+                return narrator.narrate_cards(facts)
+            except narrator.GeminiQuotaError:
+                out_of_quota["hit"] = True
+                raise
 
         def plates() -> Dict[str, Any]:
             context = _next_meal_context(
                 now, profile=profile, today=today, consumed=consumed,
                 targets=targets, window_meals=window_meals, memory=memory)
-            return narrator.narrate_next_meal(context)
+            try:
+                return narrator.narrate_next_meal(context)
+            except narrator.GeminiQuotaError:
+                out_of_quota["hit"] = True
+                raise
 
         cards, shown = feed.generate_cards(
             slot=slot, now=now, profile=profile, today=today, nutrients=nutrients,
@@ -3983,6 +3998,11 @@ def coach_generate():
         if not cards:
             store.finish_job(job_id, now.isoformat(timespec="seconds"),
                              error="no cards produced")
+            if out_of_quota["hit"]:
+                # 5xx so the caller (Cloud Tasks / Cloud Scheduler) tries again once
+                # the per-minute window rolls over.
+                return jsonify({"status": "quota", "slot": slot,
+                                "error": "Gemini quota exhausted; retry later"}), 503
             return jsonify({"status": "empty", "slot": slot,
                             "days_logged": profile.get("days_logged")}), 200
 

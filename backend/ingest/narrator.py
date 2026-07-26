@@ -49,6 +49,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
@@ -57,18 +59,36 @@ log = logging.getLogger("narrator")
 
 # -- config --------------------------------------------------------------------
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-# Default to the same model family the existing audit pipeline uses — the project's
-# Gemini API plan has quota for `gemini-3.6-flash` but **not** for `gemini-2.0-flash`
-# (that family is on a separate free-tier quota that was exhausted). Overridable.
-GEMINI_MODEL = os.environ.get("GEMINI_NARRATOR_MODEL", "gemini-3.6-flash")
-GEMINI_CRITIC_MODEL = os.environ.get("GEMINI_CRITIC_MODEL", "gemini-3.6-flash")
+# Free-tier quota is per model family and is shared with the meal-analysis pipeline,
+# so the right default is simply "whichever family still has allowance". As of
+# 2026-07-26 `gemini-3.6-flash`, `gemini-2.0-flash` and `gemini-flash-latest` all
+# answer 429 for this key while `gemini-3-flash-preview` has room. Overridable per
+# environment, which is the intended way to move it when this changes again.
+GEMINI_MODEL = os.environ.get("GEMINI_NARRATOR_MODEL", "gemini-3-flash-preview")
+GEMINI_CRITIC_MODEL = os.environ.get("GEMINI_CRITIC_MODEL", "gemini-3-flash-preview")
 GEMINI_TIMEOUT_S = int(os.environ.get("GEMINI_TIMEOUT_S", "90"))
+# How many times to wait out a 429 before giving up. Two is enough for the free
+# tier's per-minute window without letting one generation sit on a worker for
+# minutes — anything worse than that is better handled by the queue retrying later.
+QUOTA_RETRIES = int(os.environ.get("GEMINI_QUOTA_RETRIES", "2"))
+# Cap on how long a single 429 wait may be, whatever the API asks for.
+QUOTA_MAX_WAIT_S = 45.0
 
 
 # -- Gemini API transport ------------------------------------------------------
 
 class GeminiError(RuntimeError):
     """Any transport/parse failure. Callers catch this and degrade gracefully."""
+
+
+class GeminiQuotaError(GeminiError):
+    """The API said 429 — we are inside the free tier's per-minute allowance.
+
+    Worth its own type because it means "ask again shortly", not "this failed".
+    The caller turns it into a retry rather than an empty feed: the coach shares its
+    quota with the meal-analysis pipeline, so a burst of logged meals can easily push
+    a scheduled generation over the limit for a few seconds.
+    """
 
 
 def call_gemini(prompt: str, *, require_key: str = "headline",
@@ -110,18 +130,31 @@ def call_gemini(prompt: str, *, require_key: str = "headline",
         ],
     }
 
+    # The free tier allows a small number of requests per minute, and the coach shares
+    # that allowance with the meal-analysis pipeline — so a 429 is a routine "wait a
+    # moment", not a failure. The API tells us how long to wait; honour it once or
+    # twice rather than dropping the generation on the floor.
     raw = None
-    try:
-        req = urllib.request.Request(
-            url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"},
-            method="POST")
-        with urllib.request.urlopen(req, timeout=to) as resp:
-            raw = json.loads(resp.read().decode())
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode(errors="replace")[:500]
-        raise GeminiError(f"Gemini HTTP {exc.code}: {detail}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise GeminiError(f"Gemini transport error: {exc}") from exc
+    for attempt in range(QUOTA_RETRIES + 1):
+        try:
+            req = urllib.request.Request(
+                url, data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=to) as resp:
+                raw = json.loads(resp.read().decode())
+            break
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")[:500]
+            if exc.code == 429:
+                if attempt >= QUOTA_RETRIES:
+                    raise GeminiQuotaError(f"Gemini quota exhausted: {detail}") from exc
+                delay = _retry_delay_s(detail, attempt)
+                log.info("Gemini quota hit; retrying in %.1fs", delay)
+                time.sleep(delay)
+                continue
+            raise GeminiError(f"Gemini HTTP {exc.code}: {detail}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise GeminiError(f"Gemini transport error: {exc}") from exc
 
     # Extract the response text.
     try:
@@ -136,6 +169,22 @@ def call_gemini(prompt: str, *, require_key: str = "headline",
         raise GeminiError(str(exc)) from exc
 
     return obj
+
+
+def _retry_delay_s(detail: str, attempt: int) -> float:
+    """How long to wait after a 429.
+
+    The API's own message carries the answer ("Please retry in 26.9s"), which beats
+    guessing — a blind exponential backoff either wakes up too early and burns another
+    request, or sleeps far longer than the window actually needs.
+    """
+    match = re.search(r"retry in ([0-9.]+)s", detail)
+    if match:
+        try:
+            return min(float(match.group(1)) + 1.0, QUOTA_MAX_WAIT_S)
+        except ValueError:
+            pass
+    return min(5.0 * (2 ** attempt), QUOTA_MAX_WAIT_S)
 
 
 def _extract_json(text: str, require_key: str) -> Dict[str, Any]:
