@@ -493,3 +493,255 @@ func coachRelativeTime(_ raw: String?) -> String? {
     let days = Int(seconds / 86_400)
     return days <= 1 ? "ontem" : "há \(days) dias"
 }
+
+// MARK: - History and reports
+//
+// The feed is deliberately forgetful; the archive is not. These are the shapes the
+// history screen reads — everything the coach has said, noticed and reviewed, so the
+// saved data is inspectable by the user and not only by the model.
+
+struct CoachHistory: Decodable {
+    let from: String
+    let to: String
+    let count: Int
+    let entries: [CoachHistoryEntry]
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        from = try c.decodeIfPresent(String.self, forKey: .from) ?? ""
+        to = try c.decodeIfPresent(String.self, forKey: .to) ?? ""
+        count = try c.decodeIfPresent(Int.self, forKey: .count) ?? 0
+        entries = try c.decodeIfPresent([CoachHistoryEntry].self, forKey: .entries) ?? []
+    }
+
+    enum CodingKeys: String, CodingKey { case from, to, count, entries }
+}
+
+struct CoachHistoryEntry: Decodable, Identifiable, Hashable {
+    let id: String
+    let kind: String
+    let date: String
+    let at: String
+    let summary: String
+    let body: String
+    let importance: Double
+
+    /// pt-PT label for what this entry is.
+    var kindLabel: String {
+        switch kind {
+        case "card": return "Conselho"
+        case "chat": return "Conversa"
+        case "event": return "Aconteceu"
+        case "report": return "Revisão"
+        default: return "Registo"
+        }
+    }
+
+    var icon: String {
+        switch kind {
+        case "card": return "sparkles"
+        case "chat": return "bubble.left.and.text.bubble.right.fill"
+        case "event": return "calendar.badge.exclamationmark"
+        case "report": return "doc.text.fill"
+        default: return "circle"
+        }
+    }
+
+    var tint: Color {
+        switch kind {
+        case "event": return Palette.warningText
+        case "report": return Palette.protein
+        case "chat": return Palette.goodText
+        default: return Palette.accentText
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        kind = try c.decodeIfPresent(String.self, forKey: .kind) ?? ""
+        date = try c.decodeIfPresent(String.self, forKey: .date) ?? ""
+        at = try c.decodeIfPresent(String.self, forKey: .at) ?? ""
+        summary = try c.decodeIfPresent(String.self, forKey: .summary) ?? ""
+        body = try c.decodeIfPresent(String.self, forKey: .body) ?? ""
+        importance = try c.decodeIfPresent(Double.self, forKey: .importance) ?? 0
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, kind, date, at, summary, body, importance
+    }
+}
+
+/// A stored weekly, monthly or yearly review. The card in the feed is the doorway;
+/// this is the whole thing.
+struct CoachReport: Decodable, Identifiable, Hashable {
+    let period: String
+    let key: String
+    let headline: String
+    let summary: String
+    let wins: [CoachReportWin]
+    let focus: CoachReportFocus?
+    let mealReviews: [CoachMealReview]
+    let events: [CoachReportEvent]
+    let adviceReview: CoachAdviceReview?
+    let arc: [CoachArcStep]
+    let numbers: [String: String]
+    let source: String?
+
+    var id: String { "\(period):\(key)" }
+
+    var periodLabel: String {
+        switch period {
+        case "weekly": return "Semana de \(shortDate(key))"
+        case "monthly": return "Mês de \(key)"
+        case "yearly": return key
+        default: return key
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        period = try c.decodeIfPresent(String.self, forKey: .period) ?? "weekly"
+        key = try c.decodeIfPresent(String.self, forKey: .key) ?? ""
+        headline = try c.decodeIfPresent(String.self, forKey: .headline) ?? ""
+        summary = try c.decodeIfPresent(String.self, forKey: .summary) ?? ""
+        wins = try c.decodeIfPresent([CoachReportWin].self, forKey: .wins) ?? []
+        focus = try c.decodeIfPresent(CoachReportFocus.self, forKey: .focus)
+        mealReviews = try c.decodeIfPresent([CoachMealReview].self,
+                                            forKey: .mealReviews) ?? []
+        events = try c.decodeIfPresent([CoachReportEvent].self, forKey: .events) ?? []
+        adviceReview = try c.decodeIfPresent(CoachAdviceReview.self,
+                                             forKey: .adviceReview)
+        arc = try c.decodeIfPresent([CoachArcStep].self, forKey: .arc) ?? []
+        numbers = try c.decodeIfPresent([String: String].self, forKey: .numbers) ?? [:]
+        source = try c.decodeIfPresent(String.self, forKey: .source)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case period, key, headline, summary, wins, focus, events, arc, numbers, source
+        case mealReviews = "meal_reviews"
+        case adviceReview = "advice_review"
+    }
+}
+
+struct CoachReportsList: Decodable {
+    let period: String
+    let reports: [CoachReport]
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        period = try c.decodeIfPresent(String.self, forKey: .period) ?? "weekly"
+        reports = try c.decodeIfPresent([CoachReport].self, forKey: .reports) ?? []
+    }
+
+    enum CodingKeys: String, CodingKey { case period, reports }
+}
+
+struct CoachReportWin: Decodable, Identifiable, Hashable {
+    let title: String
+    let detail: String
+    var id: String { title + detail }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
+        detail = try c.decodeIfPresent(String.self, forKey: .detail) ?? ""
+    }
+
+    enum CodingKeys: String, CodingKey { case title, detail }
+}
+
+struct CoachReportFocus: Decodable, Hashable {
+    let label: String
+    let why: String
+    let how: String
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        label = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
+        why = try c.decodeIfPresent(String.self, forKey: .why) ?? ""
+        how = try c.decodeIfPresent(String.self, forKey: .how) ?? ""
+    }
+
+    enum CodingKeys: String, CodingKey { case label, why, how }
+}
+
+struct CoachMealReview: Decodable, Identifiable, Hashable {
+    let what: String
+    let verdict: String
+    let why: String
+    var id: String { what + verdict }
+
+    var color: Color {
+        switch verdict {
+        case "good": return Palette.goodText
+        case "poor": return Palette.criticalText
+        default: return Palette.warningText
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        what = try c.decodeIfPresent(String.self, forKey: .what) ?? ""
+        verdict = try c.decodeIfPresent(String.self, forKey: .verdict) ?? "mixed"
+        why = try c.decodeIfPresent(String.self, forKey: .why) ?? ""
+    }
+
+    enum CodingKeys: String, CodingKey { case what, verdict, why }
+}
+
+struct CoachReportEvent: Decodable, Identifiable, Hashable {
+    let what: String
+    let take: String
+    var id: String { what }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        what = try c.decodeIfPresent(String.self, forKey: .what) ?? ""
+        take = try c.decodeIfPresent(String.self, forKey: .take) ?? ""
+    }
+
+    enum CodingKeys: String, CodingKey { case what, take }
+}
+
+struct CoachAdviceReview: Decodable, Hashable {
+    let landed: [String]
+    let ignored: [String]
+    let note: String
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        landed = try c.decodeIfPresent([String].self, forKey: .landed) ?? []
+        ignored = try c.decodeIfPresent([String].self, forKey: .ignored) ?? []
+        note = try c.decodeIfPresent(String.self, forKey: .note) ?? ""
+    }
+
+    enum CodingKeys: String, CodingKey { case landed, ignored, note }
+}
+
+struct CoachArcStep: Decodable, Identifiable, Hashable {
+    let when: String
+    let what: String
+    var id: String { when + what }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        when = try c.decodeIfPresent(String.self, forKey: .when) ?? ""
+        what = try c.decodeIfPresent(String.self, forKey: .what) ?? ""
+    }
+
+    enum CodingKeys: String, CodingKey { case when, what }
+}
+
+/// A short pt-PT date, e.g. "20 jul".
+func shortDate(_ iso: String) -> String {
+    let parser = DateFormatter()
+    parser.calendar = Calendar(identifier: .gregorian)
+    parser.locale = Locale(identifier: "en_US_POSIX")
+    parser.dateFormat = "yyyy-MM-dd"
+    guard let date = parser.date(from: iso) else { return iso }
+    let out = DateFormatter()
+    out.locale = Locale(identifier: "pt_PT")
+    out.dateFormat = "d MMM"
+    return out.string(from: date)
+}

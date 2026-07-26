@@ -23,6 +23,7 @@ struct CoachView: View {
     let store: CoachStore
     @State private var chatCard: CoachCard?
     @State private var showMemory = false
+    @State private var showHistory = false
 
     var body: some View {
         NavigationStack {
@@ -45,12 +46,21 @@ struct CoachView: View {
                     ToolbarItem(placement: .topBarTrailing) { SyncIndicator() }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showMemory = true
+                    Menu {
+                        Button {
+                            showHistory = true
+                        } label: {
+                            Label("Histórico e revisões", systemImage: "clock.arrow.circlepath")
+                        }
+                        Button {
+                            showMemory = true
+                        } label: {
+                            Label("O que sei de ti", systemImage: "brain")
+                        }
                     } label: {
-                        Image(systemName: "brain")
+                        Image(systemName: "ellipsis.circle")
                     }
-                    .accessibilityLabel("O que o coach sabe de ti")
+                    .accessibilityLabel("Mais")
                 }
             }
             .refreshable { await store.load(force: true) }
@@ -63,6 +73,9 @@ struct CoachView: View {
             }
             .sheet(isPresented: $showMemory) {
                 CoachMemoryView(store: CoachMemoryStore())
+            }
+            .sheet(isPresented: $showHistory) {
+                CoachHistoryView(store: CoachHistoryStore())
             }
         }
         .task { await store.load() }

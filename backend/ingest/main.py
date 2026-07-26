@@ -4618,7 +4618,12 @@ def coach_patterns():
 # one place in the coach where the reasoning is genuinely hard: correlating what was
 # advised against what was eaten, over weeks, and saying something true about the
 # direction of travel.
-COACH_REPORT_MODEL = os.environ.get("COACH_REPORT_MODEL", "claude-opus-5")
+# The ALIAS, not a pinned version. `claude-opus-5` is not resolvable by the
+# subscription CLI on this machine ("it may not exist or you may not have access"),
+# while `opus` resolves to whatever the best available Opus is — currently
+# claude-opus-4-8. Pinning a name the account cannot reach fails the job hard; the
+# alias follows the plan.
+COACH_REPORT_MODEL = os.environ.get("COACH_REPORT_MODEL", "opus")
 COACH_REPORT_EFFORT = os.environ.get("COACH_REPORT_EFFORT", "medium")
 
 

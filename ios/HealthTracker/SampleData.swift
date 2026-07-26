@@ -25,6 +25,10 @@ enum SampleData {
                                                  from: coachMemoryJSON())
     static let coachThread: CoachThread = decode(CoachThread.self,
                                                  from: coachThreadJSON())
+    static let coachHistory: CoachHistory = decode(CoachHistory.self,
+                                                   from: coachHistoryJSON())
+    static let coachReports: CoachReportsList = decode(CoachReportsList.self,
+                                                       from: coachReportsJSON())
 
     /// A plausible reply, so the chat can be exercised end to end without a backend.
     static func coachChatReply(message: String) -> CoachChatReply {
@@ -509,6 +513,62 @@ enum SampleData {
                     + "e leva 20 minutos.",
                  "at": "2026-07-25T21:04:05"],
             ],
+        ]
+    }
+
+    private static func coachHistoryJSON() -> [String: Any] {
+        [
+            "from": "2026-06-27", "to": "2026-07-27", "count": 4,
+            "entries": [
+                ["kind": "report", "id": "report:weekly:2026-07-20",
+                 "date": "2026-07-27", "at": "", "importance": 0.95,
+                 "summary": "A semana em que o peixe voltou à mesa", "body": ""],
+                ["kind": "event", "id": "event:2026-07-26:eaten_out:20:00",
+                 "date": "2026-07-26", "at": "20:00", "importance": 0.7,
+                 "summary": "mcdonald ao jantar — 1257 kcal numa refeição",
+                 "body": "Comi um menu médio Big Tasty do McDonalds."],
+                ["kind": "card", "id": "card:2026-07-26:pattern:red_meat",
+                 "date": "2026-07-26", "at": "21:26", "importance": 0.63,
+                 "summary": "A carne vermelha ainda pesa mais que o peixe",
+                 "body": "Esta semana levas 6.6 doses de carne vermelha."],
+                ["kind": "chat", "id": "chat:t-fish:21:04",
+                 "date": "2026-07-25", "at": "21:04", "importance": 0.65,
+                 "summary": "não gosto de peixe cozido",
+                 "body": "Fica anotado. Então vamos por assado ou na air fryer."],
+            ],
+        ]
+    }
+
+    private static func coachReportsJSON() -> [String: Any] {
+        [
+            "period": "weekly",
+            "reports": [[
+                "period": "weekly", "key": "2026-07-20", "source": "claude-opus-5",
+                "headline": "A semana em que o peixe voltou à mesa, e o jantar continuou a ser o ponto fraco",
+                "summary": "Sete dias registados, o peixe apareceu duas vezes depois de "
+                    + "duas semanas a zero — e foste tu a escolher, não eu a insistir. "
+                    + "Os almoços continuam a ser a tua melhor refeição. Os jantares "
+                    + "seguem presos ao mesmo par: fritos e carne.",
+                "wins": [["title": "O peixe voltou",
+                          "detail": "Bacalhau à segunda e pregado ao domingo."]],
+                "focus": ["label": "Um jantar com legumes, três vezes",
+                          "why": "Cinco dos sete jantares não levaram nada verde.",
+                          "how": "Começa pelo mais fácil: salada ao lado do que já ias comer."],
+                "meal_reviews": [
+                    ["what": "Pequeno-almoço (aveia + whey)", "verdict": "good",
+                     "why": "Constante e com proteína suficiente todos os dias."],
+                    ["what": "Jantares", "verdict": "poor",
+                     "why": "Batata frita em quatro dos sete."],
+                ],
+                "advice_review": [
+                    "landed": ["Trocar o bife por bacalhau ao jantar"],
+                    "ignored": ["Legumes ao jantar"],
+                    "note": "A troca de proteína pegou; a dos acompanhamentos não.",
+                ],
+                "events": [["what": "Sexta com bebidas e McDonald's à noite",
+                            "take": "Uma noite assim por semana não desfaz o resto."]],
+                "numbers": ["proteína média": "138 g/dia", "peixe": "2x"],
+            ]],
         ]
     }
 

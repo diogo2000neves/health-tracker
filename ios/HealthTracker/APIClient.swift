@@ -99,6 +99,27 @@ struct APIClient {
                               timeout: 60)
     }
 
+    /// Everything the coach has said, noticed and reviewed. Keeping all of it is the
+    /// point of the archive; the history screen is how a human checks that it is
+    /// really being kept.
+    func coachHistory(from: String? = nil, to: String? = nil,
+                      kinds: String? = nil) async throws -> CoachHistory {
+        if useSampleData { return SampleData.coachHistory }
+        var query: [URLQueryItem] = []
+        if let from { query.append(URLQueryItem(name: "from", value: from)) }
+        if let to { query.append(URLQueryItem(name: "to", value: to)) }
+        if let kinds { query.append(URLQueryItem(name: "kinds", value: kinds)) }
+        return try await get("coach/history", query: query, cacheAs: "coach_history")
+    }
+
+    /// Past weekly / monthly / yearly reviews, newest first.
+    func coachReports(period: String) async throws -> CoachReportsList {
+        if useSampleData { return SampleData.coachReports }
+        return try await get("coach/reports",
+                             query: [URLQueryItem(name: "period", value: period)],
+                             cacheAs: "coach_reports_\(period)")
+    }
+
     /// What the coach remembers about the user.
     func coachMemory() async throws -> CoachMemory {
         if useSampleData { return SampleData.coachMemory }
@@ -158,6 +179,15 @@ struct APIClient {
 
     func cachedCoachThread(id: String) -> CoachThread? {
         useSampleData ? nil : DiskCache.load(CoachThread.self, as: "coach_thread_\(id)")
+    }
+
+    func cachedCoachHistory() -> CoachHistory? {
+        useSampleData ? nil : DiskCache.load(CoachHistory.self, as: "coach_history")
+    }
+
+    func cachedCoachReports(period: String) -> CoachReportsList? {
+        useSampleData ? nil : DiskCache.load(CoachReportsList.self,
+                                             as: "coach_reports_\(period)")
     }
 
     func cachedCoachMemory() -> CoachMemory? {

@@ -32,7 +32,11 @@ facts lead with food.
 | `ingest/coach_feed.py` | Which cards a slot produces, dedup and cooldown, card ids/expiry/priority, and the validation that a swap references real logged food. |
 | `ingest/coach_memory.py` | What the coach remembers between conversations: merge, dedup by meaning, bound, prune. |
 | `ingest/narrator.py` | The prompts — one for the whole feed, plus chat and memory extraction — and the Gemini transport. Prose only; never arithmetic, never food selection. |
-| `automation/coach/worker.py` | The Mac side: claims a job, answers it with Sonnet, posts it back. No nutrition logic. |
+| `ingest/coach_archive.py` | Append-only JSONL of every card, chat turn, event and report, sharded by month. Nothing is ever deleted or modified. |
+| `ingest/coach_events.py` | The occasions — drinking, eating out, an outsized day — and the user's own meal notes. |
+| `ingest/coach_recall.py` | Ranks the archive by relevance/recency/importance and clips each prompt section to a token budget. |
+| `ingest/coach_reports.py` | The weekly / monthly / yearly rollups and their prompts. |
+| `automation/coach/worker.py` | The Mac side: claims a job, answers it with Sonnet (or Opus for reports), posts it back. No nutrition logic. |
 
 ### Canonicalisation is what made food-level advice possible
 
@@ -75,6 +79,51 @@ is not fussiness — the first live run had Read/Write available, did 238 s of g
 work, wrote the JSON to a file and returned a prose summary, so the caller found no
 answer at all. A prompt that needs no tools is given none.
 
+## Memory
+
+Everything the coach produces is kept, and almost none of it is in any given prompt.
+Those two sentences are the whole design.
+
+**Four tiers.** The *working* set (who this person is) is small, stable and always
+present. The *episodic* archive (every card, conversation, event) is append-only and
+never injected wholesale — it is queried. The *semantic* tier is the weekly/monthly/
+yearly rollups, each summarising the level below. Retrieval assembles the last two
+into a budget for each generation.
+
+**Retrieval, not injection.** `coach_recall` scores memories the way the Generative
+Agents memory stream does — relevance, recency, importance — with one deliberate
+departure: relevance is exact topic-key overlap rather than embedding similarity.
+Those systems need fuzzy matching because their memories are unstructured chat; these
+carry typed keys (`alcohol`, `red_meat`, `swap_from:ham`, `finding:group_over:red_meat`),
+and "what did you tell me last time I drank" is a structured query. That matters
+because the [MemTier](https://arxiv.org/html/2605.03675) work found retrieval — not
+model size — to be the binding constraint, measuring multi-session recall@2 at 0.038:
+the needed memory was absent from the top results 96% of the time. Exact matching over
+typed entries is, for this domain, close to their oracle.
+
+**A budget, enforced.** Every section has a token allowance
+(`coach_recall.BUDGET`), and items are dropped whole rather than truncated — half a
+memory is worse than none, because the model can't tell which half is missing. A quiet
+Tuesday retrieves almost nothing and costs almost nothing; a Friday with drinks in it
+pulls up what happened last time and what was advised then.
+
+**Hierarchy is what makes a year affordable.** A weekly report reads the week whole.
+A monthly reads four or five weeklies. A yearly reads twelve monthlies. The prompt for
+any report stays about a page no matter how much history exists, which is the
+difference between keeping everything and drowning in it.
+
+## Occasions, and the user's own words
+
+The meal log carries a free-text note ("Comi um menu médio Big Tasty do McDonalds",
+"Exagerei hoje") that the first version never showed the model at all — the items said
+"burger, fries, iced tea" and the context the user had already supplied was thrown
+away. `coach_events` now reads it, and detects the occasions averages destroy: a night
+out is one event, not eight beers spread across a weekly mean.
+
+Drinks are counted as *drinks*, not gram-servings. A 40 ml shot is a sixth of a 330 ml
+beer by weight and the same thing socially, so serving-weight arithmetic scored eight
+shots as a quiet evening.
+
 ## When it runs
 
 Generation follows when the user actually eats, not the clock:
@@ -83,7 +132,9 @@ Generation follows when the user actually eats, not the clock:
 | --- | --- |
 | a logged meal | schedules a run **one hour later**; another meal within that hour pushes it back, so the analysis lands when the meal is genuinely over |
 | `coach-morning` | 07:30 — the day plan, before anything has been logged to trigger on |
-| `coach-weekly` | Sunday 09:00 — the week in review |
+| `coach-weekly` | Monday 10:00 — the week that just finished, on Opus |
+| `coach-monthly` | 1st of the month, 11:00 — reads the weeklies |
+| `coach-yearly` | 1 January, 12:00 — reads the monthlies |
 | `coach-sweep` | every 30 min — hands anything Sonnet hasn't taken in five hours to Gemini |
 | opening the app | only if the feed has nothing to say about the current part of the day |
 
