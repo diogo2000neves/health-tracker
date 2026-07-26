@@ -211,8 +211,23 @@ def _expires(kind: str, now: datetime) -> str:
 
 
 def _clip(text: Any, limit: int) -> str:
+    """Trim to `limit`, but never mid-sentence.
+
+    A hard character cut produced a live day summary that ended "Amanhã, o
+    pequeno-almoço e" — the model had written a good closing thought and the assembly
+    ate it. Falling back to the last complete sentence loses the tail honestly instead
+    of leaving a dangling clause on screen.
+    """
     out = " ".join(str(text or "").split())
-    return out[:limit].rstrip()
+    if len(out) <= limit:
+        return out
+    window = out[:limit]
+    cut = max(window.rfind(". "), window.rfind("! "), window.rfind("? "),
+              window.rfind("… "))
+    if cut > limit * 0.5:
+        return window[:cut + 1]
+    space = window.rfind(" ")
+    return (window[:space] if space > limit * 0.5 else window).rstrip() + "…"
 
 
 def _logged_food_names(profile: Dict[str, Any]) -> Dict[str, str]:
@@ -392,7 +407,9 @@ def assemble(answer: Dict[str, Any], *, slot: str, now: datetime,
         kind = str(entry.get("kind") or "").strip()
         ref = str(entry.get("ref") or "").strip()
         title = _clip(entry.get("title"), 70)
-        body = _clip(entry.get("body"), 700)
+        # Roomy on purpose: the day card is asked to judge each meal in turn, and the
+        # first live one ran to ~1000 characters of genuinely useful reading.
+        body = _clip(entry.get("body"), 1200)
         if not title or not body:
             continue
 

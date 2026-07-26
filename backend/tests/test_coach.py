@@ -1082,3 +1082,32 @@ class TestQuota:
         """`coach_generate` turns this one into a 503 so the queue retries, and every
         other failure into a quiet, non-retried degradation."""
         assert issubclass(narrator.GeminiQuotaError, narrator.GeminiError)
+
+
+class TestClipping:
+    """A live day summary once ended "Amanhã, o pequeno-almoço e" — the model wrote a
+    good closing thought and the assembly ate it."""
+
+    def test_short_text_is_untouched(self):
+        assert feed._clip("Uma frase curta.", 100) == "Uma frase curta."
+
+    def test_whitespace_is_collapsed(self):
+        assert feed._clip("duas   linhas\ne  espaços", 100) == "duas linhas e espaços"
+
+    def test_a_long_body_is_cut_at_a_sentence_end(self):
+        text = ("Primeira frase completa. Segunda frase completa. "
+                "Terceira frase que vai ser cortada a meio")
+        out = feed._clip(text, 55)
+        assert out.endswith(".")
+        assert "cortada" not in out
+
+    def test_text_with_no_sentence_break_is_cut_at_a_word(self):
+        out = feed._clip("palavra " * 40, 50)
+        assert out.endswith("…") and not out.endswith("palav…")
+
+    def test_the_day_card_has_room_for_a_real_reading(self):
+        profile = profile_from(a_week_of_meals())
+        body = ("Frase. " * 150).strip()
+        cards, _ = generate("evening", profile, an_answer(
+            [{"kind": "day_summary", "title": "T", "body": body}], plates=False))
+        assert len(cards[0]["body"]) > 700

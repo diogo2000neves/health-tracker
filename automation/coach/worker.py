@@ -84,7 +84,11 @@ def claim() -> Optional[Dict[str, Any]]:
     try:
         return _request("GET", f"/coach/work?worker={WORKER_NAME}")
     except urllib.error.HTTPError as exc:
-        log.error("claim failed: HTTP %s %s", exc.code, exc.read().decode()[:200])
+        # Collapse the body to one line: a Flask 404 is several lines of HTML, and a
+        # log the user reads to see whether the coach is alive shouldn't be a page of
+        # markup per poll.
+        detail = " ".join(exc.read().decode(errors="replace").split())[:160]
+        log.error("claim failed: HTTP %s %s", exc.code, detail)
     except Exception as exc:
         # No network, backend cold, laptop just woke up — all routine.
         log.info("claim unavailable: %s", exc)
