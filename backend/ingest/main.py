@@ -90,7 +90,7 @@ import ssl
 import time
 import math
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 import google.auth
@@ -3655,6 +3655,13 @@ def insights_next_meal_v2():
 # to mean something and short enough to describe how the user eats *now*.
 COACH_WINDOW_DAYS = 28
 
+# How far back memory retrieval looks. Ninety days is enough to recall "the last time
+# this happened" for anything seasonal without the read costing more than a few blobs
+# — the archive is sharded by month, so this is three reads at worst. Older material
+# reaches the model through the weekly and monthly reports instead, which is the point
+# of consolidating them.
+COACH_RECALL_DAYS = 90
+
 # A feed older than this asks the app to kick a background refresh when it opens.
 # Four hours is shorter than the gap between the scheduled slots on purpose: opening
 # the app at 13:00 should quietly refresh into something about lunch rather than still
@@ -3773,14 +3780,21 @@ def _coach_today(now: datetime, today_rows: List[Dict[str, Any]],
             if micros:
                 entry["nutrients"] = micros
             items.append(entry)
-        meals.append({
+        entry_meal = {
             "time": meal["datetime"][11:16],
             "slot": patterns.SLOT_LABELS.get(meal["slot"], meal["slot"]),
             "calories": round(meal["calories"]),
             "protein_g": round(meal["protein_g"], 1),
             "food_groups": meal["groups"],
             "items": items,
-        })
+        }
+        # The user's own words, when there are any. This is the difference between
+        # "hambúrguer, batatas fritas e chá gelado" and "comi um menu médio Big Tasty
+        # do McDonalds" — the second is context the user supplied and the coach spent
+        # its first week never seeing.
+        if meal.get("note"):
+            entry_meal["your_note"] = meal["note"]
+        meals.append(entry_meal)
 
     return {
         "date": now.date().isoformat(),
@@ -4077,6 +4091,37 @@ def coach_generate():
                     "waiting_for": "sonnet"}), 202
 
 
+def _coach_memory_context(now: datetime, *, profile: Dict[str, Any],
+                          today: Dict[str, Any],
+                          events: Sequence[Dict[str, Any]],
+                          memory: Dict[str, Any],
+                          findings: Sequence[Dict[str, Any]] = ()) -> Dict[str, Any]:
+    """The bounded slice of history this generation should see.
+
+    Never the whole archive. `coach_recall` ranks by relevance to what happened today,
+    then recency, then importance, and clips each section to a token budget — so a day
+    with drinks in it recalls previous drinking and what was advised then, and a
+    nothing-special Tuesday recalls almost nothing and costs almost nothing.
+    """
+    archive = _coach("coach_archive")
+    recall = _coach("coach_recall")
+    memory_mod = _coach("coach_memory")
+
+    day_iso = now.date().isoformat()
+    lookback = (now.date() - timedelta(days=COACH_RECALL_DAYS)).isoformat()
+    topics = recall.query_topics_for(profile=profile, today=today, events=events,
+                                     findings=findings)
+    entries = archive.read_range(lookback, day_iso)
+    recent_cards = [e for e in entries if e.get("kind") == "card"][-8:]
+    reports = (archive.recent_reports("weekly", before="9999", limit=1)
+               + archive.recent_reports("monthly", before="9999", limit=1))
+
+    return recall.assemble(
+        today_iso=day_iso, profile_facts=memory_mod.for_prompt(memory),
+        recent_cards=recent_cards, archive=entries, events=events,
+        reports=reports, query_topics=topics)
+
+
 def _build_generation_job(now: datetime, *, slot: str,
                           reason: str) -> Optional[Dict[str, Any]]:
     """The deterministic half of a generation: every fact, and the prompt built from
@@ -4105,6 +4150,20 @@ def _build_generation_job(now: datetime, *, slot: str,
     if not profile.get("findings") and not today.get("meals"):
         return None
 
+    # What HAPPENED today, as opposed to how this person eats in general — drinks,
+    # a meal eaten out, a day well over the ceiling, and the notes the user wrote.
+    events_mod = _coach("coach_events")
+    patterns = _coach("food_patterns")
+    day_iso = now.date().isoformat()
+    all_meals = patterns.read_meals(window_meals, taxonomy)
+    events = events_mod.detect(
+        all_meals, day=day_iso,
+        notes=events_mod.notes_for(all_meals, today_rows),
+        calories=_round_num(consumed.get("calories")),
+        calorie_ceiling=float((targets.get("calories") or {}).get("ceiling") or 0))
+    if events:
+        _coach("coach_archive").record_events(events)
+
     facts = feed.build_generation_facts(
         slot=slot, now=now, profile=profile, today=today, nutrients=nutrients,
         memory=memory, state=state,
@@ -4115,6 +4174,13 @@ def _build_generation_job(now: datetime, *, slot: str,
         weekly=_coach_weekly_facts(profile) if slot == "weekly" else None,
         recent=[{"title": str(c.get("title") or ""),
                  "body": str(c.get("body") or "")} for c in existing])
+
+    # The memory half of the prompt: bounded, ranked, and about today specifically
+    # rather than a dump of history. See coach_recall for why it is built this way.
+    facts["memory"] = _coach_memory_context(
+        now, profile=profile, today=today, events=events, memory=memory,
+        findings=list(facts.get("_findings_index", {}).values()))
+    facts["today_events"] = events_mod.for_prompt(events)
 
     # The findings index travels with the job rather than inside the prompt: the
     # answer has to be validated against the same objects that produced the question,
@@ -4163,6 +4229,10 @@ def coach_work():
     return jsonify({"id": job["id"], "slot": job["slot"],
                     "prompt": job["prompt"],
                     "require_key": job.get("require_key", "cards"),
+                    # Reports ask for the strong model at a slower setting; the daily
+                    # feed does not. The job carries its own answer to that.
+                    "model": job.get("model"),
+                    "effort": job.get("effort"),
                     "created_at": job.get("created_at"),
                     "attempts": job.get("attempts")}), 200
 
@@ -4196,8 +4266,10 @@ def coach_work_result(job_id: str):
     if not isinstance(answer, dict):
         return jsonify({"error": "answer must be an object"}), 400
 
-    written = _apply_generation(job, answer, now, source=str(
-        body.get("model") or "sonnet")[:60])
+    source = str(body.get("model") or "sonnet")[:60]
+    written = (_apply_report(job, answer, now, source=source)
+               if job.get("report") else
+               _apply_generation(job, answer, now, source=source))
     store.finish_generation_job(job_id)
     return jsonify({"status": "applied", "job": job_id, **written}), 200
 
@@ -4235,6 +4307,14 @@ def _apply_generation(job: Dict[str, Any], answer: Dict[str, Any], now: datetime
         return {"generated_at": stamp, "slot": slot, "source": source,
                 "cards": merged_holder["cards"]}
     store.update_json(store.FEED, merge_into, default={"cards": []})
+
+    # The feed forgets on purpose; the archive does not. Everything the coach says is
+    # kept so the weekly review can read what was actually advised, and so a report a
+    # year from now has something to read at all.
+    try:
+        _coach("coach_archive").record_cards(cards, now=now)
+    except Exception:
+        app.logger.exception("archiving cards failed (non-fatal)")
 
     def note_run(current: Dict[str, Any]) -> Dict[str, Any]:
         current.setdefault("runs", {})[slot] = stamp
@@ -4290,7 +4370,10 @@ def coach_sweep():
         except Exception:
             app.logger.exception("sweep generation failed for %s", job.get("id"))
             continue
-        _apply_generation(job, answer, now, source="gemini")
+        if job.get("report"):
+            _apply_report(job, answer, now, source="gemini")
+        else:
+            _apply_generation(job, answer, now, source="gemini")
         store.finish_generation_job(job["id"])
         handled.append(job["id"])
 
@@ -4430,6 +4513,13 @@ def coach_chat():
     thread = store.update_json(store.thread_path(thread_id), append,
                                default={"id": thread_id, "turns": []})
 
+    try:
+        _coach("coach_archive").record_chat(
+            thread_id, day=today_iso, at=stamp[11:16], question=message,
+            answer=reply, card_title=str((card or {}).get("title") or ""))
+    except Exception:
+        app.logger.exception("archiving chat failed (non-fatal)")
+
     learned = 0
     candidates = answer.get("memory_candidates") or []
     if candidates:
@@ -4511,3 +4601,227 @@ def coach_patterns():
     now = datetime.now(_tz())
     window_meals, _today_rows = _coach_window_meals(now)
     return jsonify(_coach_profile(now, window_meals)), 200
+
+
+# =============================================================================
+# Reports: the consolidated tier.
+#
+# The daily feed answers "what now". These answer "what has been happening", which is
+# a different job needing a different model and a different amount of thinking. Each
+# level reads only the level below — weekly reads the week, monthly reads four or five
+# weeklies, yearly reads twelve monthlies — so writing any of them costs about the
+# same no matter how many years of history exist. That hierarchy is what makes keeping
+# everything affordable rather than merely possible.
+# =============================================================================
+
+# Reports go to the strongest model at a slower, more thorough setting. This is the
+# one place in the coach where the reasoning is genuinely hard: correlating what was
+# advised against what was eaten, over weeks, and saying something true about the
+# direction of travel.
+COACH_REPORT_MODEL = os.environ.get("COACH_REPORT_MODEL", "claude-opus-5")
+COACH_REPORT_EFFORT = os.environ.get("COACH_REPORT_EFFORT", "medium")
+
+
+@app.post("/coach/report")
+def coach_report():
+    """Prepare a weekly, monthly or yearly review as a job for the strong model.
+
+    `{"period": "weekly|monthly|yearly"}`, optionally `{"ref": "YYYY-MM-DD"}` to
+    re-run a past period. Like `/coach/generate`, this calls no model: it gathers the
+    facts, builds the prompt and parks the job.
+    """
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    reports_mod = _coach("coach_reports")
+    store = _coach("coach_store")
+
+    body = request.get_json(silent=True) or {}
+    period = str(body.get("period") or "weekly")
+    if period not in reports_mod.PERIODS:
+        return jsonify({"error": f"unknown period {period!r}",
+                        "known": list(reports_mod.PERIODS)}), 400
+    now = datetime.now(_tz())
+    try:
+        ref = (datetime.fromisoformat(str(body["ref"])).date()
+               if body.get("ref") else now.date())
+    except (TypeError, ValueError):
+        return jsonify({"error": "ref must be YYYY-MM-DD"}), 400
+
+    try:
+        job = _build_report_job(now, period=period, ref=ref)
+    except Exception as exc:
+        app.logger.exception("report job preparation failed")
+        return jsonify({"status": "error", "error": str(exc)}), 500
+    if job is None:
+        return jsonify({"status": "empty", "period": period,
+                        "reason": "nothing logged in that period"}), 200
+
+    store.write_json(store.job_path(job["id"]), job)
+    app.logger.info("coach report job %s queued (%d chars)", job["id"],
+                    len(job["prompt"]))
+    return jsonify({"status": "queued", "job": job["id"], "period": period,
+                    "covering": job["report"], "waiting_for": "opus"}), 202
+
+
+def _build_report_job(now: datetime, *, period: str, ref) -> Optional[Dict[str, Any]]:
+    """Gather a period's facts and build its prompt.
+
+    A weekly reads the raw week — every meal, every card, every conversation, every
+    event. A monthly or yearly reads only the reports beneath it, which is what keeps
+    the prompt a page rather than a phone book.
+    """
+    archive = _coach("coach_archive")
+    reports_mod = _coach("coach_reports")
+    memory_mod = _coach("coach_memory")
+    store = _coach("coach_store")
+    patterns = _coach("food_patterns")
+
+    start, end, key = reports_mod.period_bounds(period, ref)
+    memory = store.read_json(store.MEMORY, default=memory_mod.empty())
+    memory_facts = memory_mod.for_prompt(memory, limit=20)
+
+    if period == "weekly":
+        all_rows = _all_meal_rows()
+        rows = _window_meals(all_rows, start, end)
+        taxonomy = store.read_json(store.TAXONOMY, default=None)
+        meals = patterns.read_meals(rows, taxonomy)
+        if not meals:
+            return None
+        profile = patterns.build_food_profile(
+            rows, taxonomy=taxonomy,
+            window_days=7, ref_day=end)
+        previous = archive.recent_reports("weekly", before=key, limit=1)
+        facts = reports_mod.weekly_facts(
+            start=start, end=end, key=key, meals=meals, profile=profile,
+            archive_entries=archive.read_range(start, end),
+            previous=previous[0] if previous else None,
+            memory_facts=memory_facts)
+    else:
+        child = "weekly" if period == "monthly" else "monthly"
+        children = [r for r in archive.recent_reports(child, before="9999", limit=14)
+                    if start <= str(r.get("covering", {}).get("from") or
+                                    r.get("key") or "") <= end]
+        if not children:
+            return None
+        window_meals, _today = _coach_window_meals(now)
+        facts = reports_mod.rollup_facts(
+            period=period, start=start, end=end, key=key,
+            children=sorted(children, key=lambda r: str(r.get("key"))),
+            profile=_coach_profile(now, window_meals), memory_facts=memory_facts)
+
+    return {
+        "id": f"{now.strftime('%Y%m%dT%H%M%S')}-{period}-{key}",
+        "slot": "report",
+        "reason": f"{period} report",
+        "created_at": now.isoformat(timespec="seconds"),
+        "claimed_at": None,
+        "claimed_by": None,
+        "attempts": 0,
+        "prompt": reports_mod.build_prompt(facts),
+        "require_key": "headline",
+        # Routed to the strong model, and the worker reads these two fields to know
+        # which one to run.
+        "model": COACH_REPORT_MODEL,
+        "effort": COACH_REPORT_EFFORT,
+        "report": {"period": period, "key": key, "from": start, "to": end},
+    }
+
+
+def _apply_report(job: Dict[str, Any], answer: Dict[str, Any], now: datetime, *,
+                  source: str) -> Dict[str, Any]:
+    """Store a finished report and put its headline on the feed."""
+    archive = _coach("coach_archive")
+    reports_mod = _coach("coach_reports")
+    feed = _coach("coach_feed")
+    store = _coach("coach_store")
+
+    meta = job.get("report") or {}
+    period, key = meta.get("period", "weekly"), meta.get("key", "")
+    report = reports_mod.assemble_report(
+        answer, period=period, key=key, start=meta.get("from", ""),
+        end=meta.get("to", ""), now=now, source=source)
+    if not report.get("headline") and not report.get("summary"):
+        return {"report": None}
+
+    archive.save_report(period, key, report)
+    archive.record_report(period, key, day=now.date().isoformat(),
+                          headline=report.get("headline", ""),
+                          topics=[period])
+
+    fields = reports_mod.as_card_fields(report)
+    card = feed._card(kind=fields["kind"], slot="weekly",
+                      date=now.date().isoformat(), now=now,
+                      title=fields["title"], body=fields["body"],
+                      topic=f"{period}:{key}", chips=fields["chips"],
+                      evidence={"period": period, "key": key,
+                                "covering": meta.get("from"),
+                                "focus": report.get("focus")})
+    card["source"] = source
+    stamp = now.isoformat(timespec="seconds")
+
+    def merge_into(current: Any) -> Dict[str, Any]:
+        existing = (current.get("cards") or []) if isinstance(current, dict) else []
+        return {"generated_at": stamp, "slot": "report", "source": source,
+                "cards": feed.merge_cards(existing, [card], now=now)}
+    store.update_json(store.FEED, merge_into, default={"cards": []})
+    archive.record_cards([card], now=now)
+
+    app.logger.info("coach %s report %s written by %s", period, key, source)
+    return {"report": key, "period": period, "source": source}
+
+
+@app.get("/coach/reports")
+def coach_reports_list():
+    """Past reports, newest first — what the app's history screen reads.
+    `?period=weekly|monthly|yearly`, `?key=` for one in full."""
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    archive = _coach("coach_archive")
+    period = str(request.args.get("period") or "weekly")
+    if period not in ("weekly", "monthly", "yearly"):
+        return jsonify({"error": "unknown period"}), 400
+    key = str(request.args.get("key") or "").strip()
+    if key:
+        store = _coach("coach_store")
+        if not store.is_safe_id(key):
+            return jsonify({"error": "bad key"}), 400
+        report = archive.load_report(period, key)
+        return (jsonify(report), 200) if report else (
+            jsonify({"error": "no such report"}), 404)
+    return jsonify({"period": period,
+                    "reports": archive.recent_reports(period, before="9999",
+                                                      limit=24)}), 200
+
+
+@app.get("/coach/history")
+def coach_history():
+    """Everything the coach has said and noticed, newest first.
+
+    `?from=&to=` (default: the last 30 days), `?kinds=card,chat,event,report`. This is
+    the app's history screen and the honest answer to "is it really keeping all of
+    this".
+    """
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    archive = _coach("coach_archive")
+    now = datetime.now(_tz())
+    end = str(request.args.get("to") or now.date().isoformat())
+    start = str(request.args.get("from")
+                or (now.date() - timedelta(days=30)).isoformat())
+    for value in (start, end):
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            return jsonify({"error": "from/to must be YYYY-MM-DD"}), 400
+    kinds = tuple(k.strip() for k in str(request.args.get("kinds") or "").split(",")
+                  if k.strip())
+    entries = archive.read_range(start, end, kinds=kinds)
+    entries.reverse()
+    return jsonify({"from": start, "to": end, "count": len(entries),
+                    "entries": entries[:400]}), 200
+
+
+@app.get("/coach/archive-stats")
+def coach_archive_stats():
+    """What the archive holds, by month and kind — the debug view for the memory."""
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    return jsonify(_coach("coach_archive").stats()), 200

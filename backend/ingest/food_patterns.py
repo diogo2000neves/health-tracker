@@ -163,6 +163,11 @@ def read_meals(window_meals: Sequence[Dict[str, Any]],
             "protein_g": _num(row.get("protein_g")),
             "items": items,
             "groups": sorted({i["group"] for i in items}),
+            # The user's own words about this meal ("Comi um menu médio Big Tasty do
+            # McDonalds"). Carried through because it is often the only place the
+            # context lives — the items say "burger, fries, iced tea" and the note
+            # says where they came from and why.
+            "note": " ".join(str(row.get("note") or "").split())[:400],
         })
     out.sort(key=lambda m: m["datetime"])
     return out

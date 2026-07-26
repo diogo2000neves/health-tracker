@@ -55,6 +55,9 @@ TOKEN = os.environ.get("INGEST_TOKEN", "")
 MODEL = os.environ.get("COACH_MODEL", "claude-sonnet-5")
 EFFORT = os.environ.get("COACH_EFFORT", "high")
 TIMEOUT_S = int(os.environ.get("COACH_TIMEOUT_S", "300"))
+# Reports think for longer: a bigger model, a slower effort, and a prompt carrying a
+# whole week of meals and advice.
+REPORT_TIMEOUT_S = int(os.environ.get("COACH_REPORT_TIMEOUT_S", "900"))
 WORKER_NAME = os.environ.get("COACH_WORKER_NAME", "mac")
 
 # What a spent usage window looks like coming out of the CLI. Matching on the message
@@ -96,16 +99,26 @@ def claim() -> Optional[Dict[str, Any]]:
 
 
 def answer(job: Dict[str, Any]) -> Dict[str, Any]:
-    """Run the job's prompt through Sonnet. Raises ClaudeError on failure."""
-    log.info("running job %s (%s, %d chars) through %s",
-             job["id"], job.get("slot"), len(job["prompt"]), MODEL)
+    """Run the job's prompt through the model the job asks for.
+
+    The daily feed runs on Sonnet: frequent, fast, and good enough to notice that the
+    oats held the morning. A weekly, monthly or yearly review asks for Opus at a
+    slower effort, because correlating what was advised against what was eaten across
+    weeks is a genuinely harder problem and happens rarely enough to afford it. The
+    job carries its own choice so this worker never has to know which is which.
+    """
+    model = job.get("model") or MODEL
+    effort = job.get("effort") or EFFORT
+    timeout = REPORT_TIMEOUT_S if job.get("model") else TIMEOUT_S
+    log.info("running job %s (%s, %d chars) through %s at %s effort",
+             job["id"], job.get("slot"), len(job["prompt"]), model, effort)
     started = time.monotonic()
     # No tools at all. This is pure reasoning over facts that are already in the
     # prompt, and a model that *can* write a file may decide to answer by writing
     # one: the first live run did exactly that — 238 s of good work, saved to disk,
     # with a prose summary where the JSON should have been.
     result = claude_cli.call_claude_json(
-        job["prompt"], model=MODEL, effort=EFFORT, timeout_s=TIMEOUT_S,
+        job["prompt"], model=model, effort=effort, timeout_s=timeout,
         require_key=job.get("require_key", "cards"), tools="")
     log.info("job %s answered in %.1fs (cost %s)", job["id"],
              time.monotonic() - started, result.get("_cost_usd"))
@@ -137,7 +150,7 @@ def run_once() -> bool:
                      {"release": f"error: {str(exc)[:180]}"})
         return False
 
-    model_id = result.pop("_model_id", MODEL)
+    model_id = result.pop("_model_id", job.get("model") or MODEL)
     result.pop("_cost_usd", None)
     applied = _request("POST", f"/coach/work/{job['id']}",
                        {"answer": result, "model": model_id})

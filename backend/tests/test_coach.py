@@ -11,7 +11,7 @@ the same code path the service uses is exercised without Cloud Storage.
 """
 import pathlib
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -1111,3 +1111,329 @@ class TestClipping:
         cards, _ = generate("evening", profile, an_answer(
             [{"kind": "day_summary", "title": "T", "body": body}], plates=False))
         assert len(cards[0]["body"]) > 700
+
+
+# =============================================================================
+# Memory: the archive, event detection, and budgeted recall.
+#
+# The research this design follows (MemTier, 2026) measured that retrieval — not model
+# size — is the binding constraint on agent memory, with multi-session recall@2 at
+# 0.038. These tests pin the retrieval, because that is where the quality lives.
+# =============================================================================
+
+import coach_archive as archive      # noqa: E402
+import coach_events as events        # noqa: E402
+import coach_recall as recall        # noqa: E402
+import coach_reports as reports      # noqa: E402
+
+
+def a_meal(day, time, foods, calories=500, protein=30, note=""):
+    return {"datetime": f"{day}T{time}:00", "date": day,
+            "slot": patterns.meal_slot(f"{day}T{time}:00"),
+            "calories": calories, "protein_g": protein, "note": note,
+            "items": [{"raw": f, "food": tax.canonical_name(f),
+                       "group": tax.lookup(None, f)["group"],
+                       "fried": tax.is_fried(f), "grams": 150, "calories": 200,
+                       "servings": tax.servings(tax.lookup(None, f)["group"], 150),
+                       "nutrients": {}} for f in foods],
+            "groups": sorted({tax.lookup(None, f)["group"] for f in foods})}
+
+
+class TestEventDetection:
+    """`food_patterns` answers "how does this person eat". This answers "what
+    happened on Friday", which averages destroy."""
+
+    def test_a_night_out_is_one_event_not_eight_drinks(self):
+        night = [a_meal("2026-07-24", "22:10", ["beer", "beer"]),
+                 a_meal("2026-07-24", "23:40", ["vodka", "vodka", "beer"]),
+                 a_meal("2026-07-25", "01:30", ["big tasty burger"])]
+        found = events.detect(night, day="2026-07-24")
+        drinking = [e for e in found if e["kind"] == "drinking_occasion"]
+        assert drinking, [e["kind"] for e in found]
+        assert drinking[0]["importance"] >= 0.85
+        assert "sexta-feira" in drinking[0]["headline"]
+        assert drinking[0]["evidence"]["first"] == "22:10"
+
+    def test_one_glass_of_wine_is_not_an_occasion(self):
+        found = events.detect([a_meal("2026-07-26", "13:30", ["white wine"])],
+                              day="2026-07-26")
+        drinking = [e for e in found if e["kind"].startswith("drinking")]
+        assert drinking and drinking[0]["kind"] == "drinking"
+        assert drinking[0]["importance"] <= 0.4
+
+    def test_the_restaurant_is_found_in_the_note_not_the_items(self):
+        """The items say "burger, fries, iced tea". Only the note says McDonald's."""
+        meals = [a_meal("2026-07-26", "20:00",
+                        ["big tasty burger", "french fries", "iced tea"],
+                        calories=1250)]
+        notes = {"2026-07-26T20:00:00":
+                 "Comi um menu médio Big Tasty do McDonalds com os amigos"}
+        found = events.detect(meals, day="2026-07-26", notes=notes)
+        out = [e for e in found if e["kind"] == "eaten_out"]
+        assert out and "mcdonald" in out[0]["evidence"]["markers"]
+        assert "McDonalds" in out[0]["detail"]
+
+    def test_a_user_who_says_they_overdid_it_is_heard(self):
+        """Someone telling you they already know changes what is worth saying."""
+        meals = [a_meal("2026-07-26", "20:00", ["french fries"])]
+        notes = {"2026-07-26T20:00:00": "Exagerei hoje, sei que não devia"}
+        noted = [e for e in events.detect(meals, day="2026-07-26", notes=notes)
+                 if e["kind"] == "noted"]
+        assert noted and noted[0]["evidence"]["self_aware"] is True
+        assert noted[0]["importance"] >= 0.7
+
+    def test_a_day_far_over_the_ceiling_is_an_event(self):
+        found = events.detect([a_meal("2026-07-26", "20:00", ["french fries"])],
+                              day="2026-07-26", calories=3200, calorie_ceiling=2200)
+        assert any(e["kind"] == "big_day" for e in found)
+
+    def test_an_ordinary_day_produces_nothing(self):
+        """Silence is the correct output most days; an event log that fires daily is
+        just a second copy of the meal log."""
+        ordinary = [a_meal("2026-07-26", "08:15", ["oats", "peanut butter"]),
+                    a_meal("2026-07-26", "13:00", ["white rice", "boiled cod"])]
+        assert events.detect(ordinary, day="2026-07-26",
+                             calories=1900, calorie_ceiling=2200) == []
+
+    def test_the_day_is_ranked_by_its_most_notable_moment(self):
+        night = events.detect(
+            [a_meal("2026-07-24", "22:10", ["beer", "beer", "vodka", "beer"])],
+            day="2026-07-24")
+        assert events.day_importance(night) >= 0.85
+        assert events.day_importance([]) < 0.2
+
+
+class TestArchive:
+    @pytest.fixture(autouse=True)
+    def _local(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("COACH_BUCKET", raising=False)
+        monkeypatch.setenv("COACH_LOCAL_DIR", str(tmp_path))
+
+    def _card(self, day, kind="pattern", title="T", topic="red_meat"):
+        return {"id": f"{day}:{kind}:{topic}", "kind": kind, "date": day,
+                "created_at": f"{day}T15:30:00", "title": title, "body": "Corpo.",
+                "topic": topic, "priority": 70, "source": "claude-sonnet-5",
+                "evidence": {"finding": f"group_over:{topic}"},
+                "swap": {"from": "beef steak", "to": "cod"}}
+
+    def test_what_the_feed_forgets_the_archive_keeps(self):
+        archive.record_cards([self._card("2026-07-20")], now=NOW)
+        kept = archive.read_range("2026-07-01", "2026-07-31", kinds=("card",))
+        assert len(kept) == 1 and kept[0]["summary"] == "T"
+
+    def test_appending_the_same_card_twice_does_not_duplicate_it(self):
+        """A Cloud Tasks retry re-posts the same cards; the archive must not grow."""
+        for _ in range(3):
+            archive.record_cards([self._card("2026-07-20")], now=NOW)
+        assert len(archive.read_range("2026-07-01", "2026-07-31")) == 1
+
+    def test_a_card_carries_the_keys_it_will_be_found_by(self):
+        archive.record_cards([self._card("2026-07-20")], now=NOW)
+        topics = archive.read_range("2026-07-01", "2026-07-31")[0]["topics"]
+        assert "red_meat" in topics
+        assert "finding:group_over:red_meat" in topics
+        assert "swap_from:beef steak" in topics
+
+    def test_entries_are_sharded_by_month_and_read_across_them(self):
+        archive.record_cards([self._card("2026-06-28"), self._card("2026-07-02")],
+                             now=NOW)
+        assert len(archive.read_range("2026-06-01", "2026-07-31")) == 2
+        assert len(archive.read_range("2026-07-01", "2026-07-31")) == 1
+
+    def test_conversations_are_kept(self):
+        archive.record_chat("t-1", day="2026-07-20", at="21:04",
+                            question="não gosto de peixe cozido",
+                            answer="Então vamos por assado.")
+        chats = archive.read_range("2026-07-01", "2026-07-31", kinds=("chat",))
+        assert chats and chats[0]["data"]["answer"].startswith("Então")
+
+    def test_reports_are_stored_and_listed_newest_first(self):
+        for key in ("2026-07-06", "2026-07-13", "2026-07-20"):
+            archive.save_report("weekly", key, {"period": "weekly", "key": key,
+                                                "headline": f"semana {key}"})
+        listed = archive.recent_reports("weekly", before="9999", limit=2)
+        assert [r["key"] for r in listed] == ["2026-07-20", "2026-07-13"]
+
+    def test_a_report_can_read_only_what_came_before_it(self):
+        """A monthly must not read a weekly from the future when it is re-run."""
+        for key in ("2026-07-06", "2026-07-13"):
+            archive.save_report("weekly", key, {"key": key})
+        assert [r["key"] for r in
+                archive.recent_reports("weekly", before="2026-07-13")] == ["2026-07-06"]
+
+    def test_stats_report_what_is_held(self):
+        archive.record_cards([self._card("2026-07-20")], now=NOW)
+        archive.record_chat("t-1", day="2026-07-20", at="10:00", question="q",
+                            answer="a")
+        held = archive.stats()
+        assert held["total"] == 2 and held["by_kind"]["card"] == 1
+
+
+class TestRecall:
+    """Ranking is where a memory system is won or lost: the point is not to remember
+    everything, it is to remember the right thing now."""
+
+    def _entry(self, day, topics, summary="x", importance=0.5, kind="card"):
+        return archive.entry(kind, day=day, at="12:00", id=f"{kind}:{day}:{summary}",
+                             summary=summary, topics=topics, importance=importance)
+
+    def test_an_on_topic_memory_beats_a_recent_irrelevant_one(self):
+        old_relevant = self._entry("2026-06-01", ["alcohol", "beer"], "a noite")
+        new_irrelevant = self._entry("2026-07-25", ["oats"], "aveia")
+        ranked = recall.rank([new_irrelevant, old_relevant], today="2026-07-26",
+                             query_topics=["alcohol"])
+        assert [e["summary"] for e in ranked] == ["a noite"]
+
+    def test_nothing_off_topic_is_recalled_at_all(self):
+        """Without this floor, recency alone drags in whatever happened to be recent —
+        which is how a memory system ends up padding prompts with noise."""
+        assert recall.rank([self._entry("2026-07-25", ["oats"])],
+                           today="2026-07-26", query_topics=["alcohol"]) == []
+
+    def test_recency_breaks_ties_between_equally_relevant_memories(self):
+        older = self._entry("2026-05-01", ["alcohol"], "maio")
+        newer = self._entry("2026-07-20", ["alcohol"], "julho")
+        ranked = recall.rank([older, newer], today="2026-07-26",
+                             query_topics=["alcohol"])
+        assert [e["summary"] for e in ranked] == ["julho", "maio"]
+
+    def test_importance_lifts_a_memorable_night_over_a_routine_note(self):
+        night = self._entry("2026-07-10", ["alcohol"], "festa", importance=0.9)
+        routine = self._entry("2026-07-10", ["alcohol"], "um copo", importance=0.2)
+        ranked = recall.rank([routine, night], today="2026-07-26",
+                             query_topics=["alcohol"])
+        assert ranked[0]["summary"] == "festa"
+
+    def test_recency_decays_by_half_at_the_half_life(self):
+        assert recall.recency_score("2026-07-26", "2026-07-26") == pytest.approx(1.0)
+        assert recall.recency_score("2026-07-12", "2026-07-26") == pytest.approx(0.5)
+
+    def test_partial_topic_matches_still_find_the_memory(self):
+        entry = self._entry("2026-07-20", ["swap_from:red_meat"])
+        assert recall.relevance_score(entry["topics"], ["red_meat"]) > 0
+
+    def test_the_query_is_built_from_what_actually_happened_today(self):
+        topics = recall.query_topics_for(
+            profile={}, today={"meals": [{"food_groups": ["alcohol"],
+                                          "items": [{"food": "beer"}]}]},
+            events=[{"kind": "drinking_occasion", "topics": ["alcohol"]}],
+            findings=[{"id": "group_over:red_meat", "group": "red_meat"}])
+        assert "alcohol" in topics and "kind:drinking_occasion" in topics
+        assert "finding:group_over:red_meat" in topics
+
+    def test_a_quiet_day_asks_for_almost_nothing(self):
+        """Retrieval cost should scale with how interesting the day was."""
+        topics = recall.query_topics_for(profile={}, today={"meals": []}, events=[])
+        assert topics == []
+
+
+class TestMemoryBudget:
+    """"We cannot inject a massive context history into every prompt" — made
+    mechanical, not aspirational."""
+
+    def _entries(self, count, topic="alcohol"):
+        return [archive.entry("card", day="2026-07-20", at="12:00", id=f"c{i}",
+                              summary=f"memoria numero {i} " + "detalhe " * 30,
+                              topics=[topic], importance=0.5)
+                for i in range(count)]
+
+    def test_sections_stay_inside_their_budgets(self):
+        memory = recall.assemble(
+            today_iso="2026-07-26",
+            profile_facts=[{"type": "dislike", "fact": "x " * 200}] * 20,
+            recent_cards=self._entries(30), archive=self._entries(60),
+            events=[{"headline": "h " * 100, "at": "20:00"}] * 20,
+            reports=[{"period": "weekly", "key": "2026-07-20",
+                      "summary": "s " * 500}] * 10,
+            query_topics=["alcohol"])
+        for section, budget in recall.BUDGET.items():
+            assert memory["_tokens"][section] <= budget * 1.15, section
+
+    def test_the_whole_memory_block_stays_bounded(self):
+        memory = recall.assemble(
+            today_iso="2026-07-26", profile_facts=self._entries(50),
+            recent_cards=self._entries(50), archive=self._entries(200),
+            events=[], reports=[], query_topics=["alcohol"])
+        assert memory["_tokens"]["total"] <= sum(recall.BUDGET.values()) * 1.15
+
+    def test_items_are_dropped_whole_rather_than_truncated(self):
+        """Half a memory is worse than none: the model cannot tell which half is
+        missing."""
+        memory = recall.assemble(
+            today_iso="2026-07-26", profile_facts=[], recent_cards=[],
+            archive=self._entries(60), events=[], reports=[],
+            query_topics=["alcohol"])
+        assert all(m["what"].startswith("memoria numero")
+                   for m in memory["you_might_recall"])
+
+    def test_an_empty_history_costs_nothing(self):
+        memory = recall.assemble(
+            today_iso="2026-07-26", profile_facts=[], recent_cards=[], archive=[],
+            events=[], reports=[], query_topics=[])
+        assert memory["_tokens"]["total"] < 60
+
+
+class TestReportPeriods:
+    def test_a_weekly_covers_the_week_that_just_ended(self):
+        # Monday 2026-07-27 -> the week Mon 20th to Sun 26th.
+        start, end, key = reports.period_bounds("weekly", date(2026, 7, 27))
+        assert (start, end, key) == ("2026-07-20", "2026-07-26", "2026-07-20")
+
+    def test_a_report_never_covers_a_period_still_running(self):
+        """A review of a week that hasn't finished would be revised by Sunday
+        dinner."""
+        _start, end, _key = reports.period_bounds("weekly", date(2026, 7, 23))
+        assert end < "2026-07-23"
+
+    def test_monthly_and_yearly_bounds(self):
+        assert reports.period_bounds("monthly", date(2026, 7, 15)) == (
+            "2026-06-01", "2026-06-30", "2026-06")
+        assert reports.period_bounds("yearly", date(2026, 3, 2)) == (
+            "2025-01-01", "2025-12-31", "2025")
+
+    def test_a_weekly_reads_the_week_whole(self):
+        meals = [a_meal("2026-07-20", "13:00", ["white rice", "beef steak"],
+                        note="almoço rápido")]
+        facts = reports.weekly_facts(
+            start="2026-07-20", end="2026-07-26", key="2026-07-20", meals=meals,
+            profile=profile_from(a_week_of_meals()),
+            archive_entries=[
+                archive.entry("card", day="2026-07-21", at="08:00", id="c1",
+                              summary="Menos carne", topics=["red_meat"]),
+                archive.entry("chat", day="2026-07-22", at="21:00", id="h1",
+                              summary="porquê?", topics=["chat"],
+                              data={"question": "porquê?", "answer": "porque sim"})])
+        assert facts["meals"][0]["note"] == "almoço rápido"
+        assert facts["what_you_were_told"][0]["title"] == "Menos carne"
+        assert facts["conversations"][0]["you_asked"] == "porquê?"
+
+    def test_a_rollup_reads_only_the_level_below(self):
+        """This is what keeps a yearly report affordable: twelve summaries, not a year
+        of meals."""
+        facts = reports.rollup_facts(
+            period="monthly", start="2026-06-01", end="2026-06-30", key="2026-06",
+            children=[{"key": "2026-06-01", "headline": "h", "summary": "s"}])
+        assert "meals" not in facts and facts["made_of"][0]["headline"] == "h"
+
+    def test_a_report_is_validated_into_shape(self):
+        report = reports.assemble_report(
+            {"headline": "x " * 300, "summary": "s", "wins": [{"title": "w"}] * 20,
+             "focus": {"label": "l", "why": "y", "how": "h"},
+             "meal_reviews": [{"what": "almoço", "verdict": "good", "why": "w"}]},
+            period="weekly", key="2026-07-20", start="2026-07-20", end="2026-07-26",
+            now=NOW, source="claude-opus-5")
+        assert len(report["headline"]) <= 200
+        assert len(report["wins"]) <= 5
+        assert report["focus"]["label"] == "l"
+        assert report["meal_reviews"][0]["verdict"] == "good"
+
+    def test_the_report_prompt_asks_whether_the_advice_landed(self):
+        prompt = reports.build_prompt({"period": "weekly", "covering": {}})
+        assert "what_you_were_told" in prompt and "o conselho pegou" in prompt
+
+    def test_a_report_becomes_a_card(self):
+        card = reports.as_card_fields(
+            {"period": "weekly", "key": "2026-07-20", "headline": "A semana",
+             "summary": "Correu assim.", "focus": {"label": "peixe 2x"}})
+        assert card["kind"] == "weekly_review"
+        assert "peixe 2x" in card["body"]

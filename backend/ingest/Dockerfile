@@ -28,6 +28,13 @@ COPY ingest/food_taxonomy.py .
 COPY ingest/food_patterns.py .
 COPY ingest/coach_feed.py .
 COPY ingest/coach_memory.py .
+# The memory tiers: the append-only archive of everything the coach has said, the
+# event detector that reads the user's own meal notes, the budgeted retrieval that
+# decides what a prompt gets to see, and the weekly/monthly/yearly rollups.
+COPY ingest/coach_archive.py .
+COPY ingest/coach_events.py .
+COPY ingest/coach_recall.py .
+COPY ingest/coach_reports.py .
 
 ENV PORT=8080
 # 300s timeout: strongest-first model chain with per-model retries can legitimately
