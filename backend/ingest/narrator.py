@@ -4,17 +4,27 @@ Replaces the local `claude` CLI with direct Gemini API calls. The deterministic
 analysis already happened in `insights.py` — this module only turns finished facts
 into human coaching prose. Can run in the backend (Cloud Run) or locally.
 
-Three generation modes, all called as top-level functions:
+Generation modes, all called as top-level functions:
+
+  narrate_cards(facts, ...)
+      -> { cards: [{ kind, ref, title, body, chips, swap }] }
+
+    The feed's prose. `facts` leads with the FOOD-LEVEL reading of the log (groups
+    against their weekly references, streaks, per-slot composition, variety) and
+    carries nutrient numbers only as supporting evidence. That ordering is the whole
+    content fix: a prompt that opens with a nutrient table can only produce "eat
+    more fibre", which is what the app's Nutrients tab already says.
+
+  narrate_next_meal(context, ...)
+      -> { next_slot, reasoning, plates: [{ title, items, covers, ... }] }
+
+  chat_turn(context, history, message, ...)
+      -> { reply, memory_candidates } — a conversation anchored to one card, which
+    also notices anything durable worth remembering about the user.
 
   narrate_weekly(diagnosis, profile, continuity, ...)
       -> { headline, wins, focus, swap, continuity, encouragement }
-
-  assemble_next_meal(context, profile, ...)
-      -> { next_slot, plates: [{ title, items, covers, ... }] }
-
-    where `context` already contains today's remaining budget, shortfalls, the
-    user's meal-timing profile, and per-shortfall candidate foods with portion
-    ranges. The model picks the next slot AND assembles 3 plates for it.
+    The original Sunday review, kept for the legacy /insights endpoints.
 
   critic_pass(diagnosis, draft)
       -> { ok, issues, report } — validates a weekly report against the facts.
@@ -22,6 +32,11 @@ Three generation modes, all called as top-level functions:
 Design invariants carried from Phase 2:
   * The model NEVER invents a number. Every numerical claim in the output must be
     traceable to the facts in the prompt.
+  * The model NEVER invents a food. A swap's `from` must be something the user
+    actually logged and its `to` must come from the offered options — enforced in
+    code by `coach_feed._validated_swap`, because a prompt rule alone did not hold:
+    the critic pass caught the model proposing "swap your white bread" for a user
+    who had never logged bread.
   * The critic pass rejects any claim the facts don't support, any alarm the
     policy says is benign, any restrictive framing.
   * `response_mime_type` is NOT relied on — Gemini's structured-output mode is
@@ -390,6 +405,211 @@ def assemble_next_meal(context: Dict[str, Any],
     result = call_gemini(prompt, require_key="plates", api_key=api_key,
                          model=model, temperature=0.3)
     return _strip_meta(result)
+
+
+# -- Feed cards (food-first) ---------------------------------------------------
+
+_CARD_RULES = """És o nutricionista pessoal desta pessoa, a escrever os cartões que ela vê
+quando abre a app. Português de Portugal, tratamento por "tu". O objetivo dela é
+recomposição corporal: perder gordura mantendo músculo, com proteína alta.
+
+A REGRA CENTRAL — FALA DE COMIDA, NÃO DE NUTRIENTES.
+O que interessa é o que a pessoa realmente comeu: alimentos, refeições, repetições, o que
+falta na mesa. Um número de nutriente só pode entrar se estiver amarrado a um alimento
+concreto ("o arroz branco quase todos os dias é o que está a travar a fibra"). NUNCA
+escrevas conselhos como "come mais fibra" ou "aumenta a vitamina A" — isso a pessoa já vê
+no ecrã dos nutrientes, e não a ajuda a decidir o que põe no prato.
+
+REGRAS ABSOLUTAS:
+- Só podes falar de alimentos que aparecem em `foods_the_user_eats` ou em
+  `findings[].swap_options`. Não inventes alimentos nem marcas.
+- Numa troca (`swap`): o `from` TEM de ser um alimento que a pessoa registou, e o `to` TEM
+  de ser um dos alimentos em `swap_options.to` desse finding. Se não houver uma troca
+  honesta a fazer, devolve `swap: null`.
+- Nunca inventes nem recalcules números. Usa só os que estão nos FACTOS.
+- Um cartão = uma ideia. Título curto; corpo de 1 a 2 frases.
+- Nada de linguagem médica nem diagnósticos. Nada de "corta", "elimina", "nunca mais":
+  enquadra sempre como acrescentar ou trocar, nunca como restringir por restringir.
+- Não repitas nada que esteja em `already_said_recently`.
+- Usa `memory` (o que já sabes desta pessoa) quando for relevante — é isso que faz o
+  conselho parecer dirigido a ela e não a um manual.
+- Caloroso, direto, sem jargão e sem emojis.
+
+OS TIPOS DE CARTÃO que te podem ser pedidos (em `wanted_cards`):
+- `day_plan` (manhã): o dia que começa, à luz do que aconteceu ontem. Uma ação concreta.
+- `check_in` (tarde): o que já foi comido hoje e a oportunidade que ainda resta hoje.
+- `day_summary` (noite): fecha o dia com honestidade e deixa uma nota para amanhã.
+- `weekly_review` (domingo): a semana em alimentos — o padrão mais importante e uma troca.
+- `win`: algo que está genuinamente a correr bem, dito em alimentos.
+- `pattern`: UMA observação sobre um padrão alimentar. Tens de escolher um dos `findings`
+  e pôr o `id` dele em `ref`; o teu texto tem de dizer o mesmo que o `fact` desse finding,
+  só em linguagem humana. Um cartão `pattern` por finding, no máximo."""
+
+_CARDS_SCHEMA = """Devolve APENAS um objeto JSON com esta forma exata:
+{
+  "cards": [
+    {
+      "kind": "day_plan|check_in|day_summary|weekly_review|win|pattern",
+      "ref": "<o id do finding — só para kind=pattern; caso contrário \\"\\">",
+      "title": "título curto (máx. 60 caracteres)",
+      "body": "1 a 2 frases",
+      "chips": [{"label": "facto muito curto (máx. 24 caracteres)",
+                 "tone": "good|warn|bad|neutral"}],
+      "swap": {"from": "alimento registado", "to": "alimento das swap_options",
+               "why": "uma frase"}
+    }
+  ]
+}
+Um cartão para cada tipo pedido em `wanted_cards`, na ordem em que aparecem. `chips` e
+`swap` são opcionais (`swap: null` quando não houver troca honesta)."""
+
+
+def build_cards_prompt(facts: Dict[str, Any]) -> str:
+    return (f"{_CARD_RULES}\n\nFACTOS (JSON, já calculados):\n"
+            f"{json.dumps(facts, ensure_ascii=False, indent=1, default=str)}\n\n"
+            f"{_CARDS_SCHEMA}")
+
+
+def narrate_cards(facts: Dict[str, Any], api_key: Optional[str] = None,
+                  model: Optional[str] = None) -> Dict[str, Any]:
+    """The prose for one generation slot, in a single call.
+
+    One call per slot (not one per card) keeps the whole feed coherent — the cards
+    read like one person wrote them in one sitting, and they can avoid repeating each
+    other because the model sees them all at once.
+    """
+    prompt = build_cards_prompt(facts)
+    log.info("cards prompt %d chars (slot=%s)", len(prompt), facts.get("slot"))
+    return _strip_meta(call_gemini(prompt, require_key="cards", api_key=api_key,
+                                   model=model, temperature=0.35))
+
+
+# -- Next meal (food-aware, always answerable) ---------------------------------
+
+_NEXT_MEAL_RULES = """És um coach de nutrição prático a responder à pergunta diária "o que
+vou comer a seguir?" em português de Portugal ("tu").
+
+PARTE 1 — Decide qual é a PRÓXIMA REFEIÇÃO, a partir da hora atual, do que já foi
+registado hoje, dos horários típicos da pessoa (`meal_pattern`) e do orçamento que resta.
+Exemplos: são 10:30 e ainda não comeu nada -> pequeno-almoço, mesmo tarde; já almoçou e
+são 15:00 -> lanche da tarde; já almoçou e são 18:30 -> jantar.
+
+PARTE 2 — Cria 3 sugestões de prato para essa refeição.
+- Usa sobretudo comida que a pessoa já come: `candidates.usual_at_this_slot`,
+  `candidates.by_nutrient` e `candidates.for_findings`.
+- `candidates.groups_to_favour` são os grupos alimentares que andam abaixo da referência
+  semanal — puxa por eles quando encaixar na refeição (é aqui que o peixe entra num dia
+  em que só houve carne).
+- Podes introduzir no MÁXIMO 1 alimento novo, saudável e comum por sugestão — marca-o com
+  "new": true. Os alimentos em `candidates` marcados `new` também contam como novos.
+- Respeita as gramas dadas (grams_low..grams_high) quando existirem, e não excedas as
+  calorias que restam.
+- Respeita `memory`: se a pessoa disse que não gosta de algo ou que não pode comer algo,
+  não o sugiras.
+- Sê apetecível e concreto: isto tem de dar vontade de cozinhar.
+- O 1.º prato é o recomendado.
+
+MUITO IMPORTANTE: devolves SEMPRE 3 pratos. Mesmo que hoje não falte nenhum nutriente,
+"o que como a seguir?" continua a ser uma pergunta legítima — nesse caso sugere pratos
+equilibrados, com variedade, que puxem pelos grupos em falta na semana e respeitem o
+orçamento que resta. Nunca respondas que não é preciso sugestão."""
+
+_PLATES_SCHEMA = """Devolve APENAS um objeto JSON com esta forma exata:
+{
+  "next_slot": "pequeno-almoço | almoço | jantar | lanche da manhã | lanche da tarde",
+  "reasoning": "uma frase curta — porque é esta a próxima refeição",
+  "plates": [
+    {
+      "rank": 1, "recommended": true,
+      "title": "nome do prato",
+      "items": [{"food": "...", "grams_low": N, "grams_high": N, "new": false}],
+      "covers": [{"key": "omega3_g", "label": "Ómega-3", "note": "nota curta"}],
+      "calories": N, "protein_g": N,
+      "why": "uma frase — o que resolve e porque encaixa"
+    },
+    {"rank": 2, "recommended": false, "...": "..."},
+    {"rank": 3, "recommended": false, "...": "..."}
+  ]
+}"""
+
+
+def build_next_meal_prompt(context: Dict[str, Any]) -> str:
+    """`context` carries current_time, today_meals, meal_pattern, the remaining
+    budget, the food-level candidates (see coach_feed.next_meal_candidates) and the
+    user's memory."""
+    return (f"{_NEXT_MEAL_RULES}\n\nDADOS (JSON):\n"
+            f"{json.dumps(context, ensure_ascii=False, indent=1, default=str)}\n\n"
+            f"{_PLATES_SCHEMA}")
+
+
+def narrate_next_meal(context: Dict[str, Any], api_key: Optional[str] = None,
+                      model: Optional[str] = None) -> Dict[str, Any]:
+    prompt = build_next_meal_prompt(context)
+    log.info("next-meal prompt %d chars", len(prompt))
+    return _strip_meta(call_gemini(prompt, require_key="plates", api_key=api_key,
+                                   model=model, temperature=0.35))
+
+
+# -- Chat (anchored to a card, with memory) ------------------------------------
+
+_CHAT_RULES = """És o nutricionista pessoal desta pessoa, a conversar com ela sobre um
+conselho que lhe deste. Português de Portugal, tratamento por "tu".
+
+- Responde curto: 2 a 4 frases. É uma conversa, não um artigo.
+- Fala de comida concreta — alimentos, porções, refeições — e usa os FACTOS que te são
+  dados. Não inventes números nem alimentos que a pessoa não registou.
+- Se a pergunta não for suportada pelos factos que tens, di-lo com honestidade em vez de
+  adivinhar ("não tenho isso registado, mas...").
+- Nada de diagnósticos nem de linguagem médica. Se a pergunta for clínica (análises,
+  medicação, sintomas), diz que vale a pena falar com um médico ou nutricionista e
+  responde só à parte alimentar.
+- Nunca incentives comer menos por comer menos. Recomposição faz-se com proteína alta e
+  comida suficiente.
+- Usa `memory` para não voltar a perguntar o que já sabes.
+
+MEMÓRIA: se nesta mensagem a pessoa revelar algo DURADOURO sobre ela — uma preferência,
+uma coisa que não gosta, uma restrição, um objetivo, uma rotina, uma limitação de tempo ou
+de cozinha — devolve-o em `memory_candidates`. Só o que continuará verdade daqui a um mês:
+"não gosta de peixe cozido" sim; "hoje não lhe apetece peixe" não."""
+
+_CHAT_SCHEMA = """Devolve APENAS um objeto JSON com esta forma exata:
+{
+  "reply": "a tua resposta, 2 a 4 frases",
+  "memory_candidates": [
+    {"type": "preference|dislike|constraint|goal|routine",
+     "fact": "uma frase curta, na 3.ª pessoa (ex.: \\"não gosta de peixe cozido\\")",
+     "confidence": 0.0}
+  ]
+}"""
+
+
+def build_chat_prompt(context: Dict[str, Any], history: List[Dict[str, Any]],
+                      message: str) -> str:
+    turns = "\n".join(
+        f"{'PESSOA' if t.get('role') == 'user' else 'TU'}: {t.get('text', '')}"
+        for t in history[-12:])
+    return (f"{_CHAT_RULES}\n\nFACTOS (JSON):\n"
+            f"{json.dumps(context, ensure_ascii=False, indent=1, default=str)}\n\n"
+            f"CONVERSA ATÉ AGORA:\n{turns or '(nenhuma)'}\n\n"
+            f"NOVA MENSAGEM DA PESSOA:\n{message}\n\n{_CHAT_SCHEMA}")
+
+
+def chat_turn(context: Dict[str, Any], history: List[Dict[str, Any]],
+              message: str, api_key: Optional[str] = None,
+              model: Optional[str] = None) -> Dict[str, Any]:
+    """One reply, plus anything durable the message revealed about the user.
+
+    Extraction rides along on the same call rather than a second pass: it is the
+    same reasoning ("what did they just tell me about themselves?"), and one call
+    keeps a chat turn inside the couple of seconds a conversation can tolerate.
+    """
+    prompt = build_chat_prompt(context, history, message)
+    log.info("chat prompt %d chars", len(prompt))
+    answer = _strip_meta(call_gemini(prompt, require_key="reply", api_key=api_key,
+                                      model=model, temperature=0.4))
+    candidates = answer.get("memory_candidates")
+    return {"reply": str(answer.get("reply") or "").strip(),
+            "memory_candidates": candidates if isinstance(candidates, list) else []}
 
 
 # -- Helpers -------------------------------------------------------------------

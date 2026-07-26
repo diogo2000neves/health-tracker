@@ -2613,6 +2613,12 @@ def _finalize(nut: Dict[str, Any], photo_url: str, when: datetime,
         }), 200
 
     append_meal(nut, photo_url, when, image_sha, note)
+    # The day just changed, so the coach's time-sensitive cards ("what to eat next",
+    # the afternoon check-in) are now describing a day that no longer exists.
+    # Enqueue a regeneration rather than doing it here: this request is a Cloud Tasks
+    # worker that must return promptly, and the refresh must never be able to fail a
+    # meal that is already written.
+    _trigger_coach_refresh("meal_logged")
 
     running = _day_totals(todays)
     for key in running:
@@ -3611,3 +3617,620 @@ def insights_next_meal_v2():
         }), 200
     return jsonify({"status": "pending", "plates": []}), 200
 
+
+
+# =============================================================================
+# The Coach (v2): a background-generated card feed, chat, and long-term memory.
+#
+# Everything the app reads on this path is a Cloud Storage read of already-written
+# JSON — no model call, no Sheets round trip on the critical path. That is the whole
+# design, and it is a direct answer to how the first version behaved: it cached
+# generated cards in /tmp on a service that scales to zero, so the cache was empty
+# on almost every open and the app fell through to a 45-second Gemini call on the
+# screen the user was looking at. Worse, when nothing was nutritionally short that
+# day the generator returned "skipped" with no plates, and the app's sheet sat on
+# "preparing…" forever with nothing that could ever fill it.
+#
+# So:
+#   GET  /coach/feed        pure read. Always answers, in ~100 ms, with whatever
+#                           exists plus `stale` and `generating` so the app can
+#                           decide between rendering and quietly refreshing.
+#   POST /coach/refresh     202 + a Cloud Tasks enqueue. Never blocks a request on
+#                           a model.
+#   POST /coach/generate    the worker. Called by Cloud Scheduler (four slots a
+#                           day), by the queue, or by hand.
+#   POST /coach/chat        a conversation anchored to one card, which also folds
+#                           anything durable it learns into memory.
+#   GET  /coach/thread/<id> one conversation.
+#   GET/POST/DELETE /coach/memory   read, add to, and correct what the coach
+#                           remembers — a memory the user can't edit is one they
+#                           can't correct.
+#
+# The legacy /insights/* endpoints above are left untouched: the installed app build
+# still reads them, and the backend deploys long before a new build lands on the
+# phone.
+# =============================================================================
+
+# The food vocabulary window. Four weeks is long enough for "no fish in a fortnight"
+# to mean something and short enough to describe how the user eats *now*.
+COACH_WINDOW_DAYS = 28
+
+# A feed older than this asks the app to kick a background refresh when it opens.
+# Four hours is shorter than the gap between the scheduled slots on purpose: opening
+# the app at 13:00 should quietly refresh into something about lunch rather than still
+# be talking about breakfast.
+COACH_STALE_HOURS = 4.0
+
+
+def _coach_mod(name: str):
+    """Import one of the coach modules that sit next to main.py.
+
+    The insights core is loaded by explicit file path (see `_insights_mod`) because
+    it predates having several of these; the coach modules import each other by
+    name, so what they need is the directory on `sys.path` — which is already true
+    in the container (everything is flattened into /app) and is made true here for
+    a file-path import in the tests.
+    """
+    import importlib
+    import sys
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    return importlib.import_module(name)
+
+
+@functools.lru_cache(maxsize=8)
+def _coach(name: str):
+    return _coach_mod(name)
+
+
+def _gemini_call(require_key: str, *, temperature: float = 0.3):
+    """A `prompt -> parsed JSON` callable for the pure modules to inject. Keeps the
+    model choice (and the API key) here, and keeps `food_taxonomy` / `coach_feed`
+    testable with a fake."""
+    narrator = _narrator_mod()
+
+    def call(prompt: str) -> Dict[str, Any]:
+        return narrator.call_gemini(prompt, require_key=require_key,
+                                    temperature=temperature)
+    return call
+
+
+def _coach_window_meals(now: datetime) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """(window meals, today's meals) from ONE read of the meals tab."""
+    all_rows = _all_meal_rows()
+    today = now.date().isoformat()
+    start = (now.date() - timedelta(days=COACH_WINDOW_DAYS)).isoformat()
+    return _window_meals(all_rows, start, today), [
+        r for r in all_rows if str(r.get("datetime", "")).startswith(today)]
+
+
+def _coach_profile(now: datetime, window_meals: List[Dict[str, Any]], *,
+                   learn: bool = False) -> Dict[str, Any]:
+    """The deterministic food-level reading of the window.
+
+    `learn=True` first asks the model to classify any food the curated taxonomy
+    can't place, and persists what it learns — done on the scheduled runs only, so a
+    new food costs one small call once and every read afterwards is free.
+    """
+    store = _coach("coach_store")
+    patterns = _coach("food_patterns")
+    taxonomy_mod = _coach("food_taxonomy")
+
+    taxonomy = store.read_json(store.TAXONOMY, default=taxonomy_mod.empty_taxonomy())
+    if learn and _gemini_available():
+        names = [str(i.get("name") or "")
+                 for row in window_meals
+                 for i in patterns._parse_items(row.get("items"))]
+        taxonomy, learned = taxonomy_mod.classify_unknown(
+            taxonomy, names, _gemini_call("foods", temperature=0.1))
+        if learned:
+            store.write_json(store.TAXONOMY, taxonomy)
+            app.logger.info("taxonomy learned %d new foods", learned)
+
+    return patterns.build_food_profile(
+        window_meals, taxonomy=taxonomy, window_days=COACH_WINDOW_DAYS,
+        ref_day=now.date().isoformat())
+
+
+def _coach_today(now: datetime, today_rows: List[Dict[str, Any]],
+                 consumed: Dict[str, float],
+                 targets: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Today so far: the meals, what's left of the budget, and which nutrients are
+    still short — the facts every time-sensitive card needs."""
+    ins = _insights_mod()
+    cal_t = targets.get("calories", {})
+    cal_left = max(0.0, (cal_t.get("ceiling") or cal_t.get("floor") or 0)
+                   - _round_num(consumed.get("calories")))
+    prot_t = targets.get("protein_g", {})
+    prot_left = max(0.0, (prot_t.get("floor") or 0)
+                    - _round_num(consumed.get("protein_g")))
+    return {
+        "date": now.date().isoformat(),
+        "current_time": now.strftime("%H:%M"),
+        "meals": ins.build_today_meals_summary(today_rows),
+        "calories_eaten": round(_round_num(consumed.get("calories"))),
+        "calories_left": round(cal_left),
+        "protein_eaten_g": round(_round_num(consumed.get("protein_g"))),
+        "protein_left_g": round(prot_left),
+    }
+
+
+def _coach_nutrients(consumed: Dict[str, float],
+                     targets: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """The nutrient picture, deliberately compressed to a handful of ratios.
+
+    It is *supporting* evidence now, not the subject: the whole content problem with
+    the first coach was that this was the only thing it could see, so it could only
+    ever tell the user what the Nutrients tab already showed.
+    """
+    out: Dict[str, Any] = {}
+    for key in ("protein_g", "fiber_g", "calories"):
+        target = targets.get(key) or {}
+        floor = target.get("floor") or target.get("ceiling")
+        if not floor:
+            continue
+        out[key] = {"eaten": round(_round_num(consumed.get(key)), 1),
+                    "target": floor,
+                    "pct": round(_round_num(consumed.get(key)) / floor, 2)}
+    return out
+
+
+def _next_meal_context(now: datetime, *, profile: Dict[str, Any],
+                       today: Dict[str, Any], consumed: Dict[str, float],
+                       targets: Dict[str, Dict[str, Any]],
+                       window_meals: List[Dict[str, Any]],
+                       memory: Dict[str, Any]) -> Dict[str, Any]:
+    """Everything the plate generator gets: the clock, the day, the user's timing
+    habits, the remaining budget, and candidate foods from BOTH the nutrient
+    shortfalls and the food-level findings."""
+    ins = _insights_mod()
+    feed = _coach("coach_feed")
+    memory_mod = _coach("coach_memory")
+
+    legacy_profile = ins.build_food_profile(window_meals, NUTRIENT_KEYS)
+    nutrient_ctx = ins.next_meal_context_v2(
+        consumed=consumed, targets=targets, focus_key=None,
+        food_profile=legacy_profile, today_rows=[], window_meals=window_meals,
+        window_days=COACH_WINDOW_DAYS, current_time=now.strftime("%H:%M"))
+    slot_hint = feed.slot_for(now)
+    return {
+        "current_time": now.strftime("%H:%M"),
+        "weekday": now.strftime("%A"),
+        "today_meals": today.get("meals", []),
+        "meal_pattern": ins.build_meal_timing_profile(window_meals,
+                                                      COACH_WINDOW_DAYS),
+        "calories_left": today.get("calories_left"),
+        "protein_left_g": today.get("protein_left_g"),
+        "shortfalls_today": nutrient_ctx.get("shortfalls_today", []),
+        "candidates": feed.next_meal_candidates(
+            profile, nutrient_candidates=nutrient_ctx.get("candidates", {}),
+            slot_hint=slot_hint),
+        "memory": memory_mod.for_prompt(memory, limit=12),
+    }
+
+
+def _read_feed_cards(now: datetime) -> List[Dict[str, Any]]:
+    """Every card that is still valid, in feed order — one storage read.
+
+    Cards carry their own expiry, so last night's summary is still here at 00:05 and
+    the Sunday review is still here on Thursday, without the reader having to know how
+    long any card lives.
+    """
+    store = _coach("coach_store")
+    feed = _coach("coach_feed")
+    payload = store.read_json(store.FEED, default=None)
+    cards = (payload.get("cards") or []) if isinstance(payload, dict) else []
+    return feed.live_cards([c for c in cards if isinstance(c, dict)], now=now)
+
+
+@app.get("/coach/feed")
+def coach_feed_read():
+    """The app's only read. Pure storage — never calls a model, never touches the
+    spreadsheet, so it answers in ~100 ms whether or not anything has been generated
+    yet.
+
+    `generating` is true while a background run is in flight, which is what lets the
+    app show a real progress indicator instead of an empty screen; `stale` says the
+    newest card is old enough to be worth refreshing.
+    """
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    store = _coach("coach_store")
+    feed = _coach("coach_feed")
+    now = datetime.now(_tz())
+    cards = _read_feed_cards(now)
+    state = store.read_state()
+    return jsonify({
+        "status": "ready" if cards else "empty",
+        "generated_at": max((str(c.get("created_at") or "") for c in cards),
+                            default=None),
+        "server_time": now.isoformat(timespec="seconds"),
+        "stale": feed.is_stale(cards, now=now, max_age_hours=COACH_STALE_HOURS),
+        "generating": store.job_is_live(state, now.isoformat()),
+        "cards": cards,
+    }), 200
+
+
+@app.post("/coach/refresh")
+def coach_refresh():
+    """Ask for fresh cards and return immediately (202).
+
+    The work goes to the Cloud Tasks queue that already carries meal analysis, so
+    the app never waits on Gemini and a transient failure is retried by the queue
+    rather than surfaced as a broken screen. If the queue is unreachable the reply
+    says so honestly (`queued: false`) and the app keeps showing what it has.
+    """
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    body = request.get_json(silent=True) or {}
+    feed = _coach("coach_feed")
+    now = datetime.now(_tz())
+    slot = str(body.get("slot") or "adhoc")
+    if slot not in feed.SLOTS:
+        slot = "adhoc"
+    reason = str(body.get("reason") or "manual")[:40]
+
+    try:
+        _enqueue_coach_generate(slot, reason)
+        return jsonify({"queued": True, "slot": slot,
+                        "server_time": now.isoformat(timespec="seconds")}), 202
+    except Exception:
+        app.logger.exception("coach refresh enqueue failed")
+        return jsonify({"queued": False, "slot": slot,
+                        "error": "queue unavailable"}), 202
+
+
+def _enqueue_coach_generate(slot: str, reason: str) -> None:
+    """Hand a generation to the Cloud Tasks queue that already runs meal analysis."""
+    from google.cloud import tasks_v2  # lazy: keeps tests importable without the lib
+    client = tasks_v2.CloudTasksClient()
+    parent = client.queue_path(
+        os.environ["GCP_PROJECT"],
+        os.environ.get("TASKS_LOCATION", "europe-west1"),
+        os.environ["TASKS_QUEUE"],
+    )
+    url = os.environ.get("COACH_GENERATE_URL") or (
+        os.environ["PROCESS_URL"].rsplit("/", 1)[0] + "/coach/generate")
+    client.create_task(parent=parent, task={"http_request": {
+        "http_method": tasks_v2.HttpMethod.POST,
+        "url": url,
+        "headers": {"Content-Type": "application/json",
+                    "X-Auth-Token": os.environ.get("INGEST_TOKEN", "")},
+        "body": json.dumps({"slot": slot, "reason": reason}).encode("utf-8"),
+    }})
+
+
+def _trigger_coach_refresh(reason: str) -> None:
+    """Best-effort background refresh after the data changed (a meal landed).
+
+    Never raises and never blocks: the meal is already saved, and a stale card is a
+    far smaller problem than a failed log.
+    """
+    try:
+        _enqueue_coach_generate("adhoc", reason)
+    except Exception:
+        app.logger.info("coach refresh not enqueued (%s)", reason, exc_info=True)
+
+
+@app.post("/coach/generate")
+def coach_generate():
+    """The worker: build the deterministic facts, narrate them, store the cards.
+
+    Called by Cloud Scheduler for the four daily slots (`morning`, `afternoon`,
+    `evening`, `weekly`), by the queue after a meal lands (`adhoc`), or by hand.
+    Nothing is waiting on the response, so this is the one place allowed to be slow.
+
+    Idempotent by construction: cards carry a deterministic id per (day, slot, kind,
+    topic), so a retry replaces its own cards instead of stacking duplicates.
+    """
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    store = _coach("coach_store")
+    feed = _coach("coach_feed")
+    memory_mod = _coach("coach_memory")
+    narrator = _narrator_mod()
+
+    body = request.get_json(silent=True) or {}
+    now = datetime.now(_tz())
+    slot = str(body.get("slot") or "").strip() or feed.slot_for(now)
+    # Validate the request before the environment: a malformed call is a 400 whether
+    # or not the model is configured.
+    if slot not in feed.SLOTS:
+        return jsonify({"error": f"unknown slot {slot!r}",
+                        "known": list(feed.SLOTS)}), 400
+    if not _gemini_available():
+        return jsonify({"error": "GEMINI_API_KEY not configured"}), 503
+    reason = str(body.get("reason") or "schedule")[:40]
+
+    job_id = f"{now.isoformat(timespec='seconds')}:{slot}"
+    if store.claim_job(job_id, reason, now.isoformat(timespec="seconds")) is None:
+        # Another generation is already running. Two overlapping runs would both
+        # spend model calls to write the same cards.
+        return jsonify({"status": "busy", "slot": slot}), 200
+
+    try:
+        window_meals, today_rows = _coach_window_meals(now)
+        consumed = _todays_consumed(today_rows)
+        targets, _basis = _resolved_targets_and_basis()
+        # The scheduled runs pay for taxonomy learning; an ad-hoc refresh after a
+        # meal must stay fast, so it reads the taxonomy as-is.
+        profile = _coach_profile(now, window_meals, learn=slot != "adhoc")
+        memory = store.read_json(store.MEMORY, default=memory_mod.empty())
+        today = _coach_today(now, today_rows, consumed, targets)
+        nutrients = _coach_nutrients(consumed, targets)
+        state = store.read_state()
+        existing = _read_feed_cards(now)
+
+        def narrate(facts: Dict[str, Any]) -> Dict[str, Any]:
+            facts["memory"] = memory_mod.for_prompt(memory)
+            return narrator.narrate_cards(facts)
+
+        def plates() -> Dict[str, Any]:
+            context = _next_meal_context(
+                now, profile=profile, today=today, consumed=consumed,
+                targets=targets, window_meals=window_meals, memory=memory)
+            return narrator.narrate_next_meal(context)
+
+        cards, shown = feed.generate_cards(
+            slot=slot, now=now, profile=profile, today=today, nutrients=nutrients,
+            memory=memory, state=state, narrate=narrate,
+            plates_fn=plates if slot != "weekly" else None,
+            weekly=_coach_weekly_facts(profile) if slot == "weekly" else None,
+            recent_titles=[str(c.get("title") or "") for c in existing])
+
+        if not cards:
+            store.finish_job(job_id, now.isoformat(timespec="seconds"),
+                             error="no cards produced")
+            return jsonify({"status": "empty", "slot": slot,
+                            "days_logged": profile.get("days_logged")}), 200
+
+        # Merge into the rolling feed under a precondition, so a scheduled run and a
+        # meal-triggered refresh landing together can't drop each other's cards.
+        stamp = now.isoformat(timespec="seconds")
+        merged_holder: Dict[str, Any] = {}
+
+        def merge_into(current: Any) -> Dict[str, Any]:
+            existing = (current.get("cards") or []) if isinstance(current, dict) else []
+            merged_holder["cards"] = feed.merge_cards(existing, cards, now=now)
+            return {"generated_at": stamp, "slot": slot,
+                    "cards": merged_holder["cards"]}
+        store.update_json(store.FEED, merge_into, default={"cards": []})
+        merged = merged_holder.get("cards", cards)
+
+        def note_run(current: Dict[str, Any]) -> Dict[str, Any]:
+            current.setdefault("runs", {})[slot] = now.isoformat(timespec="seconds")
+            current.setdefault("shown", {}).update(shown)
+            job = current.get("job")
+            if isinstance(job, dict) and job.get("id") == job_id:
+                job["finished_at"] = now.isoformat(timespec="seconds")
+            return current
+        store.update_state(note_run)
+
+        app.logger.info("coach %s: %d cards (%d in feed)", slot, len(cards),
+                        len(merged))
+        return jsonify({"status": "generated", "slot": slot,
+                        "cards": len(cards), "feed": len(merged),
+                        "findings_shown": list(shown)}), 200
+
+    except Exception as exc:
+        app.logger.exception("coach generation failed")
+        store.finish_job(job_id, datetime.now(_tz()).isoformat(timespec="seconds"),
+                         error=str(exc))
+        return jsonify({"status": "error", "error": str(exc)}), 500
+
+
+def _coach_weekly_facts(profile: Dict[str, Any]) -> Dict[str, Any]:
+    """The Sunday frame: the week in foods, plus the continuity thread against the
+    finding the last review picked (a coach that remembers what it asked for is a
+    relationship; one that starts fresh every week is a report)."""
+    store = _coach("coach_store")
+    state = store.read_state()
+    shown = state.get("shown") or {}
+    previous = sorted(shown.items(), key=lambda kv: str(kv[1].get("date") or ""),
+                      reverse=True)[:1]
+    prior = None
+    if previous:
+        key, record = previous[0]
+        current = next((f for f in profile.get("findings", []) if f["id"] == key),
+                       None)
+        prior = {
+            "finding": key,
+            "severity_then": record.get("severity"),
+            "severity_now": current["severity"] if current else 0.0,
+            "still_present": bool(current),
+        }
+    return {"prior_focus": prior,
+            "groups": profile.get("groups"),
+            "variety": profile.get("variety")}
+
+
+# -- chat ----------------------------------------------------------------------
+
+def _thread(thread_id: str) -> Dict[str, Any]:
+    store = _coach("coach_store")
+    return store.read_json(store.thread_path(thread_id),
+                           default={"id": thread_id, "turns": []})
+
+
+@app.get("/coach/thread/<thread_id>")
+def coach_thread(thread_id: str):
+    """One conversation, oldest turn first."""
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    store = _coach("coach_store")
+    if not store.is_safe_id(thread_id):
+        return jsonify({"error": "bad thread id"}), 400
+    return jsonify(_thread(thread_id)), 200
+
+
+@app.post("/coach/chat")
+def coach_chat():
+    """Talk to the coach about a specific card.
+
+    Synchronous, unlike generation: the user is sitting there waiting for a reply, so
+    a couple of seconds is the right trade. The card's own evidence goes into the
+    prompt along with the food profile, today's log and the long-term memory, so the
+    answer is anchored to the same facts the card was.
+    """
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    store = _coach("coach_store")
+    memory_mod = _coach("coach_memory")
+    narrator = _narrator_mod()
+
+    body = request.get_json(silent=True) or {}
+    message = " ".join(str(body.get("message") or "").split())[:1000]
+    thread_id = str(body.get("thread_id") or "").strip()
+    card_id = str(body.get("card_id") or "").strip()
+    # The request is validated before the environment, so a malformed call reads as a
+    # 400 whether or not the model happens to be configured.
+    if not message:
+        return jsonify({"error": "message is required"}), 400
+    if not store.is_safe_id(thread_id):
+        return jsonify({"error": "bad thread id"}), 400
+    if not _gemini_available():
+        return jsonify({"error": "GEMINI_API_KEY not configured"}), 503
+
+    now = datetime.now(_tz())
+    today_iso = now.date().isoformat()
+    thread = _thread(thread_id)
+    card = next((c for c in _read_feed_cards(now) if c.get("id") == card_id), None)
+
+    try:
+        window_meals, today_rows = _coach_window_meals(now)
+        consumed = _todays_consumed(today_rows)
+        targets, _basis = _resolved_targets_and_basis()
+        profile = _coach_profile(now, window_meals)
+        memory = store.read_json(store.MEMORY, default=memory_mod.empty())
+        context = {
+            "card": {"title": card.get("title"), "body": card.get("body"),
+                     "kind": card.get("kind"), "evidence": card.get("evidence"),
+                     "swap": card.get("swap")} if card else None,
+            "today": _coach_today(now, today_rows, consumed, targets),
+            "nutrients_supporting": _coach_nutrients(consumed, targets),
+            "food_patterns": {
+                "groups": {k: {"servings_per_week": v.get("servings_per_week"),
+                               "reference_min": v.get("week_min"),
+                               "reference_max": v.get("week_max"),
+                               "days_since_last": v.get("days_since_last")}
+                           for k, v in (profile.get("groups") or {}).items()},
+                "variety": profile.get("variety"),
+                "findings": [{"fact": f["headline"]}
+                             for f in profile.get("findings", [])[:5]],
+            },
+            "foods_the_user_eats": [
+                {"food": f["food"], "times": f["times"],
+                 "typical_portion_g": f["median_portion_g"]}
+                for f in profile.get("foods", [])[:25]],
+            "memory": memory_mod.for_prompt(memory),
+        }
+        answer = narrator.chat_turn(context, thread.get("turns") or [], message)
+    except Exception as exc:
+        app.logger.exception("coach chat failed")
+        return jsonify({"error": str(exc)}), 502
+
+    reply = answer.get("reply") or ""
+    if not reply:
+        return jsonify({"error": "empty reply"}), 502
+
+    stamp = now.isoformat(timespec="seconds")
+
+    def append(current: Any) -> Dict[str, Any]:
+        data = current if isinstance(current, dict) else {"id": thread_id,
+                                                          "turns": []}
+        turns = [t for t in (data.get("turns") or []) if isinstance(t, dict)]
+        turns.append({"role": "user", "text": message, "at": stamp})
+        turns.append({"role": "coach", "text": reply, "at": stamp})
+        # Keep a thread bounded: the prompt only reads the last dozen turns anyway,
+        # and an unbounded blob is a slow read on the app's chat screen.
+        data.update({"id": thread_id, "card_id": card_id or data.get("card_id"),
+                     "title": (card or {}).get("title") or data.get("title"),
+                     "updated_at": stamp, "turns": turns[-60:]})
+        return data
+    thread = store.update_json(store.thread_path(thread_id), append,
+                               default={"id": thread_id, "turns": []})
+
+    learned = 0
+    candidates = answer.get("memory_candidates") or []
+    if candidates:
+        def remember(current: Any) -> Dict[str, Any]:
+            merged, added = memory_mod.merge(
+                current if isinstance(current, dict) else memory_mod.empty(),
+                candidates, today=today_iso, source="chat")
+            merged["_added"] = added
+            return merged
+        stored = store.update_json(store.MEMORY, remember,
+                                   default=memory_mod.empty())
+        learned = int((stored or {}).pop("_added", 0) or 0)
+        if learned:
+            app.logger.info("coach memory: %d new fact(s)", learned)
+
+    return jsonify({"thread_id": thread_id, "reply": reply,
+                    "turns": thread.get("turns", []),
+                    "memory_learned": learned}), 200
+
+
+# -- memory --------------------------------------------------------------------
+
+@app.get("/coach/memory")
+def coach_memory_read():
+    """What the coach remembers, newest-weightiest first."""
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    store = _coach("coach_store")
+    memory_mod = _coach("coach_memory")
+    memory = store.read_json(store.MEMORY, default=memory_mod.empty())
+    return jsonify(memory), 200
+
+
+@app.post("/coach/memory")
+def coach_memory_add():
+    """Tell the coach something about yourself directly. Pinned, because it was said
+    on purpose rather than inferred from a conversation."""
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    store = _coach("coach_store")
+    memory_mod = _coach("coach_memory")
+    body = request.get_json(silent=True) or {}
+    fact = " ".join(str(body.get("fact") or "").split())[:160]
+    if not fact:
+        return jsonify({"error": "fact is required"}), 400
+    kind = str(body.get("type") or "preference")
+    today_iso = datetime.now(_tz()).date().isoformat()
+    memory = store.update_json(
+        store.MEMORY,
+        lambda current: memory_mod.add_manual(current, kind=kind, fact=fact,
+                                              today=today_iso),
+        default=memory_mod.empty())
+    return jsonify(memory), 200
+
+
+@app.delete("/coach/memory/<fact_id>")
+def coach_memory_delete(fact_id: str):
+    """Forget one fact. The coach being wrong about you is recoverable; the coach
+    being permanently wrong about you is not."""
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    store = _coach("coach_store")
+    memory_mod = _coach("coach_memory")
+    if not store.is_safe_id(fact_id):
+        return jsonify({"error": "bad id"}), 400
+    memory = store.update_json(
+        store.MEMORY, lambda current: memory_mod.remove(current, fact_id),
+        default=memory_mod.empty())
+    return jsonify(memory), 200
+
+
+@app.get("/coach/patterns")
+def coach_patterns():
+    """The deterministic food-level analysis, unnarrated — the debug view for
+    eyeballing what the coach is reasoning over before any model call is spent (the
+    same role `/insights/diagnose` plays for the nutrient side)."""
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    now = datetime.now(_tz())
+    window_meals, _today_rows = _coach_window_meals(now)
+    return jsonify(_coach_profile(now, window_meals)), 200

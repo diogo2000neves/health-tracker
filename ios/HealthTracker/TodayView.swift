@@ -553,6 +553,7 @@ private struct MealRow: View {
 	        .sheet(item: $editTarget) { target in
 	            EditMealItemSheet(datetime: meal.datetime, itemIndex: target.id, item: target.item) { updated in
 	                meal = updated
+	                store.noteEdit()
 	                Task { await store.load() }
 	            }
 	        }

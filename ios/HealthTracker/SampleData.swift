@@ -20,10 +20,30 @@ enum SampleData {
     static let daily: DailyResponse = decode(DailyResponse.self, from: dailyJSON())
     static let nutrients: NutrientInfoResponse = decode(NutrientInfoResponse.self,
                                                         from: nutrientsJSON())
-    static let weeklyInsights: WeeklyInsightsResponse = decode(WeeklyInsightsResponse.self,
-                                                               from: weeklyJSON())
-    static let nextMeal: NextMealResponse = decode(NextMealResponse.self,
-                                                   from: nextMealJSON())
+    static let coachFeed: CoachFeed = decode(CoachFeed.self, from: coachFeedJSON())
+    static let coachMemory: CoachMemory = decode(CoachMemory.self,
+                                                 from: coachMemoryJSON())
+    static let coachThread: CoachThread = decode(CoachThread.self,
+                                                 from: coachThreadJSON())
+
+    /// A plausible reply, so the chat can be exercised end to end without a backend.
+    static func coachChatReply(message: String) -> CoachChatReply {
+        decode(CoachChatReply.self, from: [
+            "thread_id": "t-sample",
+            "reply": "Boa pergunta. O arroz branco não tem nada de mal em si — o que "
+                + "pesa é ser o único acompanhamento cinco dias seguidos. Alterna com "
+                + "batata cozida ou feijão preto duas vezes e já muda a fibra da "
+                + "semana.",
+            "turns": [
+                ["role": "user", "text": message, "at": "2026-07-26T15:32:00"],
+                ["role": "coach",
+                 "text": "Boa pergunta. O arroz branco não tem nada de mal em si — o "
+                    + "que pesa é ser o único acompanhamento cinco dias seguidos.",
+                 "at": "2026-07-26T15:32:04"],
+            ],
+            "memory_learned": 0,
+        ])
+    }
 
     // MARK: - /nutrients (a few populated examples; the rest render "em breve")
 
@@ -343,94 +363,151 @@ enum SampleData {
     private static func round1(_ x: Double) -> Double { (x * 10).rounded() / 10 }
     private static func round2(_ x: Double) -> Double { (x * 100).rounded() / 100 }
 
-    // MARK: - /insights/weekly (a full, realistic Sunday review)
+    // MARK: - /coach/feed (a realistic afternoon feed)
+    //
+    // Cards as the server writes them: food-first prose, chips carrying the numbers
+    // behind the claim, a swap whose `from` is a food that appears in the sample meals,
+    // and the plates riding along on the next-meal card.
 
-    private static func weeklyJSON() -> [String: Any] {
-        [
-            "status": "generated",
-            "week_start": "2026-07-19",
-            "generated_at": "2026-07-19T09:00:00",
-            "window_start": "2026-07-12",
-            "window_end": "2026-07-18",
-            "focus_key": "saturated_fat_g",
-            "prior_focus_delta": ["key": "omega3_g", "prev": 0.9, "now": 1.3,
-                                  "pct": 44, "direction": "up", "toward_target": true],
-            "coverage_note": "Boa cobertura de dados esta semana.",
-            "report": [
-                "headline": "Semana forte: proteína cravada e ómega-3 a subir — só a "
-                    + "gordura saturada é que pede atenção.",
-                "wins": [
-                    ["title": "Proteína no ponto",
-                     "detail": "Bateste a meta em 6 dos 7 dias — é isto que protege o "
-                        + "músculo enquanto perdes gordura."],
-                    ["title": "Ómega-3 a subir",
-                     "detail": "As sardinhas de terça e sexta fizeram a diferença."],
-                ],
-                "focus": [
-                    "key": "saturated_fat_g", "label": "Gordura saturada",
-                    "why": "Ficaste cerca de 28% acima do teto em 5 dos 7 dias.",
-                    "attribution": "68% vem do chouriço nas refeições de sábado e domingo.",
-                    "severity": "high",
-                ],
-                "swap": [
-                    "from": "chouriço", "to": "peito de peru fumado",
-                    "why": "Mantém o salgado de que gostas com cerca de 1/5 da gordura "
-                        + "saturada.",
-                ],
-                "continuity": "O ómega-3 subiu 44% desde domingo passado — continua com "
-                    + "o peixe 2x/semana.",
-                "encouragement": "Uma troca só e a semana fica redonda. Vais lá "
-                    + "facilmente.",
-            ],
-        ]
-    }
-
-    // MARK: - /insights/next-meal (three ranked plates)
-
-    private static func nextMealJSON() -> [String: Any] {
-        func item(_ food: String, _ lo: Int, _ hi: Int, new: Bool = false) -> [String: Any] {
+    private static func coachFeedJSON() -> [String: Any] {
+        func chip(_ label: String, _ tone: String = "neutral") -> [String: Any] {
+            ["label": label, "tone": tone]
+        }
+        func item(_ food: String, _ lo: Int, _ hi: Int,
+                  new: Bool = false) -> [String: Any] {
             ["food": food, "grams_low": lo, "grams_high": hi, "new": new]
         }
         func cover(_ key: String, _ label: String, _ note: String) -> [String: Any] {
             ["key": key, "label": label, "note": note]
         }
         return [
-            "status": "generated",
-            "date": "2026-07-19",
-            "generated_at": "2026-07-19T17:32:00",
-            "focus_key": "saturated_fat_g",
-            "plates": [
+            "status": "ready",
+            "generated_at": "2026-07-26T15:30:00+01:00",
+            "server_time": "2026-07-26T15:41:00+01:00",
+            "stale": false,
+            "generating": false,
+            "cards": [
                 [
-                    "rank": 1, "recommended": true,
-                    "title": "Salmão no forno com brócolos e arroz",
-                    "items": [item("salmão", 140, 170), item("brócolos", 120, 150),
-                              item("arroz", 60, 90)],
-                    "covers": [cover("omega3_g", "Ómega-3", "fecha a semana"),
-                               cover("protein_g", "Proteína", "+38 g")],
-                    "calories": 640, "protein_g": 42,
-                    "why": "Fecha o ómega-3 da semana e a proteína de hoje, com comida "
-                        + "que já comes.",
+                    "id": "2026-07-26:afternoon:next_meal",
+                    "kind": "next_meal", "slot": "afternoon", "date": "2026-07-26",
+                    "created_at": "2026-07-26T15:30:00+01:00",
+                    "priority": 100,
+                    "title": "O que comer ao jantar",
+                    "body": "Já almoçaste às 13:10 e sobram-te cerca de 780 kcal — dá "
+                        + "para um jantar a sério.",
+                    "chips": [chip("3 ideias"), chip("780 kcal livres")],
+                    "next_slot": "jantar",
+                    "thread_id": "t-nextmeal",
+                    "plates": [
+                        [
+                            "rank": 1, "recommended": true,
+                            "title": "Bacalhau no forno com grão e espinafres",
+                            "items": [item("bacalhau", 130, 160, new: true),
+                                      item("grão-de-bico", 90, 120, new: true),
+                                      item("espinafres", 100, 140),
+                                      item("azeite", 8, 12)],
+                            "covers": [cover("omega3_g", "Ómega-3", "primeiro peixe da semana"),
+                                       cover("fiber_g", "Fibra", "+11 g")],
+                            "calories": 610, "protein_g": 44,
+                            "why": "Duas semanas sem peixe e sem leguminosas — este "
+                                + "prato resolve as duas coisas de uma vez.",
+                        ],
+                        [
+                            "rank": 2, "recommended": false,
+                            "title": "Omelete de 3 ovos com legumes salteados",
+                            "items": [item("ovo", 150, 165), item("mistura de legumes", 120, 160),
+                                      item("azeite", 8, 12)],
+                            "covers": [cover("protein_g", "Proteína", "+26 g")],
+                            "calories": 430, "protein_g": 28,
+                            "why": "Dez minutos, com o que já tens em casa.",
+                        ],
+                        [
+                            "rank": 3, "recommended": false,
+                            "title": "Frango grelhado com batata-doce e salada",
+                            "items": [item("peito de frango", 140, 170),
+                                      item("batata-doce", 150, 200, new: true),
+                                      item("salada mista", 80, 120)],
+                            "covers": [cover("protein_g", "Proteína", "+38 g")],
+                            "calories": 590, "protein_g": 45,
+                            "why": "Troca a batata frita habitual pela assada, sem "
+                                + "perder o acompanhamento.",
+                        ],
+                    ],
                 ],
                 [
-                    "rank": 2, "recommended": false,
-                    "title": "Omelete de 3 ovos com espinafres e queijo fresco",
-                    "items": [item("ovos", 150, 180), item("espinafres", 80, 120),
-                              item("queijo fresco", 60, 80)],
-                    "covers": [cover("protein_g", "Proteína", "+30 g"),
-                               cover("vitamin_d_ug", "Vitamina D", "")],
-                    "calories": 480, "protein_g": 33,
-                    "why": "Rápida e rica em proteína; os espinafres puxam pelo ferro.",
+                    "id": "2026-07-26:afternoon:check_in",
+                    "kind": "check_in", "slot": "afternoon", "date": "2026-07-26",
+                    "created_at": "2026-07-26T15:30:00+01:00",
+                    "priority": 92,
+                    "title": "Meio-dia feito, e ainda sem um legume",
+                    "body": "Aveia ao pequeno-almoço e arroz com bife ao almoço — bom "
+                        + "em proteína, mas o prato ainda não viu nada verde hoje.",
+                    "chips": [chip("62 g de proteína", "good"),
+                              chip("0 legumes hoje", "warn")],
+                    "thread_id": "t-checkin",
                 ],
                 [
-                    "rank": 3, "recommended": false,
-                    "title": "Bowl de grão com atum e legumes",
-                    "items": [item("grão", 120, 150), item("atum", 80, 100),
-                              item("edamame", 60, 90, new: true), item("azeite", 10, 15)],
-                    "covers": [cover("fiber_g", "Fibra", "+9 g"),
-                               cover("protein_g", "Proteína", "+28 g")],
-                    "calories": 560, "protein_g": 31,
-                    "why": "Fibra e proteína numa tigela; o grão mantém-te saciado.",
+                    "id": "2026-07-26:afternoon:pattern:fish_white",
+                    "kind": "pattern", "slot": "afternoon", "date": "2026-07-26",
+                    "topic": "fish_white",
+                    "created_at": "2026-07-26T15:30:00+01:00",
+                    "priority": 68,
+                    "title": "Duas semanas sem peixe",
+                    "body": "A carne vermelha apareceu sete vezes nas últimas duas "
+                        + "semanas e o peixe nenhuma. Uma troca por semana já muda a "
+                        + "gordura e o ómega-3 sem mexer na proteína.",
+                    "chips": [chip("7× carne vermelha", "warn"),
+                              chip("0× peixe", "bad"),
+                              chip("referência: 2×/semana")],
+                    "swap": ["from": "bife de vaca", "to": "bacalhau",
+                             "why": "Mesma proteína, muito menos gordura saturada — e "
+                                + "traz o ómega-3 que falta.",
+                             "new": true],
+                    "thread_id": "t-fish",
                 ],
+                [
+                    "id": "2026-07-26:morning:win",
+                    "kind": "win", "slot": "morning", "date": "2026-07-26",
+                    "created_at": "2026-07-26T07:30:00+01:00",
+                    "priority": 40,
+                    "title": "A aveia está a puxar por ti",
+                    "body": "Nove pequenos-almoços seguidos com aveia — é a tua maior "
+                        + "fonte de fibra e a razão pela qual as manhãs estão sólidas.",
+                    "chips": [chip("9 dias seguidos", "good")],
+                    "thread_id": "t-oats",
+                ],
+            ],
+        ]
+    }
+
+    private static func coachMemoryJSON() -> [String: Any] {
+        [
+            "version": 1,
+            "facts": [
+                ["id": "m-1", "type": "dislike", "fact": "não gosta de peixe cozido",
+                 "source": "chat", "pinned": false, "mentions": 2],
+                ["id": "m-2", "type": "routine",
+                 "fact": "cozinha em 15 minutos nos dias de semana",
+                 "source": "chat", "pinned": false, "mentions": 1],
+                ["id": "m-3", "type": "constraint",
+                 "fact": "não come lactose à noite", "source": "user",
+                 "pinned": true, "mentions": 1],
+            ],
+        ]
+    }
+
+    private static func coachThreadJSON() -> [String: Any] {
+        [
+            "id": "t-fish", "card_id": "2026-07-26:afternoon:pattern:fish_white",
+            "title": "Duas semanas sem peixe",
+            "turns": [
+                ["role": "user", "text": "não gosto de peixe cozido",
+                 "at": "2026-07-25T21:04:00"],
+                ["role": "coach",
+                 "text": "Fica anotado. Então vamos por assado ou na air fryer: "
+                    + "bacalhau no forno com azeite e alho fica bem longe de cozido, "
+                    + "e leva 20 minutos.",
+                 "at": "2026-07-25T21:04:05"],
             ],
         ]
     }

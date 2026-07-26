@@ -20,6 +20,14 @@ COPY ingest/nutrient_info.json .
 COPY ingest/insights.py .
 COPY ingest/nutrient_policy.json .
 COPY ingest/narrator.py .
+# The Coach (v2): durable storage, the canonical food taxonomy, the deterministic
+# food-pattern analysis, the card feed and the long-term memory. These import each
+# other by name, which works because everything is flattened into /app.
+COPY ingest/coach_store.py .
+COPY ingest/food_taxonomy.py .
+COPY ingest/food_patterns.py .
+COPY ingest/coach_feed.py .
+COPY ingest/coach_memory.py .
 
 ENV PORT=8080
 # 300s timeout: strongest-first model chain with per-model retries can legitimately

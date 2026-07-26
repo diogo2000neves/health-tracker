@@ -26,10 +26,17 @@ final class TodayStore {
     /// True while a reload runs behind data that's already on screen — drives a
     /// small, unobtrusive indicator instead of blocking the view.
     var isRefreshing = false
+    /// Bumped whenever the user changes the day's data from inside the app (currently
+    /// a hand-corrected meal item). The root view watches it and asks the coach to
+    /// regenerate, since its day cards are now describing numbers that changed.
+    /// Meals logged the usual way — through the Shortcut — are picked up server-side.
+    private(set) var editCount = 0
 
     init() {
         response = APIClient.shared.cachedToday()
     }
+
+    func noteEdit() { editCount += 1 }
 
     func load() async {
         let hadResponse = response != nil
@@ -88,7 +95,7 @@ final class TrendsStore {
 struct RootView: View {
     @State private var today = TodayStore()
     @State private var trends = TrendsStore()
-    @State private var insights = InsightsStore()
+    @State private var coach = CoachStore()
     @State private var showProfile = false
     @State private var selection = 0
     @Environment(\.scenePhase) private var scenePhase
@@ -102,23 +109,37 @@ struct RootView: View {
                 NutrientsView(store: today)
             }
             Tab("Coach", systemImage: "sparkles", value: 2) {
-                InsightsView(store: insights)
+                CoachView(store: coach)
             }
+            .badge(coach.unseenCount)
             Tab("Tendências", systemImage: "chart.xyaxis.line", value: 3) {
                 TrendsView(store: trends, today: today)
             }
         }
+        // Concurrently, not in sequence: these are three independent fetches, and
+        // awaiting them one after another meant the Coach tab's data was always last
+        // in line behind two other round trips.
+        //
+        // The coach is NOT loaded here — `CoachView.task` owns that, and its store
+        // rate-limits itself. The old version loaded it from the root AND from the
+        // view AND on every foreground, then kicked off generation from inside the
+        // load, so one tap could put three overlapping model runs in flight.
         .task {
-            await today.load()
-            await trends.load()
-            await insights.load()
+            async let first: Void = today.load()
+            async let second: Void = trends.load()
+            _ = await (first, second)
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 Task { await today.load() }
                 Task { await trends.load() }
-                Task { await insights.load() }
+                Task { await coach.load() }
             }
+        }
+        .onChange(of: today.editCount) { _, _ in
+            // A hand-corrected meal changes today's numbers, so the coach's day cards
+            // are out of date.
+            coach.mealWasLogged()
         }
         .sheet(isPresented: $showProfile) {
             ProfileView(store: today)

@@ -58,33 +58,63 @@ struct APIClient {
         return try await get("nutrients", query: [])
     }
 
-    /// The latest weekly coaching report. Read-only — the strong model wrote it on the
-    /// Mac; `status == "pending"` until the first Sunday run has landed.
-    func weeklyInsights() async throws -> WeeklyInsightsResponse {
-        if useSampleData { return SampleData.weeklyInsights }
-        return try await get("insights/weekly", query: [], cacheAs: "insights_weekly")
+    // MARK: - Coach
+    //
+    // The read is a plain GET of already-generated cards — the server does no model
+    // work on this path, so it answers in ~100 ms and the app never waits on Gemini
+    // to draw a screen. Generation is asked for separately and acknowledged with a
+    // 202; the app watches for the result by re-reading the feed.
+
+    /// The current card feed. Always answers, generated or not.
+    func coachFeed() async throws -> CoachFeed {
+        if useSampleData { return SampleData.coachFeed }
+        return try await get("coach/feed", query: [], cacheAs: "coach_feed")
     }
 
-    /// Today's next-meal plates from the file cache (v2 endpoint).
-    /// `status == "pending"` if on-demand generation hasn't been run yet.
-    func nextMeal() async throws -> NextMealResponse {
-        if useSampleData { return SampleData.nextMeal }
-        return try await get("insights/next-meal/v2", query: [], cacheAs: "insights_next_meal")
+    /// Ask for fresh cards. Returns as soon as the work is queued (202) — never waits
+    /// for the generation itself.
+    @discardableResult
+    func coachRefresh(reason: String) async throws -> CoachRefreshAck {
+        if useSampleData { return CoachRefreshAck.sample }
+        return try await post("coach/refresh", body: ["reason": reason],
+                              timeout: 20)
     }
 
-    /// Trigger on-demand generation of next-meal suggestions via Gemini API.
-    /// Returns immediately with the generated plates (may take 5-15s on first call).
-    func generateNextMeal() async throws -> NextMealResponse {
-        if useSampleData { return SampleData.nextMeal }
-        var url = Config.baseURL.appending(path: "insights/generate-next-meal")
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
+    /// One conversation's history.
+    func coachThread(id: String) async throws -> CoachThread {
+        if useSampleData { return SampleData.coachThread }
+        return try await get("coach/thread/\(id)", query: [],
+                            cacheAs: "coach_thread_\(id)")
+    }
+
+    /// Send a message about a card. Synchronous by design: the user is waiting for the
+    /// reply, so a couple of seconds is the right trade — with a longer timeout than a
+    /// plain read, because a model is genuinely in the loop here.
+    func coachChat(threadID: String, cardID: String,
+                   message: String) async throws -> CoachChatReply {
+        if useSampleData { return SampleData.coachChatReply(message: message) }
+        return try await post("coach/chat",
+                              body: ["thread_id": threadID, "card_id": cardID,
+                                     "message": message],
+                              timeout: 60)
+    }
+
+    /// What the coach remembers about the user.
+    func coachMemory() async throws -> CoachMemory {
+        if useSampleData { return SampleData.coachMemory }
+        return try await get("coach/memory", query: [], cacheAs: "coach_memory")
+    }
+
+    func addCoachMemory(fact: String, type: String) async throws -> CoachMemory {
+        if useSampleData { return SampleData.coachMemory }
+        return try await post("coach/memory", body: ["fact": fact, "type": type])
+    }
+
+    func deleteCoachMemory(id: String) async throws -> CoachMemory {
+        if useSampleData { return SampleData.coachMemory }
+        var request = URLRequest(url: Config.baseURL.appending(path: "coach/memory/\(id)"))
+        request.httpMethod = "DELETE"
         request.setValue(Config.authToken, forHTTPHeaderField: "X-Auth-Token")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-        // Longer timeout for the Gemini API call (may take 30s).
-        let timeout: TimeInterval = 45
-        request.timeoutInterval = timeout
         return try await send(request, cacheAs: nil)
     }
 
@@ -119,12 +149,19 @@ struct APIClient {
         useSampleData ? nil : DiskCache.load(NutrientInfoResponse.self, as: "nutrients")
     }
 
-    func cachedWeeklyInsights() -> WeeklyInsightsResponse? {
-        useSampleData ? nil : DiskCache.load(WeeklyInsightsResponse.self, as: "insights_weekly")
+    /// The last feed the app saw. Read synchronously in `CoachStore.init`, so the
+    /// Coach tab's first frame has cards before any network call starts — the fix for
+    /// a tab that used to open blank.
+    func cachedCoachFeed() -> CoachFeed? {
+        useSampleData ? nil : DiskCache.load(CoachFeed.self, as: "coach_feed")
     }
 
-    func cachedNextMeal() -> NextMealResponse? {
-        useSampleData ? nil : DiskCache.load(NextMealResponse.self, as: "insights_next_meal")
+    func cachedCoachThread(id: String) -> CoachThread? {
+        useSampleData ? nil : DiskCache.load(CoachThread.self, as: "coach_thread_\(id)")
+    }
+
+    func cachedCoachMemory() -> CoachMemory? {
+        useSampleData ? nil : DiskCache.load(CoachMemory.self, as: "coach_memory")
     }
 
     // MARK: - Internals
@@ -158,15 +195,19 @@ struct APIClient {
         return try await send(request, cacheAs: cacheAs)
     }
 
-    /// A mutation (currently just /meals/edit — the app's first non-GET call).
-    /// Retried the same way as `get`: every edit here is an absolute overwrite, not
-    /// a delta, so re-applying one after a lost response is harmless.
-    private func post<T: Decodable>(_ path: String, body: [String: Any]) async throws -> T {
+    /// A mutation (/meals/edit, and the coach's refresh + chat).
+    /// Retried the same way as `get`: every one of these is either an absolute
+    /// overwrite or idempotent server-side, so re-applying after a lost response is
+    /// harmless. `timeout` is raised only for the one call that genuinely has a model
+    /// in the loop (chat) — a refresh returns before any model runs.
+    private func post<T: Decodable>(_ path: String, body: [String: Any],
+                                    timeout: TimeInterval? = nil) async throws -> T {
         var request = URLRequest(url: Config.baseURL.appending(path: path))
         request.httpMethod = "POST"
         request.setValue(Config.authToken, forHTTPHeaderField: "X-Auth-Token")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        if let timeout { request.timeoutInterval = timeout }
         return try await send(request, cacheAs: nil)
     }
 
