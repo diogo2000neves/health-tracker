@@ -1,34 +1,43 @@
 """The coach's feed: which cards exist right now, and why.
 
 The old coach was one page that regenerated itself while the user watched. This is
-the opposite shape — a stream of small cards, each written once in the background
-and valid for a known window:
+the opposite shape — a stream of small cards, written in the background, each valid
+for a specific stretch of the day:
 
-    07:30  day_plan     "Ontem o jantar foi arroz e carne; hoje mete legumes ao almoço"
-    07:30  next_meal    three breakfast plates
-    15:30  check_in     "Já levas 62 g de proteína e nenhum legume — o lanche dá para isso"
-    15:30  next_meal    three afternoon plates
-    21:30  day_summary  "Dia fechado com 1 890 kcal; a fruta apareceu duas vezes"
-    Sun    weekly_review the week's one focus, food-first
-    any    pattern      "Peixe: nada registado em 12 dias"
+    morning     day_plan      "Ontem o jantar foi arroz e carne; hoje mete legumes ao almoço"
+    any         next_meal     three plates for whatever meal is genuinely next
+    midday      check_in      today's meals, judged one by one
+    after the   day_summary   the whole day closed out, with a note for tomorrow
+      last meal
+    Sunday      weekly_review the week in food — one pattern, one swap
+    any         pattern       "Peixe: nada registado em 12 dias"
 
-Two rules hold the whole thing together.
+Generation follows when the user actually eats: a logged meal schedules a run an hour
+later and each further meal pushes it back, so the day summary arrives when dinner is
+genuinely over rather than at a clock time that guesses.
 
-**The model writes sentences; this module decides facts.** `generate_cards` plans
-which cards a slot should carry from the deterministic food profile, hands the facts
-to a narrator callable, and then re-attaches the ids, evidence, priorities and
-expiry itself. Anything the model returns that isn't traceable to the facts it was
-given is dropped in `_validated_swap` — the model cannot suggest replacing a food
-the user has never logged, which is the exact failure the old critic pass caught in
-production ("swap your white bread" when no bread was ever logged).
+Three rules hold the whole thing together.
 
-**Nothing repeats until it has earned it.** A pattern finding that was shown goes
-into `state["shown"]` with the date and can't come back for `PATTERN_COOLDOWN_DAYS`
-unless it got materially worse. A feed that says the same thing every day trains the
-user to stop opening it.
+**The model writes sentences; this module decides facts.** `build_generation_facts`
+assembles what the model is told; `assemble` turns its answer back into cards,
+re-attaching every id, expiry, priority and piece of evidence rather than trusting
+them. Anything untraceable is dropped in `_validated_swap` — the model cannot suggest
+cutting a food the user never logged (the failure the critic pass caught in
+production: "swap your white bread" for a log containing no bread), and cannot answer
+a breakfast ham with a fillet of cod.
 
-The callables (`narrate`, `plates_fn`) are injected, so every branch here is
-testable without a network and the caller owns which model runs.
+**The feed is about now.** A card that describes a moment — `next_meal`, `check_in`,
+`day_summary` — is shown only while the day is still in the part it was written for,
+so opening the app after dinner leads with the day's whole story instead of this
+morning's read on breakfast. See `relevant_now` and `context_stale`.
+
+**Nothing repeats until it has earned it.** A pattern finding that was shown goes into
+`state["shown"]` with the date and can't return for `PATTERN_COOLDOWN_DAYS` unless it
+got materially worse. A feed that says the same thing every day teaches the user to
+stop opening it.
+
+Both model paths — Sonnet on the Mac, Gemini as the fallback — are given the same
+facts and pass through the same assembly, so neither gets more benefit of the doubt.
 """
 from __future__ import annotations
 
@@ -280,6 +289,10 @@ def _card(*, kind: str, slot: str, date: str, now: datetime, title: str, body: s
         "id": card_id(date=date, kind=kind, topic=topic),
         "kind": kind,
         "slot": slot,
+        # The part of the day this was written for, which is what `relevant_now`
+        # reads. Distinct from `slot`: a generation triggered an hour after lunch runs
+        # as "adhoc" but is still an afternoon card.
+        "context": slot_for(now),
         "date": date,
         "topic": topic or None,
         "created_at": now.isoformat(timespec="seconds"),
@@ -299,72 +312,87 @@ def _card(*, kind: str, slot: str, date: str, now: datetime, title: str, body: s
 
 # -- generation ----------------------------------------------------------------
 
-def generate_cards(*, slot: str, now: datetime, profile: Dict[str, Any],
-                   today: Dict[str, Any], nutrients: Dict[str, Any],
-                   memory: Dict[str, Any], state: Dict[str, Any],
-                   narrate: Callable[[Dict[str, Any]], Dict[str, Any]],
-                   plates_fn: Optional[Callable[[], Dict[str, Any]]] = None,
-                   weekly: Optional[Dict[str, Any]] = None,
-                   recent_titles: Sequence[str] = ()
-                   ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Build this slot's cards. Returns (cards, findings_shown).
+def build_generation_facts(*, slot: str, now: datetime, profile: Dict[str, Any],
+                           today: Dict[str, Any], nutrients: Dict[str, Any],
+                           memory: Dict[str, Any], state: Dict[str, Any],
+                           next_meal: Optional[Dict[str, Any]] = None,
+                           weekly: Optional[Dict[str, Any]] = None,
+                           recent: Sequence[Dict[str, str]] = ()
+                           ) -> Dict[str, Any]:
+    """Everything the model is given, for the whole feed, in one object.
 
-    A narration failure is not fatal: the deterministic cards that don't need prose
-    (the plates) still ship, and the caller keeps whatever the feed already had. The
-    coach going quiet for one slot is recoverable; the coach showing a spinner
-    forever is not.
+    Returned rather than sent, because the same facts have to reach two different
+    models by two different routes: Sonnet on the Mac (which claims a job carrying
+    this prompt) and Gemini here (the fallback). Building it in one place is what
+    keeps those two paths honest with each other.
     """
-    if slot not in SLOTS:
-        raise ValueError(f"unknown slot {slot!r}")
-
     date = now.date().isoformat()
     wants = _wants(slot)
     findings = (eligible_findings(profile, state, today=date)
                 if "pattern" in wants else [])
-
-    cards: List[Dict[str, Any]] = []
-
-    # 1. The plates. Deterministic context in, model prose out, and it is generated
-    #    FIRST because it is the card the user opens the app for.
-    if "next_meal" in wants and plates_fn is not None:
-        try:
-            result = plates_fn() or {}
-            plates = [p for p in (result.get("plates") or []) if isinstance(p, dict)]
-            if plates:
-                next_slot = _clip(result.get("next_slot"), 30)
-                cards.append(_card(
-                    kind="next_meal", slot=slot, date=date, now=now,
-                    title=(f"O que comer ao {next_slot.lower()}" if next_slot
-                           else "O que comer a seguir"),
-                    body=_clip(result.get("reasoning"), 240),
-                    chips=[{"label": f"{len(plates)} ideias", "tone": "neutral"}],
-                    evidence={"calories_left": today.get("calories_left"),
-                              "protein_left_g": today.get("protein_left_g")},
-                    plates=plates, next_slot=next_slot))
-        except Exception:
-            log.exception("plate generation failed (non-fatal)")
-
-    # 2. The prose cards, in one call.
     facts = build_facts(slot=slot, now=now, profile=profile, today=today,
                         nutrients=nutrients, memory=memory, findings=findings,
-                        weekly=weekly, recent_titles=recent_titles)
-    prose_kinds = [k for k in wants if k not in ("next_meal", "pattern")]
-    facts["wanted_cards"] = prose_kinds + (["pattern"] if findings else [])
+                        weekly=weekly,
+                        recent_titles=[r.get("title", "") for r in recent])
+    facts["wanted_cards"] = [k for k in wants if k not in ("next_meal", "pattern")] \
+        + (["pattern"] if findings else [])
+    facts["wanted_next_meal"] = "next_meal" in wants
+    if next_meal is not None:
+        facts["next_meal"] = next_meal
+    # The bodies too, not just the titles: "don't repeat yourself" is unenforceable
+    # against a list of headlines.
+    facts["already_said_recently"] = [
+        {"title": r.get("title", ""), "body": r.get("body", "")} for r in recent][:6]
+    facts["_findings_index"] = {f["id"]: f for f in findings}
+    return facts
 
-    written: List[Dict[str, Any]] = []
-    try:
-        answer = narrate(facts) or {}
-        written = [c for c in (answer.get("cards") or []) if isinstance(c, dict)]
-    except Exception:
-        log.exception("card narration failed (non-fatal)")
+
+def assemble(answer: Dict[str, Any], *, slot: str, now: datetime,
+             profile: Dict[str, Any], today: Dict[str, Any],
+             findings: Sequence[Dict[str, Any]]
+             ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Turn one model answer into cards. Returns (cards, findings_shown).
+
+    Every id, expiry, priority and piece of evidence is re-attached here rather than
+    trusted from the answer, and each claim is checked against the facts it came from.
+    Both model paths land in this function, so Sonnet gets no more benefit of the
+    doubt than Gemini does.
+    """
+    date = now.date().isoformat()
+    wants = _wants(slot)
+    prose_kinds = [k for k in wants if k not in ("next_meal", "pattern")]
+    cards: List[Dict[str, Any]] = []
+
+    # The plates first — it is the card the user opens the app for.
+    meal = answer.get("next_meal")
+    if "next_meal" in wants and isinstance(meal, dict):
+        plates = [p for p in (meal.get("plates") or []) if isinstance(p, dict)]
+        if plates:
+            next_slot = _clip(meal.get("next_slot"), 30)
+            # The rationale is the "why these, for you, right now" the plates alone
+            # never answered; the slot reasoning is the fallback when it's missing.
+            rationale = _clip(meal.get("rationale"), 260) or _clip(
+                meal.get("reasoning"), 260)
+            cards.append(_card(
+                kind="next_meal", slot=slot, date=date, now=now,
+                title=(f"O que comer ao {next_slot.lower()}" if next_slot
+                       else "O que comer a seguir"),
+                body=rationale,
+                chips=[{"label": f"{len(plates)} ideias", "tone": "neutral"}],
+                evidence={"calories_left": today.get("calories_left"),
+                          "protein_left_g": today.get("protein_left_g"),
+                          "reasoning": _clip(meal.get("reasoning"), 200)},
+                plates=plates, next_slot=next_slot))
 
     by_finding = {f["id"]: f for f in findings}
     shown: Dict[str, Any] = {}
-    for entry in written:
+    for entry in (answer.get("cards") or []):
+        if not isinstance(entry, dict):
+            continue
         kind = str(entry.get("kind") or "").strip()
         ref = str(entry.get("ref") or "").strip()
         title = _clip(entry.get("title"), 70)
-        body = _clip(entry.get("body"), 420)
+        body = _clip(entry.get("body"), 700)
         if not title or not body:
             continue
 
@@ -421,11 +449,65 @@ def merge_cards(existing: Sequence[Dict[str, Any]],
     return feed_order(merged.values())[:MAX_FEED_CARDS]
 
 
+# The cards that describe a moment rather than a habit. Each is shown only while the
+# day is still in the part it was written for: opening the app after dinner should
+# lead with the day's whole story, not with this morning's read on breakfast.
+_TIME_SENSITIVE = ("day_plan", "check_in", "next_meal", "day_summary")
+
+# Which parts of the day each one belongs to.
+_RELEVANT_IN = {
+    "day_plan": ("morning",),
+    "check_in": ("afternoon",),
+    "day_summary": ("evening",),
+    "next_meal": ("morning", "afternoon", "evening"),
+}
+
+
+def relevant_now(card: Dict[str, Any], *, now: datetime) -> bool:
+    """Whether a card still describes the moment the user is in.
+
+    Patterns, wins and the weekly review are about habits, so they stay. A "what to
+    eat next" or a mid-day check-in is about a specific stretch of the day and is
+    hidden once that stretch has passed — even if its lifetime hasn't run out, because
+    the honest answer to "how is my day going" at 22:00 is not the one written at 15:00.
+    """
+    kind = str(card.get("kind") or "")
+    if kind not in _TIME_SENSITIVE:
+        return True
+    context = str(card.get("context") or "")
+    current = slot_for(now)
+    if kind == "next_meal":
+        # Tied to the stretch it was written in: a lunch suggestion is not an answer
+        # at nine in the evening.
+        return context == current
+    return current in _RELEVANT_IN.get(kind, ()) and (not context
+                                                      or context == current)
+
+
 def live_cards(cards: Sequence[Dict[str, Any]], *, now: datetime
                ) -> List[Dict[str, Any]]:
-    """The cards still valid at `now`, feed order."""
+    """The cards still valid at `now` — unexpired AND still about now — in feed
+    order."""
     return feed_order(c for c in cards
-                      if isinstance(c, dict) and not _expired(c, now))
+                      if isinstance(c, dict) and not _expired(c, now)
+                      and relevant_now(c, now=now))
+
+
+def context_stale(cards: Sequence[Dict[str, Any]], *, now: datetime) -> bool:
+    """Whether the feed has nothing that speaks to the current part of the day.
+
+    This is what turns "I opened the app after dinner" into a regeneration: the
+    morning's cards may be perfectly fresh by age and still have nothing to say about
+    the evening.
+    """
+    current = slot_for(now)
+    for card in cards:
+        if not isinstance(card, dict) or _expired(card, now):
+            continue
+        kind = str(card.get("kind") or "")
+        if kind in _TIME_SENSITIVE and str(card.get("context") or "") == current:
+            return False
+    return True
 
 
 def feed_order(cards) -> List[Dict[str, Any]]:
@@ -470,9 +552,16 @@ def is_stale(cards: Sequence[Dict[str, Any]], *, now: datetime,
 
 
 def slot_for(now: datetime) -> str:
-    """The slot a clock time belongs to — used by the scheduler-free paths (a manual
-    refresh, a meal landing) to pick which cards to regenerate."""
+    """The part of the day a clock time belongs to — used both to pick what to
+    generate and to decide what is still worth showing.
+
+    The small hours belong to the evening that preceded them: at 00:30 the thing the
+    user wants is still last night's summary, not a plan for a day they haven't
+    started.
+    """
     hour = now.hour
+    if hour < 5:
+        return "evening"
     if hour < 11:
         return "morning"
     if hour < 18:

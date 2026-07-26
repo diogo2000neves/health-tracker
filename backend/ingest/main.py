@@ -3733,26 +3733,68 @@ def _coach_profile(now: datetime, window_meals: List[Dict[str, Any]], *,
         ref_day=now.date().isoformat())
 
 
+# The micronutrients worth putting in front of the model per meal. The full set of
+# 37 would bury the food under numbers; these are the ones a dietitian would actually
+# comment on when reading a plate.
+_COACH_MEAL_NUTRIENTS = ("fiber_g", "saturated_fat_g", "sugar_g", "sodium_mg",
+                         "omega3_g", "iron_mg", "calcium_mg", "vitamin_c_mg")
+
+
 def _coach_today(now: datetime, today_rows: List[Dict[str, Any]],
                  consumed: Dict[str, float],
-                 targets: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """Today so far: the meals, what's left of the budget, and which nutrients are
-    still short — the facts every time-sensitive card needs."""
-    ins = _insights_mod()
+                 targets: Dict[str, Dict[str, Any]],
+                 taxonomy: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Today so far, in full detail: every meal, every item in it, with grams, macros
+    and the micronutrients worth commenting on.
+
+    The first version handed the model a one-line summary per meal ("aveia, banana,
+    leite — 420 kcal"), which is exactly enough to produce "protein is on track, have
+    more protein at dinner" and nothing better. Judging a *choice* — why the oats held
+    the morning, whether lunch was balanced — needs the actual plate.
+    """
+    patterns = _coach("food_patterns")
     cal_t = targets.get("calories", {})
     cal_left = max(0.0, (cal_t.get("ceiling") or cal_t.get("floor") or 0)
                    - _round_num(consumed.get("calories")))
     prot_t = targets.get("protein_g", {})
     prot_left = max(0.0, (prot_t.get("floor") or 0)
                     - _round_num(consumed.get("protein_g")))
+
+    meals: List[Dict[str, Any]] = []
+    for meal in patterns.read_meals(today_rows, taxonomy):
+        items = []
+        for item in meal["items"]:
+            entry = {"food": item["food"], "grams": round(item["grams"]),
+                     "group": item["group"], "calories": round(item["calories"])}
+            if item["fried"]:
+                entry["fried"] = True
+            micros = {k: round(v, 1) for k, v in item["nutrients"].items()
+                      if k in _COACH_MEAL_NUTRIENTS and _round_num(v) > 0}
+            if micros:
+                entry["nutrients"] = micros
+            items.append(entry)
+        meals.append({
+            "time": meal["datetime"][11:16],
+            "slot": patterns.SLOT_LABELS.get(meal["slot"], meal["slot"]),
+            "calories": round(meal["calories"]),
+            "protein_g": round(meal["protein_g"], 1),
+            "food_groups": meal["groups"],
+            "items": items,
+        })
+
     return {
         "date": now.date().isoformat(),
         "current_time": now.strftime("%H:%M"),
-        "meals": ins.build_today_meals_summary(today_rows),
+        "meals": meals,
+        "meals_logged": len(meals),
         "calories_eaten": round(_round_num(consumed.get("calories"))),
         "calories_left": round(cal_left),
         "protein_eaten_g": round(_round_num(consumed.get("protein_g"))),
         "protein_left_g": round(prot_left),
+        "totals": {key: round(_round_num(consumed.get(key)), 1)
+                   for key in ("calories", "protein_g", "carbs_g", "fat_g",
+                               "fiber_g", "saturated_fat_g", "sugar_g")
+                   if _round_num(consumed.get(key)) > 0},
     }
 
 
@@ -3841,13 +3883,23 @@ def coach_feed_read():
     now = datetime.now(_tz())
     cards = _read_feed_cards(now)
     state = store.read_state()
+    queue = store.queue_summary(now.isoformat())
     return jsonify({
         "status": "ready" if cards else "empty",
         "generated_at": max((str(c.get("created_at") or "") for c in cards),
                             default=None),
         "server_time": now.isoformat(timespec="seconds"),
-        "stale": feed.is_stale(cards, now=now, max_age_hours=COACH_STALE_HOURS),
-        "generating": store.job_is_live(state, now.isoformat()),
+        # Stale by age OR by context: cards written this morning can be perfectly
+        # fresh and still have nothing to say about the evening the user just opened
+        # the app in.
+        "stale": (feed.is_stale(cards, now=now, max_age_hours=COACH_STALE_HOURS)
+                  or feed.context_stale(cards, now=now)),
+        # Only a job a worker is actually running counts as "generating". A job
+        # merely waiting for a sleeping laptop must not put a progress bar on screen
+        # for hours — that is the old "loading forever" bug in a new costume.
+        "generating": (store.job_is_live(state, now.isoformat())
+                       or queue["running"]),
+        "queued": queue["waiting"],
         "cards": cards,
     }), 200
 
@@ -3881,9 +3933,17 @@ def coach_refresh():
                         "error": "queue unavailable"}), 202
 
 
-def _enqueue_coach_generate(slot: str, reason: str) -> None:
-    """Hand a generation to the Cloud Tasks queue that already runs meal analysis."""
+def _enqueue_coach_generate(slot: str, reason: str, *,
+                            delay_s: int = 0,
+                            not_before_meal: str = "") -> None:
+    """Hand a generation to the Cloud Tasks queue that already runs meal analysis.
+
+    `delay_s` schedules it into the future, and `not_before_meal` carries the
+    "nothing has been logged since" condition that makes the delay a *debounce* —
+    see `_trigger_coach_refresh`.
+    """
     from google.cloud import tasks_v2  # lazy: keeps tests importable without the lib
+    from google.protobuf import timestamp_pb2
     client = tasks_v2.CloudTasksClient()
     parent = client.queue_path(
         os.environ["GCP_PROJECT"],
@@ -3892,153 +3952,350 @@ def _enqueue_coach_generate(slot: str, reason: str) -> None:
     )
     url = os.environ.get("COACH_GENERATE_URL") or (
         os.environ["PROCESS_URL"].rsplit("/", 1)[0] + "/coach/generate")
-    client.create_task(parent=parent, task={"http_request": {
+    payload: Dict[str, Any] = {"slot": slot, "reason": reason}
+    if not_before_meal:
+        payload["only_if_no_meal_since"] = not_before_meal
+    task: Dict[str, Any] = {"http_request": {
         "http_method": tasks_v2.HttpMethod.POST,
         "url": url,
         "headers": {"Content-Type": "application/json",
                     "X-Auth-Token": os.environ.get("INGEST_TOKEN", "")},
-        "body": json.dumps({"slot": slot, "reason": reason}).encode("utf-8"),
-    }})
+        "body": json.dumps(payload).encode("utf-8"),
+    }}
+    if delay_s > 0:
+        stamp = timestamp_pb2.Timestamp()
+        stamp.FromDatetime(datetime.now(_tz()) + timedelta(seconds=delay_s))
+        task["schedule_time"] = stamp
+    client.create_task(parent=parent, task=task)
+
+
+# How long the coach waits after a logged meal before it reads the day. A meal is
+# rarely one entry — a plate, then the drink, then the fruit ten minutes later — and
+# analysing after the first one would describe half a meal. An hour of quiet is a
+# good proxy for "that meal is over".
+COACH_QUIET_MINUTES = int(os.environ.get("COACH_QUIET_MINUTES", "60"))
+
+# How long an unanswered job suppresses an identical one. Long enough that a laptop
+# asleep all morning collects one job per part of the day rather than one per app
+# open, short enough that a genuinely new situation still gets asked about.
+COACH_JOB_DEDUP_MINUTES = int(os.environ.get("COACH_JOB_DEDUP_MINUTES", "45"))
 
 
 def _trigger_coach_refresh(reason: str) -> None:
-    """Best-effort background refresh after the data changed (a meal landed).
+    """Debounce a generation an hour past the last logged meal.
 
-    Never raises and never blocks: the meal is already saved, and a stale card is a
-    far smaller problem than a failed log.
+    Each meal records itself and schedules a run `COACH_QUIET_MINUTES` out carrying
+    the timestamp it was scheduled for. When that run fires it regenerates only if
+    nothing has been logged since — so a second helping forty minutes later doesn't
+    produce a second analysis, it postpones the first. The task that eventually finds
+    a quiet hour behind it is the one that speaks.
+
+    Never raises and never blocks: the meal is already saved, and a late card is a far
+    smaller problem than a failed log.
     """
+    store = _coach("coach_store")
+    stamp = datetime.now(_tz()).isoformat(timespec="seconds")
     try:
-        _enqueue_coach_generate("adhoc", reason)
+        store.update_state(lambda state: {**state, "last_meal_at": stamp})
+    except Exception:
+        app.logger.info("could not record last_meal_at", exc_info=True)
+    try:
+        _enqueue_coach_generate("adhoc", reason,
+                                delay_s=COACH_QUIET_MINUTES * 60,
+                                not_before_meal=stamp)
     except Exception:
         app.logger.info("coach refresh not enqueued (%s)", reason, exc_info=True)
 
 
 @app.post("/coach/generate")
 def coach_generate():
-    """The worker: build the deterministic facts, narrate them, store the cards.
+    """Prepare a generation: compute the facts, build the prompt, park it as a job.
 
-    Called by Cloud Scheduler for the four daily slots (`morning`, `afternoon`,
-    `evening`, `weekly`), by the queue after a meal lands (`adhoc`), or by hand.
-    Nothing is waiting on the response, so this is the one place allowed to be slow.
+    This endpoint does NOT call a model. It writes a job that the Mac worker claims
+    and answers with Sonnet (`GET /coach/work` + `POST /coach/work/<id>`); if nobody
+    claims it within `COACH_SONNET_WAIT_HOURS`, `/coach/sweep` runs the same prompt
+    through Gemini. Quality is the reason: the local subscription model is worth
+    waiting hours for, and the fallback exists so waiting can never mean silence.
 
-    Idempotent by construction: cards carry a deterministic id per (day, slot, kind,
-    topic), so a retry replaces its own cards instead of stacking duplicates.
+    Called by the Cloud Tasks debounce an hour after the last logged meal, by Cloud
+    Scheduler for the morning and weekly slots, or by hand. Idempotent: cards carry a
+    deterministic id per (day, kind, topic), so a retry replaces its own cards.
     """
     if not _authorized(request):
         return jsonify({"error": "unauthorized"}), 401
 
     store = _coach("coach_store")
     feed = _coach("coach_feed")
-    memory_mod = _coach("coach_memory")
-    narrator = _narrator_mod()
 
     body = request.get_json(silent=True) or {}
     now = datetime.now(_tz())
     slot = str(body.get("slot") or "").strip() or feed.slot_for(now)
-    # Validate the request before the environment: a malformed call is a 400 whether
-    # or not the model is configured.
     if slot not in feed.SLOTS:
         return jsonify({"error": f"unknown slot {slot!r}",
                         "known": list(feed.SLOTS)}), 400
-    if not _gemini_available():
-        return jsonify({"error": "GEMINI_API_KEY not configured"}), 503
     reason = str(body.get("reason") or "schedule")[:40]
 
-    job_id = f"{now.isoformat(timespec='seconds')}:{slot}"
-    if store.claim_job(job_id, reason, now.isoformat(timespec="seconds")) is None:
-        # Another generation is already running. Two overlapping runs would both
-        # spend model calls to write the same cards.
-        return jsonify({"status": "busy", "slot": slot}), 200
+    # The debounce. A task scheduled an hour after a meal carries that meal's
+    # timestamp; if something has been logged since, the meal is still going and a
+    # later task will cover it.
+    only_if_no_meal_since = str(body.get("only_if_no_meal_since") or "")
+    if only_if_no_meal_since:
+        last_meal = str(store.read_state().get("last_meal_at") or "")
+        if last_meal and last_meal > only_if_no_meal_since:
+            app.logger.info("coach: still eating (last meal %s), skipping", last_meal)
+            return jsonify({"status": "superseded", "slot": slot,
+                            "last_meal_at": last_meal}), 200
+
+    # One job per question. The app asks for a refresh whenever the feed has nothing
+    # to say about the current part of the day, so without this every open while the
+    # Mac sleeps would queue another identical job for it to chew through later.
+    for existing_job in store.list_jobs():
+        if existing_job.get("done_at") or existing_job.get("slot") != slot:
+            continue
+        age = store._age_seconds(existing_job.get("created_at"),
+                                 now.isoformat(timespec="seconds"))
+        if age is not None and age < COACH_JOB_DEDUP_MINUTES * 60:
+            return jsonify({"status": "already-queued", "job": existing_job["id"],
+                            "slot": slot}), 200
 
     try:
-        window_meals, today_rows = _coach_window_meals(now)
-        consumed = _todays_consumed(today_rows)
-        targets, _basis = _resolved_targets_and_basis()
-        # The scheduled runs pay for taxonomy learning; an ad-hoc refresh after a
-        # meal must stay fast, so it reads the taxonomy as-is.
-        profile = _coach_profile(now, window_meals, learn=slot != "adhoc")
-        memory = store.read_json(store.MEMORY, default=memory_mod.empty())
-        today = _coach_today(now, today_rows, consumed, targets)
-        nutrients = _coach_nutrients(consumed, targets)
-        state = store.read_state()
-        existing = _read_feed_cards(now)
-
-        # A 429 from the shared free-tier quota is a "come back shortly", not a
-        # failure. `generate_cards` deliberately swallows model errors so one dead
-        # call can't take the whole feed down with it, so the reason is recorded here
-        # and turned into a 5xx below — which is what makes Cloud Tasks and Cloud
-        # Scheduler retry instead of leaving the user with a silently empty feed.
-        out_of_quota = {"hit": False}
-
-        def narrate(facts: Dict[str, Any]) -> Dict[str, Any]:
-            facts["memory"] = memory_mod.for_prompt(memory)
-            try:
-                return narrator.narrate_cards(facts)
-            except narrator.GeminiQuotaError:
-                out_of_quota["hit"] = True
-                raise
-
-        def plates() -> Dict[str, Any]:
-            context = _next_meal_context(
-                now, profile=profile, today=today, consumed=consumed,
-                targets=targets, window_meals=window_meals, memory=memory)
-            try:
-                return narrator.narrate_next_meal(context)
-            except narrator.GeminiQuotaError:
-                out_of_quota["hit"] = True
-                raise
-
-        cards, shown = feed.generate_cards(
-            slot=slot, now=now, profile=profile, today=today, nutrients=nutrients,
-            memory=memory, state=state, narrate=narrate,
-            plates_fn=plates if slot != "weekly" else None,
-            weekly=_coach_weekly_facts(profile) if slot == "weekly" else None,
-            recent_titles=[str(c.get("title") or "") for c in existing])
-
-        if not cards:
-            store.finish_job(job_id, now.isoformat(timespec="seconds"),
-                             error="no cards produced")
-            if out_of_quota["hit"]:
-                # 5xx so the caller (Cloud Tasks / Cloud Scheduler) tries again once
-                # the per-minute window rolls over.
-                return jsonify({"status": "quota", "slot": slot,
-                                "error": "Gemini quota exhausted; retry later"}), 503
-            return jsonify({"status": "empty", "slot": slot,
-                            "days_logged": profile.get("days_logged")}), 200
-
-        # Merge into the rolling feed under a precondition, so a scheduled run and a
-        # meal-triggered refresh landing together can't drop each other's cards.
-        stamp = now.isoformat(timespec="seconds")
-        merged_holder: Dict[str, Any] = {}
-
-        def merge_into(current: Any) -> Dict[str, Any]:
-            existing = (current.get("cards") or []) if isinstance(current, dict) else []
-            merged_holder["cards"] = feed.merge_cards(existing, cards, now=now)
-            return {"generated_at": stamp, "slot": slot,
-                    "cards": merged_holder["cards"]}
-        store.update_json(store.FEED, merge_into, default={"cards": []})
-        merged = merged_holder.get("cards", cards)
-
-        def note_run(current: Dict[str, Any]) -> Dict[str, Any]:
-            current.setdefault("runs", {})[slot] = now.isoformat(timespec="seconds")
-            current.setdefault("shown", {}).update(shown)
-            job = current.get("job")
-            if isinstance(job, dict) and job.get("id") == job_id:
-                job["finished_at"] = now.isoformat(timespec="seconds")
-            return current
-        store.update_state(note_run)
-
-        app.logger.info("coach %s: %d cards (%d in feed)", slot, len(cards),
-                        len(merged))
-        return jsonify({"status": "generated", "slot": slot,
-                        "cards": len(cards), "feed": len(merged),
-                        "findings_shown": list(shown)}), 200
-
+        job = _build_generation_job(now, slot=slot, reason=reason)
     except Exception as exc:
-        app.logger.exception("coach generation failed")
-        store.finish_job(job_id, datetime.now(_tz()).isoformat(timespec="seconds"),
-                         error=str(exc))
+        app.logger.exception("coach job preparation failed")
         return jsonify({"status": "error", "error": str(exc)}), 500
+
+    if job is None:
+        return jsonify({"status": "empty", "slot": slot,
+                        "reason": "nothing worth generating"}), 200
+
+    store.write_json(store.job_path(job["id"]), job)
+    app.logger.info("coach job %s queued (slot=%s, %d chars)", job["id"], slot,
+                    len(job["prompt"]))
+
+    # Nudge the Mac if it is awake and listening; harmless if it isn't.
+    return jsonify({"status": "queued", "job": job["id"], "slot": slot,
+                    "waiting_for": "sonnet"}), 202
+
+
+def _build_generation_job(now: datetime, *, slot: str,
+                          reason: str) -> Optional[Dict[str, Any]]:
+    """The deterministic half of a generation: every fact, and the prompt built from
+    it. Whichever model answers, it answers THIS.
+
+    Returns None when there is nothing worth saying — a log too thin for any finding
+    and no meals today is not a coach problem, it is an empty diary.
+    """
+    store = _coach("coach_store")
+    feed = _coach("coach_feed")
+    memory_mod = _coach("coach_memory")
+    narrator = _narrator_mod()
+
+    window_meals, today_rows = _coach_window_meals(now)
+    consumed = _todays_consumed(today_rows)
+    targets, _basis = _resolved_targets_and_basis()
+    # Scheduled runs pay for taxonomy learning; the meal-triggered ones read it as-is.
+    profile = _coach_profile(now, window_meals, learn=slot != "adhoc")
+    taxonomy = store.read_json(store.TAXONOMY, default=None)
+    memory = store.read_json(store.MEMORY, default=memory_mod.empty())
+    today = _coach_today(now, today_rows, consumed, targets, taxonomy=taxonomy)
+    nutrients = _coach_nutrients(consumed, targets)
+    state = store.read_state()
+    existing = _read_feed_cards(now)
+
+    if not profile.get("findings") and not today.get("meals"):
+        return None
+
+    facts = feed.build_generation_facts(
+        slot=slot, now=now, profile=profile, today=today, nutrients=nutrients,
+        memory=memory, state=state,
+        next_meal=(_next_meal_context(now, profile=profile, today=today,
+                                      consumed=consumed, targets=targets,
+                                      window_meals=window_meals, memory=memory)
+                   if "next_meal" in feed._wants(slot) else None),
+        weekly=_coach_weekly_facts(profile) if slot == "weekly" else None,
+        recent=[{"title": str(c.get("title") or ""),
+                 "body": str(c.get("body") or "")} for c in existing])
+
+    # The findings index travels with the job rather than inside the prompt: the
+    # answer has to be validated against the same objects that produced the question,
+    # and re-deriving them at validation time could silently drift.
+    findings = list(facts.pop("_findings_index", {}).values())
+
+    return {
+        "id": f"{now.strftime('%Y%m%dT%H%M%S')}-{slot}",
+        "slot": slot,
+        "reason": reason,
+        "created_at": now.isoformat(timespec="seconds"),
+        "claimed_at": None,
+        "claimed_by": None,
+        "attempts": 0,
+        "prompt": narrator.build_feed_prompt(facts),
+        "require_key": "cards",
+        # Everything assembly needs, so answering a job never re-reads the sheet.
+        "context": {
+            "profile": {"foods": profile.get("foods", []),
+                        "swaps": profile.get("swaps", {}),
+                        "days_logged": profile.get("days_logged")},
+            "today": {"calories_left": today.get("calories_left"),
+                      "protein_left_g": today.get("protein_left_g"),
+                      "meals": today.get("meals", [])},
+            "findings": findings,
+        },
+    }
+
+
+@app.get("/coach/work")
+def coach_work():
+    """The Mac worker asks for something to do.
+
+    Returns one job with its prompt, or 204 when the queue is empty. The claim is a
+    lease: a laptop that sleeps mid-run releases the job back after 15 minutes rather
+    than stranding it.
+    """
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    store = _coach("coach_store")
+    now = datetime.now(_tz())
+    worker = str(request.args.get("worker") or "mac")[:40]
+    job = store.claim_next_job(worker, now.isoformat(timespec="seconds"))
+    if job is None:
+        return "", 204
+    return jsonify({"id": job["id"], "slot": job["slot"],
+                    "prompt": job["prompt"],
+                    "require_key": job.get("require_key", "cards"),
+                    "created_at": job.get("created_at"),
+                    "attempts": job.get("attempts")}), 200
+
+
+@app.post("/coach/work/<job_id>")
+def coach_work_result(job_id: str):
+    """The Mac worker hands back what Sonnet said — or admits it couldn't.
+
+    `{"answer": {...}}` completes the job. `{"release": "reason"}` puts it back on
+    the queue untouched, which is what an exhausted usage window does: the job stays
+    pending, the worker tries again later, and if the wait runs past
+    `COACH_SONNET_WAIT_HOURS` the sweeper falls back to Gemini.
+    """
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    store = _coach("coach_store")
+    if not store.is_safe_id(job_id):
+        return jsonify({"error": "bad job id"}), 400
+    job = store.read_json(store.job_path(job_id), default=None)
+    if not isinstance(job, dict):
+        return jsonify({"error": "no such job"}), 404
+
+    body = request.get_json(silent=True) or {}
+    now = datetime.now(_tz())
+    if body.get("release"):
+        store.release_job(job_id, str(body["release"]), now.isoformat(timespec="seconds"))
+        app.logger.info("coach job %s released: %s", job_id, body["release"])
+        return jsonify({"status": "released", "job": job_id}), 200
+
+    answer = body.get("answer")
+    if not isinstance(answer, dict):
+        return jsonify({"error": "answer must be an object"}), 400
+
+    written = _apply_generation(job, answer, now, source=str(
+        body.get("model") or "sonnet")[:60])
+    store.finish_generation_job(job_id)
+    return jsonify({"status": "applied", "job": job_id, **written}), 200
+
+
+def _apply_generation(job: Dict[str, Any], answer: Dict[str, Any], now: datetime,
+                      *, source: str) -> Dict[str, Any]:
+    """Validate one model answer and fold the resulting cards into the feed.
+
+    Both models land here. Sonnet gets no more benefit of the doubt than Gemini: the
+    swap validation, the finding checks and the id/expiry re-attachment are the same
+    code either way.
+    """
+    store = _coach("coach_store")
+    feed = _coach("coach_feed")
+    context = job.get("context") or {}
+    slot = job.get("slot", "adhoc")
+
+    cards, shown = feed.assemble(
+        answer, slot=slot, now=now,
+        profile=context.get("profile") or {},
+        today=context.get("today") or {},
+        findings=context.get("findings") or [])
+    if not cards:
+        return {"cards": 0, "source": source}
+
+    for card in cards:
+        card["source"] = source
+
+    stamp = now.isoformat(timespec="seconds")
+    merged_holder: Dict[str, Any] = {}
+
+    def merge_into(current: Any) -> Dict[str, Any]:
+        existing = (current.get("cards") or []) if isinstance(current, dict) else []
+        merged_holder["cards"] = feed.merge_cards(existing, cards, now=now)
+        return {"generated_at": stamp, "slot": slot, "source": source,
+                "cards": merged_holder["cards"]}
+    store.update_json(store.FEED, merge_into, default={"cards": []})
+
+    def note_run(current: Dict[str, Any]) -> Dict[str, Any]:
+        current.setdefault("runs", {})[slot] = stamp
+        current.setdefault("shown", {}).update(shown)
+        return current
+    store.update_state(note_run)
+
+    merged = merged_holder.get("cards", cards)
+    app.logger.info("coach %s via %s: %d cards (%d in feed)", slot, source,
+                    len(cards), len(merged))
+    return {"cards": len(cards), "feed": len(merged), "source": source,
+            "findings_shown": list(shown)}
+
+
+# How long a job may wait for Sonnet before Gemini takes it. Five hours is Claude's
+# usage window: if the whole window passes without the Mac being awake and inside its
+# allowance, waiting longer is unlikely to help and the user has been without a
+# coach all day.
+COACH_SONNET_WAIT_HOURS = float(os.environ.get("COACH_SONNET_WAIT_HOURS", "5"))
+
+
+@app.post("/coach/sweep")
+def coach_sweep():
+    """The fallback: run anything that has waited too long through Gemini.
+
+    Cloud Scheduler calls this periodically. It is the only place Gemini generates a
+    feed, and it deliberately does nothing while a job is young — the whole point is
+    to give the better model its chance first.
+    """
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    store = _coach("coach_store")
+    narrator = _narrator_mod()
+    now = datetime.now(_tz())
+    stamp = now.isoformat(timespec="seconds")
+    cutoff_s = COACH_SONNET_WAIT_HOURS * 3600
+
+    handled, skipped = [], []
+    for job in store.list_jobs():
+        age = store._age_seconds(job.get("created_at"), stamp)
+        if age is None or age < cutoff_s:
+            skipped.append(job.get("id"))
+            continue
+        if not _gemini_available():
+            return jsonify({"error": "GEMINI_API_KEY not configured"}), 503
+        try:
+            answer = narrator.call_gemini(job["prompt"],
+                                          require_key=job.get("require_key", "cards"),
+                                          temperature=0.35)
+        except narrator.GeminiQuotaError as exc:
+            app.logger.warning("sweep hit quota on %s: %s", job.get("id"), exc)
+            return jsonify({"status": "quota", "handled": handled}), 503
+        except Exception:
+            app.logger.exception("sweep generation failed for %s", job.get("id"))
+            continue
+        _apply_generation(job, answer, now, source="gemini")
+        store.finish_generation_job(job["id"])
+        handled.append(job["id"])
+
+    return jsonify({"status": "swept", "fell_back_to_gemini": handled,
+                    "still_waiting_for_sonnet": skipped}), 200
 
 
 def _coach_weekly_facts(profile: Dict[str, Any]) -> Dict[str, Any]:

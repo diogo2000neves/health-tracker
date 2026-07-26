@@ -456,52 +456,109 @@ def assemble_next_meal(context: Dict[str, Any],
     return _strip_meta(result)
 
 
-# -- Feed cards (food-first) ---------------------------------------------------
+# -- The feed, in one call ------------------------------------------------------
+#
+# Plates and cards are generated TOGETHER, deliberately. Split across two calls they
+# contradicted each other in production on the first day: the next-meal card proposed
+# fish while the day card, generated blind to it, told the user to finish the day with
+# beef. One call sees the whole feed at once, so the day analysis can reference the
+# suggestion it just made.
 
-_CARD_RULES = """És o nutricionista pessoal desta pessoa, a escrever os cartões que ela vê
+_FEED_RULES = """És o nutricionista pessoal desta pessoa, a escrever tudo o que ela vê
 quando abre a app. Português de Portugal, tratamento por "tu". O objetivo dela é
 recomposição corporal: perder gordura mantendo músculo, com proteína alta.
 
 A REGRA CENTRAL — FALA DE COMIDA, NÃO DE NUTRIENTES.
-O que interessa é o que a pessoa realmente comeu: alimentos, refeições, repetições, o que
-falta na mesa. Um número de nutriente só pode entrar se estiver amarrado a um alimento
-concreto ("o arroz branco quase todos os dias é o que está a travar a fibra"). NUNCA
-escrevas conselhos como "come mais fibra" ou "aumenta a vitamina A" — isso a pessoa já vê
-no ecrã dos nutrientes, e não a ajuda a decidir o que põe no prato.
+O que interessa é o que a pessoa realmente comeu: alimentos concretos, refeições,
+repetições, o que falta na mesa. Um número de nutriente só entra se estiver amarrado a um
+alimento ("o arroz branco quase todos os dias é o que está a travar a fibra"). NUNCA
+escrevas "come mais fibra" ou "aumenta a vitamina A" — isso ela já vê no ecrã dos
+nutrientes e não a ajuda a decidir o que põe no prato.
+
+PROFUNDIDADE — é isto que distingue um bom conselho de um relatório.
+Tens em `today.meals` o detalhe completo de cada refeição de hoje: alimentos, gramas,
+calorias, macros e micronutrientes. Usa-o para avaliar ESCOLHAS, não para repetir totais:
+- diz porque é que uma escolha concreta foi boa ("a aveia com manteiga de amendoim ao
+  pequeno-almoço segurou-te a manhã inteira"),
+- avalia o equilíbrio de uma refeição ("o almoço trouxe proteína e hidratos, mas foi o
+  terceiro dia seguido sem nada verde"),
+- e só depois diz o passo seguinte.
+"Estás bem na proteína, mete mais proteína ao jantar" é exatamente o tipo de comentário
+genérico a evitar.
+
+COERÊNCIA — tudo o que escreves é lido ao mesmo tempo, no mesmo ecrã.
+As sugestões de refeição e os cartões TÊM de dizer a mesma coisa. Se sugerires peixe ao
+jantar, o cartão do dia não pode mandar comer carne. Não te repitas entre cartões, e não
+repitas nada que esteja em `already_said_recently`.
 
 REGRAS ABSOLUTAS:
-- Só podes falar de alimentos que aparecem em `foods_the_user_eats` ou em
-  `findings[].swap_options`. Não inventes alimentos nem marcas.
-- Numa troca (`swap`): o `from` TEM de ser um alimento que a pessoa registou, e o `to` TEM
-  de ser um dos alimentos em `swap_options.to` desse finding. Se não houver uma troca
-  honesta a fazer, devolve `swap: null`.
+- Só podes falar de alimentos que aparecem em `foods_the_user_eats`, em
+  `findings[].swap_options` ou em `next_meal.candidates`. Não inventes alimentos.
+- Numa troca (`swap`): o `from` TEM de ser um alimento que a pessoa registou e o `to` TEM
+  de vir das `swap_options.to` desse finding. Se não houver troca honesta, `swap: null`.
+- A troca tem de fazer sentido À MESA: cada alimento traz a refeição em que é
+  realmente comido (`usually_at`). Não substituas o fiambre da sanduíche do
+  pequeno-almoço por bacalhau — troca-o por algo que se coma ao pequeno-almoço (ovo,
+  queijo fresco, atum, manteiga de amendoim). Uma troca que ninguém faria na vida real
+  é pior do que não sugerir troca nenhuma.
 - Nunca inventes nem recalcules números. Usa só os que estão nos FACTOS.
-- Um cartão = uma ideia. Título curto; corpo de 1 a 2 frases.
-- Nada de linguagem médica nem diagnósticos. Nada de "corta", "elimina", "nunca mais":
-  enquadra sempre como acrescentar ou trocar, nunca como restringir por restringir.
-- Não repitas nada que esteja em `already_said_recently`.
-- Usa `memory` (o que já sabes desta pessoa) quando for relevante — é isso que faz o
-  conselho parecer dirigido a ela e não a um manual.
+- Nada de linguagem médica nem diagnósticos. Nada de "corta" ou "elimina": enquadra
+  como acrescentar ou trocar, nunca como restringir por restringir.
+- Usa `memory` (o que já sabes desta pessoa) quando for relevante.
 - Caloroso, direto, sem jargão e sem emojis.
 
-OS TIPOS DE CARTÃO que te podem ser pedidos (em `wanted_cards`):
-- `day_plan` (manhã): o dia que começa, à luz do que aconteceu ontem. Uma ação concreta.
-- `check_in` (tarde): o que já foi comido hoje e a oportunidade que ainda resta hoje.
-- `day_summary` (noite): fecha o dia com honestidade e deixa uma nota para amanhã.
+PARTE 1 — A PRÓXIMA REFEIÇÃO (`next_meal`).
+Decide qual é, a partir da hora atual, do que já foi registado hoje, dos horários
+típicos (`next_meal.meal_pattern`) e do orçamento que resta. Depois cria 3 pratos:
+- sobretudo comida que a pessoa já come (`next_meal.candidates`);
+- `candidates.groups_to_favour` são os grupos abaixo da referência semanal — puxa por
+  eles quando encaixar na refeição (é aqui que o peixe entra num dia só de carne);
+- no MÁXIMO 1 alimento novo por prato, marcado `"new": true`;
+- respeita as gramas dadas e as calorias que restam;
+- respeita `memory` (o que a pessoa não gosta ou não pode comer);
+- o 1.º prato é o recomendado.
+Escreve também `rationale`: UMA frase curta que explique porque é que estas sugestões
+encaixam na situação dela AGORA (o que já comeu hoje, o que falta, o que a semana pede).
+Devolves SEMPRE 3 pratos — "o que como a seguir?" é sempre uma pergunta legítima, mesmo
+num dia em que não falte nenhum nutriente.
+
+PARTE 2 — OS CARTÕES (`cards`), um por cada tipo pedido em `wanted_cards`:
+- `day_plan` (manhã): o dia que começa à luz de ontem. Uma ação concreta.
+- `check_in` (a meio do dia): avalia as refeições de hoje uma a uma — o que foi boa
+  escolha e porquê, o que ficou desequilibrado — e só então o passo seguinte.
+- `day_summary` (fim do dia): o dia inteiro fechado. Aqui SIM podes usar os totais
+  (refeições, calorias, macros), mas amarrados às escolhas que os produziram, e deixa
+  uma nota para amanhã.
 - `weekly_review` (domingo): a semana em alimentos — o padrão mais importante e uma troca.
 - `win`: algo que está genuinamente a correr bem, dito em alimentos.
-- `pattern`: UMA observação sobre um padrão alimentar. Tens de escolher um dos `findings`
-  e pôr o `id` dele em `ref`; o teu texto tem de dizer o mesmo que o `fact` desse finding,
-  só em linguagem humana. Um cartão `pattern` por finding, no máximo."""
+- `pattern`: UMA observação sobre um padrão. Escolhe um dos `findings` e põe o `id` dele
+  em `ref`; o texto tem de dizer o mesmo que o `fact` desse finding, em linguagem humana."""
 
-_CARDS_SCHEMA = """Devolve APENAS um objeto JSON com esta forma exata:
+_FEED_SCHEMA = """Devolve APENAS um objeto JSON com esta forma exata:
 {
+  "next_meal": {
+    "next_slot": "pequeno-almoço | almoço | jantar | lanche da manhã | lanche da tarde",
+    "reasoning": "uma frase — porque é esta a próxima refeição",
+    "rationale": "uma frase — porque é que estas sugestões encaixam no teu dia de hoje",
+    "plates": [
+      {
+        "rank": 1, "recommended": true,
+        "title": "nome do prato",
+        "items": [{"food": "...", "grams_low": N, "grams_high": N, "new": false}],
+        "covers": [{"key": "omega3_g", "label": "Ómega-3", "note": "nota curta"}],
+        "calories": N, "protein_g": N,
+        "why": "uma frase — o que resolve e porque encaixa"
+      },
+      {"rank": 2, "recommended": false, "...": "..."},
+      {"rank": 3, "recommended": false, "...": "..."}
+    ]
+  },
   "cards": [
     {
       "kind": "day_plan|check_in|day_summary|weekly_review|win|pattern",
-      "ref": "<o id do finding — só para kind=pattern; caso contrário \\"\\">",
+      "ref": "<o id do finding — só para kind=pattern; caso contrário \"\">",
       "title": "título curto (máx. 60 caracteres)",
-      "body": "1 a 2 frases",
+      "body": "2 a 4 frases com substância",
       "chips": [{"label": "facto muito curto (máx. 24 caracteres)",
                  "tone": "good|warn|bad|neutral"}],
       "swap": {"from": "alimento registado", "to": "alimento das swap_options",
@@ -509,93 +566,28 @@ _CARDS_SCHEMA = """Devolve APENAS um objeto JSON com esta forma exata:
     }
   ]
 }
-Um cartão para cada tipo pedido em `wanted_cards`, na ordem em que aparecem. `chips` e
-`swap` são opcionais (`swap: null` quando não houver troca honesta)."""
+Omite `next_meal` quando `wanted_next_meal` for false. `chips` e `swap` são opcionais.
+
+Responde com o JSON na tua resposta, e mais nada — sem preâmbulo, sem resumo, sem
+escrever ficheiros."""
 
 
-def build_cards_prompt(facts: Dict[str, Any]) -> str:
-    return (f"{_CARD_RULES}\n\nFACTOS (JSON, já calculados):\n"
+def build_feed_prompt(facts: Dict[str, Any]) -> str:
+    """The one prompt behind the whole feed — built on the server so that Sonnet (on
+    the Mac) and Gemini (the fallback) are given byte-identical instructions and their
+    answers pass through byte-identical validation."""
+    return (f"{_FEED_RULES}\n\nFACTOS (JSON, já calculados):\n"
             f"{json.dumps(facts, ensure_ascii=False, indent=1, default=str)}\n\n"
-            f"{_CARDS_SCHEMA}")
+            f"{_FEED_SCHEMA}")
 
 
-def narrate_cards(facts: Dict[str, Any], api_key: Optional[str] = None,
-                  model: Optional[str] = None) -> Dict[str, Any]:
-    """The prose for one generation slot, in a single call.
-
-    One call per slot (not one per card) keeps the whole feed coherent — the cards
-    read like one person wrote them in one sitting, and they can avoid repeating each
-    other because the model sees them all at once.
-    """
-    prompt = build_cards_prompt(facts)
-    log.info("cards prompt %d chars (slot=%s)", len(prompt), facts.get("slot"))
+def narrate_feed(facts: Dict[str, Any], api_key: Optional[str] = None,
+                 model: Optional[str] = None) -> Dict[str, Any]:
+    """Generate the whole feed with Gemini. The fallback path — see
+    `automation/coach/worker.py` for the Sonnet-on-the-Mac primary."""
+    prompt = build_feed_prompt(facts)
+    log.info("feed prompt %d chars (slot=%s)", len(prompt), facts.get("slot"))
     return _strip_meta(call_gemini(prompt, require_key="cards", api_key=api_key,
-                                   model=model, temperature=0.35))
-
-
-# -- Next meal (food-aware, always answerable) ---------------------------------
-
-_NEXT_MEAL_RULES = """És um coach de nutrição prático a responder à pergunta diária "o que
-vou comer a seguir?" em português de Portugal ("tu").
-
-PARTE 1 — Decide qual é a PRÓXIMA REFEIÇÃO, a partir da hora atual, do que já foi
-registado hoje, dos horários típicos da pessoa (`meal_pattern`) e do orçamento que resta.
-Exemplos: são 10:30 e ainda não comeu nada -> pequeno-almoço, mesmo tarde; já almoçou e
-são 15:00 -> lanche da tarde; já almoçou e são 18:30 -> jantar.
-
-PARTE 2 — Cria 3 sugestões de prato para essa refeição.
-- Usa sobretudo comida que a pessoa já come: `candidates.usual_at_this_slot`,
-  `candidates.by_nutrient` e `candidates.for_findings`.
-- `candidates.groups_to_favour` são os grupos alimentares que andam abaixo da referência
-  semanal — puxa por eles quando encaixar na refeição (é aqui que o peixe entra num dia
-  em que só houve carne).
-- Podes introduzir no MÁXIMO 1 alimento novo, saudável e comum por sugestão — marca-o com
-  "new": true. Os alimentos em `candidates` marcados `new` também contam como novos.
-- Respeita as gramas dadas (grams_low..grams_high) quando existirem, e não excedas as
-  calorias que restam.
-- Respeita `memory`: se a pessoa disse que não gosta de algo ou que não pode comer algo,
-  não o sugiras.
-- Sê apetecível e concreto: isto tem de dar vontade de cozinhar.
-- O 1.º prato é o recomendado.
-
-MUITO IMPORTANTE: devolves SEMPRE 3 pratos. Mesmo que hoje não falte nenhum nutriente,
-"o que como a seguir?" continua a ser uma pergunta legítima — nesse caso sugere pratos
-equilibrados, com variedade, que puxem pelos grupos em falta na semana e respeitem o
-orçamento que resta. Nunca respondas que não é preciso sugestão."""
-
-_PLATES_SCHEMA = """Devolve APENAS um objeto JSON com esta forma exata:
-{
-  "next_slot": "pequeno-almoço | almoço | jantar | lanche da manhã | lanche da tarde",
-  "reasoning": "uma frase curta — porque é esta a próxima refeição",
-  "plates": [
-    {
-      "rank": 1, "recommended": true,
-      "title": "nome do prato",
-      "items": [{"food": "...", "grams_low": N, "grams_high": N, "new": false}],
-      "covers": [{"key": "omega3_g", "label": "Ómega-3", "note": "nota curta"}],
-      "calories": N, "protein_g": N,
-      "why": "uma frase — o que resolve e porque encaixa"
-    },
-    {"rank": 2, "recommended": false, "...": "..."},
-    {"rank": 3, "recommended": false, "...": "..."}
-  ]
-}"""
-
-
-def build_next_meal_prompt(context: Dict[str, Any]) -> str:
-    """`context` carries current_time, today_meals, meal_pattern, the remaining
-    budget, the food-level candidates (see coach_feed.next_meal_candidates) and the
-    user's memory."""
-    return (f"{_NEXT_MEAL_RULES}\n\nDADOS (JSON):\n"
-            f"{json.dumps(context, ensure_ascii=False, indent=1, default=str)}\n\n"
-            f"{_PLATES_SCHEMA}")
-
-
-def narrate_next_meal(context: Dict[str, Any], api_key: Optional[str] = None,
-                      model: Optional[str] = None) -> Dict[str, Any]:
-    prompt = build_next_meal_prompt(context)
-    log.info("next-meal prompt %d chars", len(prompt))
-    return _strip_meta(call_gemini(prompt, require_key="plates", api_key=api_key,
                                    model=model, temperature=0.35))
 
 

@@ -12,13 +12,15 @@
 //  2. **Never block on the network, never block on a model.** `GET /coach/feed` is a
 //     pure storage read on the server (~100 ms). Generation happens in the background
 //     via `POST /coach/refresh`, which returns 202 immediately.
-//  3. **A failure never destroys good data.** A failed refresh leaves the cached feed
-//     on screen and surfaces an error only when there is nothing to show. The old
-//     store assigned the response unconditionally, so a "skipped" or empty reply
-//     wiped out a perfectly good one.
-//  4. **If the user is waiting, show real progress.** While the server reports
-//     `generating`, the store polls and advances a determinate progress bar. The old
-//     version showed a bare spinner that could spin forever with nothing behind it.
+//  3. **A failure never destroys good data.** A failed refresh throws and leaves the
+//     cached feed on screen, surfacing an error only when there is nothing to show.
+//     A *successful* empty answer is different and is taken at face value: the server
+//     filters cards by what the current part of the day is about, so "nothing" in the
+//     evening genuinely means this morning's check-in no longer applies.
+//  4. **Only claim progress that exists.** A determinate bar runs while a worker is
+//     actually generating. Work merely queued for the Mac's Sonnet gets a quiet note
+//     instead — it can honestly wait hours for a sleeping laptop, and a bar promising
+//     imminent results would be the old forever-spinner in a nicer costume.
 //  5. **Load at most once per interval.** The old code loaded on app launch AND on
 //     tab appearance AND on every foreground, then triggered generation from inside
 //     the load — three overlapping 45-second Gemini calls for one tap.
@@ -39,8 +41,12 @@ final class CoachStore {
     var isLoading = false
     /// A reload running behind cards that are already on screen.
     var isRefreshing = false
-    /// The server is generating. Drives the progress bar.
+    /// A worker is actively generating. Drives the progress bar.
     var isGenerating = false
+    /// Work is queued for the Mac's Sonnet, which may be asleep. Deliberately NOT a
+    /// progress bar: this can honestly take hours, and a bar that promises imminent
+    /// results is the old "loading forever" lie in a nicer costume.
+    var isQueued = false
     /// 0…1 while generating, so the user sees movement rather than a mystery spinner.
     var progress: Double = 0
     /// Card ids the user has already seen, so genuinely new cards can be marked.
@@ -113,12 +119,13 @@ final class CoachStore {
             lastLoadedAt = Date()
             errorMessage = nil
 
-            // Ask for new cards when the feed has gone stale, or when the user pulled
-            // to refresh. Fire and forget: the work happens on the server and the
-            // poll below is what notices it landing.
+            // Ask for new cards when the feed has gone stale — by age or because the
+            // day has moved into a part these cards have nothing to say about — or
+            // when the user pulled to refresh. Fire and forget: the work happens on
+            // the server, and the poll below is what notices it landing.
             if fresh.stale || force {
                 await requestRefresh(reason: force ? "manual" : "stale")
-            } else if fresh.generating {
+            } else if fresh.generating || fresh.queued > 0 {
                 startPolling()
             }
         } catch {
@@ -139,7 +146,10 @@ final class CoachStore {
         guard !isGenerating else { return }
         do {
             _ = try await APIClient.shared.coachRefresh(reason: reason)
-            beginGenerating()
+            // Queued, not generating: the request goes to the Mac first, and it may
+            // be asleep. Poll for a while in case it answers quickly.
+            isQueued = true
+            startPolling()
         } catch {
             // The queue is unreachable. There is nothing for the user to do about it
             // and the cached cards are still on screen, so this stays quiet.
@@ -147,15 +157,21 @@ final class CoachStore {
     }
 
     private func apply(_ fresh: CoachFeed) {
-        // Only replace what's on screen with something that actually has cards. An
-        // empty response behind a populated feed means "generation hasn't landed
-        // yet", not "you have nothing".
-        if fresh.cards.isEmpty, !(feed?.cards.isEmpty ?? true) {
-            if !fresh.generating { endGenerating() }
-            return
-        }
+        // The server's list is authoritative, including when it is empty.
+        //
+        // It filters cards by what the current part of the day is actually about, so
+        // an empty answer in the evening means "this morning's check-in is no longer
+        // the truth", not "the response was lost". Keeping the old cards on screen
+        // here would resurrect exactly the stale-context problem the filter exists to
+        // fix. A genuinely failed refresh never reaches this method — it throws, and
+        // `load` leaves the cached feed alone.
         feed = fresh
-        if !fresh.generating { endGenerating() }
+        isQueued = fresh.queued > 0
+        if fresh.generating {
+            if !isGenerating { beginGenerating() }
+        } else {
+            endGenerating()
+        }
     }
 
     // MARK: - Generation progress
@@ -168,8 +184,6 @@ final class CoachStore {
     }
 
     private func endGenerating() {
-        pollTask?.cancel()
-        pollTask = nil
         guard isGenerating else { return }
         isGenerating = false
         generationStartedAt = nil
@@ -183,7 +197,6 @@ final class CoachStore {
     /// still moving. It only completes when the server says it did.
     private func startPolling() {
         pollTask?.cancel()
-        isGenerating = true
         if generationStartedAt == nil { generationStartedAt = Date() }
 
         pollTask = Task { [weak self] in
@@ -192,25 +205,28 @@ final class CoachStore {
                 try? await Task.sleep(for: self?.pollInterval ?? .seconds(3))
                 guard let self, !Task.isCancelled else { return }
 
-                let elapsed = Date().timeIntervalSince(started)
-                withAnimation(.linear(duration: 0.3)) {
-                    self.progress = min(0.92, 0.05
-                                        + elapsed / self.expectedGenerationSeconds * 0.87)
+                if self.isGenerating {
+                    let elapsed = Date().timeIntervalSince(started)
+                    withAnimation(.linear(duration: 0.3)) {
+                        self.progress = min(0.92, 0.05
+                                            + elapsed / self.expectedGenerationSeconds * 0.87)
+                    }
                 }
 
                 if let fresh = try? await APIClient.shared.coachFeed() {
                     let landed = fresh.cards.map(\.id) != (self.feed?.cards.map(\.id) ?? [])
                     self.apply(fresh)
-                    if !fresh.generating || landed {
+                    if landed || (!fresh.generating && fresh.queued == 0) {
                         self.endGenerating()
                         self.lastLoadedAt = Date()
                         return
                     }
                 }
 
-                if elapsed > self.pollCeiling {
-                    // Give up watching, keep whatever is on screen. The generation may
-                    // still land; the next open will pick it up.
+                // Stop watching after a couple of minutes. Work queued for a sleeping
+                // Mac can take hours, and that is fine — it lands in the feed whenever
+                // it lands, and the next time the app opens it is simply there.
+                if Date().timeIntervalSince(started) > self.pollCeiling {
                     self.endGenerating()
                     return
                 }

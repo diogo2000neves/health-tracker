@@ -539,6 +539,46 @@ _BETTER_GROUPS: Dict[str, Tuple[str, ...]] = {
     "fat_sat": ("fat_healthy", "nut_seed"),
 }
 
+# Which groups to reach for depends on the meal as well as the problem. Cutting the
+# breakfast ham means an egg or fresh cheese, not a fillet of cod — the generic
+# ranking is nutritionally right and practically absurd at 8 a.m.
+_BETTER_GROUPS_BY_SLOT: Dict[str, Dict[str, Tuple[str, ...]]] = {
+    "breakfast": {
+        "processed_meat": ("egg", "dairy_plain", "cheese", "nut_seed"),
+        "refined_grain": ("whole_grain", "fruit", "dairy_plain"),
+        "sweet": ("fruit", "dairy_plain", "nut_seed"),
+    },
+    "morning_snack": {
+        "sweet": ("fruit", "nut_seed", "dairy_plain"),
+        "savory_snack": ("fruit", "nut_seed"),
+    },
+    "afternoon_snack": {
+        "sweet": ("fruit", "nut_seed", "dairy_plain"),
+        "savory_snack": ("fruit", "nut_seed"),
+        "processed_meat": ("egg", "dairy_plain", "nut_seed"),
+    },
+}
+
+# Staples that belong to a particular meal, used when the log has nothing to offer
+# in the group we want at that time of day.
+_SLOT_STAPLES: Dict[str, Dict[str, Tuple[str, ...]]] = {
+    "breakfast": {
+        "egg": ("ovo cozido", "ovos mexidos"),
+        "dairy_plain": ("iogurte natural", "skyr"),
+        "cheese": ("queijo fresco",),
+        "nut_seed": ("manteiga de amendoim", "amêndoas"),
+        "fish_oily": ("atum",),
+        "whole_grain": ("aveia", "pão integral"),
+        "fruit": ("banana", "maçã"),
+    },
+    "afternoon_snack": {
+        "dairy_plain": ("iogurte natural", "skyr"),
+        "nut_seed": ("amêndoas", "nozes"),
+        "fruit": ("maçã", "pera"),
+        "egg": ("ovo cozido",),
+    },
+}
+
 # Common, cheap, Portuguese-supermarket staples per group — the fallback when the
 # log has nothing in a group. Deliberately short and boring: a suggestion the user
 # won't buy is worse than no suggestion.
@@ -563,9 +603,15 @@ def swap_candidates(finding: Dict[str, Any], foods: Sequence[Dict[str, Any]], *,
     """Concrete replacements for a finding: what to move away from (only ever a food
     that appears in the log) and what to move toward.
 
-    Returns `{"from": [...], "to": [...]}` where every `to` entry carries whether it
-    is already part of the user's diet. The model picks and phrases; it cannot
-    invent either side, which is precisely the bug this replaces.
+    Replacements are ranked by whether they fit the MEAL the original food is actually
+    eaten at. Ham eaten in a breakfast sandwich must not be answered with codfish: it
+    is nutritionally sound and practically useless, which is worse than saying nothing.
+    So a candidate the user eats at the same slot outranks one they eat at another
+    slot, which outranks a staple they have never logged.
+
+    Returns `{"from": [...], "to": [...]}` where every `to` entry carries the slot it
+    belongs to and whether it is already part of the diet. The model picks and phrases;
+    it cannot invent either side.
     """
     group = finding.get("group")
     from_foods: List[Dict[str, Any]] = []
@@ -574,13 +620,19 @@ def swap_candidates(finding: Dict[str, Any], foods: Sequence[Dict[str, Any]], *,
             if food["group"] == group:
                 from_foods.append({"food": food["food"], "times": food["times"],
                                    "median_portion_g": food["median_portion_g"],
+                                   "slot": food["top_slot"],
                                    "slot_label": food["slot_label"]})
             if len(from_foods) >= limit:
                 break
 
+    # The meal the thing we're replacing actually belongs to.
+    target_slot = from_foods[0]["slot"] if from_foods else finding.get(
+        "evidence", {}).get("slot")
+
     wanted: Tuple[str, ...] = ()
     if finding["kind"] in ("group_over", "refined_share", "streak") and group:
-        wanted = _BETTER_GROUPS.get(group, ())
+        by_slot = _BETTER_GROUPS_BY_SLOT.get(target_slot or "", {})
+        wanted = by_slot.get(group) or _BETTER_GROUPS.get(group, ())
     elif finding["kind"] == "group_under" and group:
         wanted = (group,)
     elif finding["kind"] in ("slot_no_plant", "veg_variety"):
@@ -593,20 +645,33 @@ def swap_candidates(finding: Dict[str, Any], foods: Sequence[Dict[str, Any]], *,
     to_foods: List[Dict[str, Any]] = []
     for target in wanted:
         eaten = [f for f in foods if f["group"] == target]
+        # Foods eaten at the same meal as the one being replaced come first.
+        eaten.sort(key=lambda f: (f["top_slot"] != target_slot, -f["times"]))
         for food in eaten[:2]:
             to_foods.append({"food": food["food"], "group": target,
                              "median_portion_g": food["median_portion_g"],
-                             "times": food["times"], "new": False})
+                             "times": food["times"], "new": False,
+                             "slot": food["top_slot"],
+                             "slot_label": food["slot_label"],
+                             "fits_the_meal": food["top_slot"] == target_slot})
         if not eaten:
-            for staple in _STAPLES.get(target, ())[:2]:
+            slot_staples = _SLOT_STAPLES.get(target_slot or "", {}).get(target)
+            for staple in (slot_staples or _STAPLES.get(target, ()))[:2]:
                 to_foods.append({"food": staple, "group": target,
                                  "median_portion_g": tax.GROUP_INFO.get(
                                      target, {}).get("serving_g", 100),
-                                 "times": 0, "new": True})
-        if len(to_foods) >= limit + 1:
+                                 "times": 0, "new": True, "slot": None,
+                                 "slot_label": "", "fits_the_meal": None})
+        if len(to_foods) >= limit + 2:
             break
 
-    return {"from": from_foods, "to": to_foods[: limit + 1]}
+    # A replacement that fits the meal outranks one that doesn't, whatever group it
+    # came from — the model reads this list top-down.
+    to_foods.sort(key=lambda t: (t.get("fits_the_meal") is not True,
+                                 t.get("new") is True))
+    return {"from": from_foods, "to": to_foods[: limit + 1],
+            "replacing_at": target_slot,
+            "replacing_at_label": SLOT_LABELS.get(target_slot or "", "")}
 
 
 # -- the whole profile ---------------------------------------------------------

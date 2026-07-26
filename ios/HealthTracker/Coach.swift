@@ -30,15 +30,20 @@ struct CoachFeed: Decodable {
     /// The newest card is old enough to be worth refreshing. The app acts on this by
     /// kicking a *background* generation — never by blocking the screen.
     let stale: Bool
-    /// A generation is running on the server right now, so the app can show real
+    /// A worker is running a generation *right now*, so the app can show real
     /// progress instead of an empty screen.
     let generating: Bool
+    /// Generations waiting for the Mac's Sonnet to pick them up. Deliberately
+    /// distinct from `generating`: a job can legitimately wait hours for a sleeping
+    /// laptop, and showing a progress bar for that would be the old "loading forever"
+    /// bug wearing a new hat. This gets a quiet note instead.
+    let queued: Int
     let cards: [CoachCard]
 
     var isEmpty: Bool { cards.isEmpty }
 
     enum CodingKeys: String, CodingKey {
-        case status, stale, generating, cards
+        case status, stale, generating, queued, cards
         case generatedAt = "generated_at"
         case serverTime = "server_time"
     }
@@ -50,6 +55,7 @@ struct CoachFeed: Decodable {
         serverTime = try c.decodeIfPresent(String.self, forKey: .serverTime)
         stale = try c.decodeIfPresent(Bool.self, forKey: .stale) ?? false
         generating = try c.decodeIfPresent(Bool.self, forKey: .generating) ?? false
+        queued = try c.decodeIfPresent(Int.self, forKey: .queued) ?? 0
         cards = try c.decodeIfPresent([CoachCard].self, forKey: .cards) ?? []
     }
 
@@ -64,6 +70,7 @@ struct CoachFeed: Decodable {
         serverTime = nil
         stale = true
         generating = false
+        queued = 0
     }
 }
 

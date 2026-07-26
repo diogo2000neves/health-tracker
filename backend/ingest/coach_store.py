@@ -62,6 +62,18 @@ def thread_path(thread_id: str) -> str:
     return f"{ROOT}/threads/{thread_id}.json"
 
 
+# A generation waiting for a model. The backend builds the prompt and parks it here;
+# the Mac worker claims it and answers with Sonnet. If nobody claims it — the laptop
+# is asleep, or Claude's usage window is spent — the sweeper eventually runs it
+# through Gemini instead. The job IS the handoff, so neither side needs to be up at
+# the same time as the other.
+JOBS = f"{ROOT}/jobs"
+
+
+def job_path(job_id: str) -> str:
+    return f"{JOBS}/{job_id}.json"
+
+
 # A thread id comes in from the app, so it is checked before it becomes a path —
 # an id with a slash or a `..` in it must never be able to address another blob.
 _SAFE_ID = re.compile(r"[A-Za-z0-9_.:-]{1,80}\Z")
@@ -321,3 +333,103 @@ def _age_seconds(then_iso: Any, now_iso: str) -> Optional[float]:
     if (then.tzinfo is None) != (now.tzinfo is None):
         then = then.replace(tzinfo=now.tzinfo)
     return (now - then).total_seconds()
+
+
+# -- the generation job queue --------------------------------------------------
+# Small enough to be a few JSON blobs: there is one user, and at most a handful of
+# jobs an hour. What matters is not throughput but that a job survives a sleeping
+# laptop, an exhausted usage window and a scaled-to-zero service.
+
+def list_jobs() -> List[Dict[str, Any]]:
+    """Every job on the queue, oldest first."""
+    out: List[Dict[str, Any]] = []
+    for name in list_names(f"{JOBS}/"):
+        job = read_json(name, default=None)
+        if isinstance(job, dict) and job.get("id"):
+            out.append(job)
+    out.sort(key=lambda j: str(j.get("created_at") or ""))
+    return out
+
+
+def claim_next_job(worker: str, now_iso: str, *, lease_s: int = 900
+                   ) -> Optional[Dict[str, Any]]:
+    """Hand the oldest unclaimed job to a worker, or None if there is nothing to do.
+
+    The claim is a lease, not a lock: a worker that takes a job and then dies (the
+    laptop sleeps mid-run, which is the normal case here, not the exotic one) loses
+    the job back to the queue after `lease_s` rather than stranding it forever.
+    """
+    for job in list_jobs():
+        if job.get("done_at"):
+            continue
+        claimed_at = job.get("claimed_at")
+        if claimed_at:
+            age = _age_seconds(claimed_at, now_iso)
+            if age is not None and age < lease_s:
+                continue                      # someone else is on it
+
+        def take(current: Any) -> Dict[str, Any]:
+            data = current if isinstance(current, dict) else dict(job)
+            data["claimed_at"] = now_iso
+            data["claimed_by"] = worker
+            data["attempts"] = int(data.get("attempts") or 0) + 1
+            return data
+
+        updated = update_json(job_path(job["id"]), take, default=job)
+        # Only the writer that actually won the precondition may run the job.
+        if isinstance(updated, dict) and updated.get("claimed_by") == worker:
+            return updated
+    return None
+
+
+def release_job(job_id: str, reason: str, now_iso: str) -> None:
+    """Put a claimed job back. Used when the worker can't do it *right now* — an
+    exhausted Claude usage window is the expected case, and it must not consume the
+    job or the fallback timer would never get a chance to matter."""
+    def clear(current: Any) -> Dict[str, Any]:
+        data = current if isinstance(current, dict) else {"id": job_id}
+        data["claimed_at"] = None
+        data["claimed_by"] = None
+        data["last_release"] = {"reason": reason[:200], "at": now_iso}
+        return data
+    update_json(job_path(job_id), clear, default={"id": job_id})
+
+
+def finish_generation_job(job_id: str) -> None:
+    delete(job_path(job_id))
+
+
+def oldest_pending_age_s(now_iso: str) -> Optional[float]:
+    """How long the oldest unfinished job has been waiting, or None if the queue is
+    empty. The fallback decision is exactly this number against a threshold."""
+    ages = [
+        _age_seconds(job.get("created_at"), now_iso)
+        for job in list_jobs() if not job.get("done_at")
+    ]
+    real = [a for a in ages if a is not None]
+    return max(real) if real else None
+
+
+def queue_summary(now_iso: str, *, lease_s: int = 900) -> Dict[str, Any]:
+    """What the queue looks like right now: how many jobs are waiting, and whether a
+    worker is actually running one.
+
+    The distinction matters to the app. A job *claimed* by the Mac is work in
+    progress and deserves a progress bar; a job merely *waiting* for a laptop that
+    might be asleep is not — showing a spinner for the hours a job may legitimately
+    wait for Sonnet would be the old "loading forever" bug wearing a new hat.
+    """
+    waiting, running, oldest = 0, False, None
+    for job in list_jobs():
+        if job.get("done_at"):
+            continue
+        age = _age_seconds(job.get("created_at"), now_iso)
+        if age is not None:
+            oldest = age if oldest is None else max(oldest, age)
+        claimed = job.get("claimed_at")
+        claim_age = _age_seconds(claimed, now_iso) if claimed else None
+        if claim_age is not None and claim_age < lease_s:
+            running = True
+        else:
+            waiting += 1
+    return {"waiting": waiting, "running": running, "oldest_age_s": oldest}

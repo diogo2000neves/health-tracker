@@ -31,7 +31,8 @@ facts lead with food.
 | `ingest/food_patterns.py` | The deterministic reading of the log: servings/week per group vs reference, streaks, per-slot composition, variety, ranked findings with evidence, swap candidates. |
 | `ingest/coach_feed.py` | Which cards a slot produces, dedup and cooldown, card ids/expiry/priority, and the validation that a swap references real logged food. |
 | `ingest/coach_memory.py` | What the coach remembers between conversations: merge, dedup by meaning, bound, prune. |
-| `ingest/narrator.py` | Gemini prompts: feed cards, plates, chat + memory extraction. Prose only — never arithmetic, never food selection. |
+| `ingest/narrator.py` | The prompts — one for the whole feed, plus chat and memory extraction — and the Gemini transport. Prose only; never arithmetic, never food selection. |
+| `automation/coach/worker.py` | The Mac side: claims a job, answers it with Sonnet, posts it back. No nutrition logic. |
 
 ### Canonicalisation is what made food-level advice possible
 
@@ -42,13 +43,73 @@ a real 28-day window that produced 116 "foods", 85 of them appearing exactly onc
 the same window is 75 foods with nothing unplaced, and "red meat seven times, fish
 none" becomes a fact the coach can state.
 
+## Which model writes it
+
+Claude Sonnet, on the MacBook, is the primary. Gemini is the fallback. That ordering
+is deliberate: the coaching voice *is* the product, and a flash model produces correct,
+forgettable sentences where Sonnet notices that the oats held the morning and that
+lunch was the tenth day running without anything green.
+
+The backend never calls a model to generate the feed. It computes the facts, builds
+the prompt, and parks it as a job:
+
+```
+POST /coach/generate     ->  writes coach/jobs/<id>.json, returns 202 "waiting_for": "sonnet"
+GET  /coach/work         ->  the Mac worker claims the oldest job (a 15-minute lease)
+POST /coach/work/<id>    ->  {"answer": {...}}  the answer, validated and assembled
+                             {"release": "..."} put it back — used for a spent usage window
+POST /coach/sweep        ->  anything older than COACH_SONNET_WAIT_HOURS (5) goes to Gemini
+```
+
+So a sleeping laptop delays the coach; it cannot break it. An exhausted five-hour
+usage window releases the job rather than consuming it, and the job keeps waiting for
+Sonnet until the sweeper decides the wait has gone on long enough.
+
+Both paths are given byte-identical prompts and pass through byte-identical
+validation (`coach_feed.assemble`) — Sonnet gets no more benefit of the doubt than
+Gemini. Each card records which model wrote it in `source`.
+
+The worker (`automation/coach/worker.py`) holds no nutrition logic at all: it claims
+a job, runs `claude -p` with **no tools**, and posts the JSON back. The no-tools part
+is not fussiness — the first live run had Read/Write available, did 238 s of good
+work, wrote the JSON to a file and returned a prose summary, so the caller found no
+answer at all. A prompt that needs no tools is given none.
+
+## When it runs
+
+Generation follows when the user actually eats, not the clock:
+
+| trigger | when |
+| --- | --- |
+| a logged meal | schedules a run **one hour later**; another meal within that hour pushes it back, so the analysis lands when the meal is genuinely over |
+| `coach-morning` | 07:30 — the day plan, before anything has been logged to trigger on |
+| `coach-weekly` | Sunday 09:00 — the week in review |
+| `coach-sweep` | every 30 min — hands anything Sonnet hasn't taken in five hours to Gemini |
+| opening the app | only if the feed has nothing to say about the current part of the day |
+
+The debounce is a Cloud Task scheduled an hour out carrying the timestamp of the meal
+that scheduled it; when it fires it regenerates only if nothing has been logged since.
+Identical jobs are deduplicated for 45 minutes, so opening the app repeatedly while
+the Mac sleeps queues one job, not twenty.
+
+## The feed is about *now*
+
+Cards that describe a moment — `next_meal`, `check_in`, `day_summary` — are shown only
+while the day is still in the part they were written for. Opening the app after dinner
+leads with the day's whole story rather than the morning's read on breakfast, and the
+feed reports itself stale so the app quietly asks for something current. Patterns,
+wins and the weekly review are about habits and always stay.
+
 ## Endpoints
 
 | method | path | notes |
 | --- | --- | --- |
 | `GET` | `/coach/feed` | The app's only read. Storage only — no model, no Sheets. Carries `stale` and `generating`. |
 | `POST` | `/coach/refresh` | 202 + Cloud Tasks enqueue. Never blocks on a model. |
-| `POST` | `/coach/generate` | The worker. `{"slot": "morning\|afternoon\|evening\|weekly\|adhoc"}`. One run at a time; retries replace their own cards. |
+| `POST` | `/coach/generate` | Prepares a job (no model call). `{"slot": "morning\|afternoon\|evening\|weekly\|adhoc"}`. |
+| `GET` | `/coach/work` | The Mac worker claims a job, or 204. |
+| `POST` | `/coach/work/<id>` | The answer, or a release. |
+| `POST` | `/coach/sweep` | Gemini takes over anything that waited too long. |
 | `POST` | `/coach/chat` | A turn in the conversation about one card; also folds anything durable into memory. |
 | `GET` | `/coach/thread/<id>` | One conversation. |
 | `GET`/`POST`/`DELETE` | `/coach/memory[/<id>]` | Read, add to, and correct what the coach remembers. |
@@ -75,27 +136,33 @@ gcloud run services update health-tracker-ingest --region=${REGION} \
   --update-env-vars=COACH_BUCKET=${BUCKET}
 ```
 
-Then the four generation slots. Cloud Scheduler calls the worker directly; the times
-are in the service's own timezone (`Europe/Lisbon`).
+Then the schedules. Only three are clock-driven — the rest follows the meals.
 
 ```bash
 REGION=europe-west1
-URL=https://health-tracker-ingest-myznjtlyrq-ew.a.run.app/coach/generate
+BASE=https://health-tracker-ingest-myznjtlyrq-ew.a.run.app
 TOKEN=...   # the INGEST_TOKEN the service already holds
 
-create() {  # name, cron, slot
+create() {  # name, cron, path, body
   gcloud scheduler jobs create http "coach-$1" --location=${REGION} \
-    --schedule="$2" --time-zone="Europe/Lisbon" --uri="${URL}" \
+    --schedule="$2" --time-zone="Europe/Lisbon" --uri="${BASE}$3" \
     --http-method=POST \
     --headers="Content-Type=application/json,X-Auth-Token=${TOKEN}" \
-    --message-body="{\"slot\":\"$3\",\"reason\":\"schedule\"}" \
-    --attempt-deadline=300s
+    --message-body="$4" --attempt-deadline=300s
 }
 
-create morning   "30 7 * * *"  morning
-create afternoon "30 15 * * *" afternoon
-create evening   "30 21 * * *" evening
-create weekly    "0 9 * * SUN" weekly
+create morning "30 7 * * *"  /coach/generate '{"slot":"morning","reason":"schedule"}'
+create weekly  "0 9 * * SUN" /coach/generate '{"slot":"weekly","reason":"schedule"}'
+create sweep   "*/30 * * * *" /coach/sweep   '{}'
+```
+
+Then the Sonnet worker on the Mac:
+
+```bash
+cp automation/coach/com.dneves.coach-worker.plist ~/Library/LaunchAgents/
+# put the real INGEST_TOKEN in it first — launchd inherits no shell environment
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.dneves.coach-worker.plist
+tail -f automation/coach/logs/worker.log
 ```
 
 A meal landing also enqueues an `adhoc` refresh (see `_finalize` in `ingest/main.py`),

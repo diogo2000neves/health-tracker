@@ -50,16 +50,40 @@ class ClaudeError(RuntimeError):
 
 
 def call_claude_json(prompt: str, *, model: str, effort: str,
-                     timeout_s: int, require_key: str = "items") -> Dict[str, Any]:
+                     timeout_s: int, require_key: str = "items",
+                     tools: str = "Read") -> Dict[str, Any]:
     """Run the headless CLI and return the first JSON object carrying `require_key`.
     Attaches `_cost_usd` and `_model_id` from the CLI envelope. Raises ClaudeError
-    on any failure so the caller decides how to degrade."""
+    on any failure so the caller decides how to degrade.
+
+    `tools` is the exact tool budget for the call. "Read" is what the audit needs (to
+    open the meal images). Pass "" for a pure reasoning call: a prompt that needs no
+    tools should be given none, because a model that *can* write a file may decide to
+    answer by writing one — which is exactly what happened the first time the coach's
+    prompt was run through here. It did the work, wrote the JSON to disk, and returned
+    a prose summary, so the caller found no JSON in the answer at all.
+    """
+    if tools:
+        # The audit's invocation, unchanged: it is production and it works.
+        command = [CLAUDE_BIN, "-p", prompt, "--model", model, "--effort", effort,
+                   "--output-format", "json", "--allowedTools", tools]
+    else:
+        # Deny the tools that let a model answer by side effect instead of by
+        # replying. `--tools ""` is not usable here: the flag is variadic, so an
+        # empty value silently swallowed the prompt and the CLI then answered
+        # whatever it found on stdin. Hence an explicit deny list, and `-p` LAST so
+        # it terminates that list.
+        command = [CLAUDE_BIN, "--model", model, "--effort", effort,
+                   "--output-format", "json",
+                   "--disallowedTools", "Write", "Edit", "NotebookEdit", "Bash",
+                   "Task", "WebFetch", "WebSearch",
+                   "-p", prompt]
     try:
         proc = subprocess.run(
-            [CLAUDE_BIN, "-p", prompt, "--model", model,
-             "--effort", effort, "--output-format", "json",
-             "--allowedTools", "Read"],
-            capture_output=True, text=True, timeout=timeout_s,
+            command, capture_output=True, text=True, timeout=timeout_s,
+            # Never inherit stdin. A headless call that reads the caller's stdin will
+            # happily answer something that was never asked.
+            stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired as exc:
         raise ClaudeError(f"claude timed out after {timeout_s}s") from exc

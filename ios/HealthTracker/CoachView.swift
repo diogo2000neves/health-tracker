@@ -33,6 +33,9 @@ struct CoachView: View {
                 if store.isGenerating {
                     GenerationBar(progress: store.progress)
                         .transition(.move(edge: .top).combined(with: .opacity))
+                } else if store.isQueued {
+                    QueuedNote()
+                        .transition(.move(edge: .top).combined(with: .opacity))
                 }
             }
             .background(Palette.screen)
@@ -70,7 +73,7 @@ struct CoachView: View {
     private var content: some View {
         if !store.cards.isEmpty {
             feed
-        } else if store.isLoading || store.isGenerating {
+        } else if store.isLoading || store.isGenerating || store.isQueued {
             firstRun
         } else if let error = store.errorMessage {
             LoadingOrError(isLoading: false, error: error) {
@@ -85,8 +88,8 @@ struct CoachView: View {
     private var feed: some View {
         ScrollView {
             VStack(spacing: 14) {
-                if store.isGenerating {
-                    // Reserve the bar's height so the first card doesn't jump.
+                if store.isGenerating || store.isQueued {
+                    // Reserve the banner's height so the first card doesn't jump.
                     Spacer().frame(height: 26)
                 }
                 ForEach(store.cards) { card in
@@ -100,14 +103,17 @@ struct CoachView: View {
         }
     }
 
-    /// Fresh install: nothing cached, generation running. The one moment a spinner is
-    /// honest — and it comes with a bar and an explanation.
+    /// Nothing cached yet, with work under way. The one moment a placeholder is
+    /// honest — and it says which of the two waits this is.
     private var firstRun: some View {
         ContentUnavailableView {
             Label("A preparar o teu coach", systemImage: "sparkles")
         } description: {
-            Text("Estou a ler as tuas últimas semanas de refeições para te dizer algo "
-                 + "que valha a pena. Demora uns segundos — só desta vez.")
+            Text(store.isGenerating
+                 ? "Estou a ler as tuas últimas semanas de refeições para te dizer "
+                   + "algo que valha a pena."
+                 : "Pedi uma análise ao modelo grande. Aparece aqui assim que estiver "
+                   + "pronta — podes fechar a app à vontade.")
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -156,6 +162,26 @@ struct GenerationBar: View {
         .padding(.horizontal, 16)
         .padding(.top, 6)
         .padding(.bottom, 8)
+        .background(.bar)
+    }
+}
+
+/// Work is queued for the Mac's Sonnet, which may be asleep. No bar and no
+/// percentage: this can take hours, and the honest thing is to say so and get out of
+/// the way rather than animate a promise the app can't keep.
+struct QueuedNote: View {
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "hourglass")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text("Análise pedida ao modelo grande — chega quando estiver pronta")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
         .background(.bar)
     }
 }

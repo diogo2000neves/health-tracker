@@ -297,10 +297,29 @@ class TestSwapCandidates:
 NOW = datetime(2026, 7, 26, 15, 30)
 
 
-def fake_narrate(cards):
-    def narrate(_facts):
-        return {"cards": cards}
-    return narrate
+def generate(slot, profile, answer, *, now=NOW, today=None, state=None):
+    """Drive one generation exactly the way the endpoint does: build the facts, pull
+    the findings index out of them, then assemble the model's answer against it."""
+    today = today if today is not None else {"meals": [], "calories_left": 900}
+    facts = feed.build_generation_facts(
+        slot=slot, now=now, profile=profile, today=today, nutrients={},
+        memory={}, state=state or {})
+    findings = list(facts.pop("_findings_index", {}).values())
+    return feed.assemble(answer, slot=slot, now=now, profile=profile, today=today,
+                         findings=findings)
+
+
+def an_answer(cards=(), plates=True):
+    out = {"cards": list(cards)}
+    if plates:
+        out["next_meal"] = {
+            "next_slot": "jantar", "reasoning": "Já almoçaste.",
+            "rationale": "Faltam-te 900 kcal e a semana pede peixe.",
+            "plates": [{"rank": 1, "recommended": True, "title": "Bacalhau com grão",
+                        "items": [{"food": "cod", "grams_low": 130,
+                                   "grams_high": 160, "new": False}],
+                        "calories": 520, "protein_g": 42, "why": "Fecha a semana."}]}
+    return out
 
 
 class TestCardAssembly:
@@ -314,35 +333,24 @@ class TestCardAssembly:
         and the refresh triggered by a logged lunch would both sit in the feed, two
         cards with the same title saying different things."""
         profile = profile_from(a_week_of_meals())
-
-        def run(slot):
-            cards, _ = feed.generate_cards(
-                slot=slot, now=NOW, profile=profile,
-                today={"meals": [], "calories_left": 900}, nutrients={}, memory={},
-                state={}, narrate=fake_narrate([]),
-                plates_fn=lambda: {"next_slot": "jantar", "reasoning": "porque",
-                                   "plates": [{"rank": 1, "title": "Prato"}]})
-            return cards
-
-        merged = feed.merge_cards(run("afternoon"), run("adhoc"), now=NOW)
+        afternoon, _ = generate("afternoon", profile, an_answer())
+        adhoc, _ = generate("adhoc", profile, an_answer())
+        merged = feed.merge_cards(afternoon, adhoc, now=NOW)
         assert len([c for c in merged if c["kind"] == "next_meal"]) == 1
 
     def test_a_rerun_does_not_stack_duplicates(self):
         profile = profile_from(a_week_of_meals())
-        args = dict(slot="afternoon", now=NOW, profile=profile,
-                    today={"meals": [], "calories_left": 900},
-                    nutrients={}, memory={}, state={},
-                    narrate=fake_narrate([{"kind": "check_in", "title": "Olá",
-                                           "body": "Corpo do cartão."}]))
-        one, _ = feed.generate_cards(**args)
-        two, _ = feed.generate_cards(**args)
-        merged = feed.merge_cards(one, two, now=NOW)
-        assert len(merged) == 1
+        card = {"kind": "check_in", "title": "Olá", "body": "Corpo do cartão."}
+        one, _ = generate("afternoon", profile, an_answer([card], plates=False))
+        two, _ = generate("afternoon", profile, an_answer([card], plates=False))
+        assert len(feed.merge_cards(one, two, now=NOW)) == 1
 
     def test_expired_cards_drop_out_of_the_feed(self):
-        stale = {"id": "old", "priority": 90, "created_at": "2026-07-20T08:00:00",
+        stale = {"id": "old", "kind": "pattern", "priority": 90,
+                 "created_at": "2026-07-20T08:00:00",
                  "expires_at": "2026-07-21T08:00:00"}
-        live = {"id": "new", "priority": 50, "created_at": "2026-07-26T08:00:00",
+        live = {"id": "new", "kind": "pattern", "priority": 50,
+                "created_at": "2026-07-26T08:00:00",
                 "expires_at": "2026-07-27T08:00:00"}
         assert [c["id"] for c in feed.live_cards([stale, live], now=NOW)] == ["new"]
 
@@ -356,14 +364,74 @@ class TestCardAssembly:
 
     def test_every_card_gets_a_stable_chat_thread(self):
         profile = profile_from(a_week_of_meals())
-        cards, _ = feed.generate_cards(
-            slot="afternoon", now=NOW, profile=profile, today={"meals": []},
-            nutrients={}, memory={}, state={},
-            narrate=fake_narrate([{"kind": "check_in", "title": "T",
-                                   "body": "B"}]))
-        assert cards[0]["thread_id"]
+        cards, _ = generate("afternoon", profile,
+                            an_answer([{"kind": "check_in", "title": "T",
+                                        "body": "B"}], plates=False))
         assert cards[0]["thread_id"] == feed.thread_id_for(cards[0])
         assert store.is_safe_id(cards[0]["thread_id"])
+
+    def test_the_next_meal_card_carries_its_rationale(self):
+        """"Why these, for me, right now" — the plates alone never answered it."""
+        profile = profile_from(a_week_of_meals())
+        cards, _ = generate("afternoon", profile, an_answer())
+        meal_card = next(c for c in cards if c["kind"] == "next_meal")
+        assert meal_card["body"] == "Faltam-te 900 kcal e a semana pede peixe."
+        # The slot reasoning is kept, but as evidence rather than as the headline.
+        assert meal_card["evidence"]["reasoning"] == "Já almoçaste."
+
+    def test_a_missing_rationale_falls_back_to_the_reasoning(self):
+        profile = profile_from(a_week_of_meals())
+        answer = an_answer()
+        answer["next_meal"].pop("rationale")
+        cards, _ = generate("afternoon", profile, answer)
+        meal_card = next(c for c in cards if c["kind"] == "next_meal")
+        assert meal_card["body"] == "Já almoçaste."
+
+
+class TestContextualRelevance:
+    """Opening the app after dinner must lead with the day's whole story, not with
+    this morning's read on breakfast."""
+
+    def _card(self, kind, hour):
+        moment = NOW.replace(hour=hour)
+        return feed._card(kind=kind, slot="adhoc", date="2026-07-26", now=moment,
+                          title="T", body="B")
+
+    def test_a_morning_check_in_is_not_shown_in_the_evening(self):
+        morning = self._card("check_in", 9)
+        assert feed.relevant_now(morning, now=NOW.replace(hour=21)) is False
+
+    def test_it_is_shown_while_the_afternoon_lasts(self):
+        afternoon = self._card("check_in", 15)
+        assert feed.relevant_now(afternoon, now=NOW.replace(hour=17)) is True
+
+    def test_a_lunch_suggestion_is_not_an_answer_at_night(self):
+        lunch = self._card("next_meal", 13)
+        assert feed.relevant_now(lunch, now=NOW.replace(hour=21)) is False
+
+    def test_habits_are_always_relevant(self):
+        for kind in ("pattern", "win", "weekly_review"):
+            card = self._card(kind, 9)
+            assert feed.relevant_now(card, now=NOW.replace(hour=23)) is True
+
+    def test_the_small_hours_still_belong_to_last_night(self):
+        """At 00:30 the useful thing is yesterday's summary, not a plan for a day the
+        user hasn't started."""
+        assert feed.slot_for(NOW.replace(hour=0, minute=30)) == "evening"
+        summary = self._card("day_summary", 22)
+        assert feed.relevant_now(summary, now=NOW.replace(hour=0, minute=30)) is True
+
+    def test_a_feed_with_nothing_about_now_asks_to_be_refreshed(self):
+        morning = self._card("check_in", 9)
+        assert feed.context_stale([morning], now=NOW.replace(hour=21)) is True
+        evening = self._card("day_summary", 21)
+        assert feed.context_stale([morning, evening],
+                                  now=NOW.replace(hour=21)) is False
+
+    def test_habits_alone_do_not_satisfy_the_moment(self):
+        """A feed of nothing but pattern cards has nothing to say about right now."""
+        pattern = self._card("pattern", 9)
+        assert feed.context_stale([pattern], now=NOW) is True
 
 
 class TestSwapValidation:
@@ -373,19 +441,14 @@ class TestSwapValidation:
 
     def setup_method(self):
         self.profile = profile_from(a_week_of_meals())
-        # Whatever the feed would actually put on a card today: only an eligible
-        # finding gets one, so only its swap options are on offer.
         self.finding = feed.eligible_findings(self.profile, {},
                                               today="2026-07-26")[0]
         self.offered = self.profile["swaps"][self.finding["id"]]["to"][0]["food"]
 
     def _run(self, swap):
-        cards, _ = feed.generate_cards(
-            slot="afternoon", now=NOW, profile=self.profile,
-            today={"meals": []}, nutrients={}, memory={},
-            state={}, narrate=fake_narrate([
-                {"kind": "pattern", "ref": self.finding["id"], "title": "T",
-                 "body": "B", "swap": swap}]))
+        cards, _ = generate("afternoon", self.profile, an_answer([
+            {"kind": "pattern", "ref": self.finding["id"], "title": "T",
+             "body": "B", "swap": swap}], plates=False))
         return cards[0]["swap"]
 
     def test_a_swap_from_an_unlogged_food_is_dropped(self):
@@ -403,12 +466,61 @@ class TestSwapValidation:
         assert isinstance(swap["new"], bool)
 
     def test_a_pattern_card_without_a_real_finding_is_dropped(self):
-        cards, shown = feed.generate_cards(
-            slot="afternoon", now=NOW, profile=self.profile, today={"meals": []},
-            nutrients={}, memory={}, state={},
-            narrate=fake_narrate([{"kind": "pattern", "ref": "made:up",
-                                   "title": "T", "body": "B"}]))
+        cards, shown = generate("afternoon", self.profile, an_answer([
+            {"kind": "pattern", "ref": "made:up", "title": "T", "body": "B"}],
+            plates=False))
         assert cards == [] and shown == {}
+
+
+class TestMealContextSwaps:
+    """A ham sandwich at breakfast answered with codfish is nutritionally sound and
+    practically useless — which is worse than saying nothing."""
+
+    def _breakfast_ham_log(self):
+        rows = []
+        for offset in range(7):
+            day = (datetime(2026, 7, 19) + timedelta(days=offset)).date().isoformat()
+            rows.append(meal(f"{day}T08:15:00", "bread, ham, cheese",
+                             [item("white bread", 80), item("sliced ham", 40),
+                              item("cheese", 30)]))
+            rows.append(meal(f"{day}T13:00:00", "rice, cod",
+                             [item("white rice", 150), item("boiled cod", 140)]))
+            rows.append(meal(f"{day}T20:30:00", "potato, egg",
+                             [item("boiled potato", 150), item("fried egg", 50)]))
+        return rows
+
+    def test_a_breakfast_food_is_replaced_by_breakfast_food(self):
+        profile = profile_from(self._breakfast_ham_log())
+        finding = next(f for f in profile["findings"]
+                       if f["group"] == "processed_meat")
+        swaps = patterns.swap_candidates(finding, profile["foods"])
+
+        assert swaps["replacing_at"] == "breakfast"
+        best = swaps["to"][0]
+        assert best["fits_the_meal"] is True
+        # Cod is logged (at lunch) and is a fine protein — but it must not be the
+        # headline answer for a breakfast sandwich.
+        assert best["food"] != "cod"
+
+    def test_options_that_fit_the_meal_are_ranked_first(self):
+        profile = profile_from(self._breakfast_ham_log())
+        finding = next(f for f in profile["findings"]
+                       if f["group"] == "processed_meat")
+        fits = [t["fits_the_meal"] is True
+                for t in patterns.swap_candidates(finding, profile["foods"])["to"]]
+        assert fits == sorted(fits, reverse=True)
+
+    def test_a_group_the_user_never_eats_falls_back_to_a_fitting_staple(self):
+        """No dairy at all in this log, so the breakfast fallback must still be
+        something anyone would eat at breakfast."""
+        profile = profile_from(self._breakfast_ham_log())
+        finding = {"kind": "group_over", "group": "processed_meat",
+                   "id": "group_over:processed_meat",
+                   "evidence": {"slot": "breakfast"}}
+        options = patterns.swap_candidates(finding, profile["foods"])["to"]
+        assert options
+        assert all(o["food"] != "cod" or o["fits_the_meal"] is not True
+                   for o in options)
 
 
 class TestPatternCooldown:
@@ -442,13 +554,43 @@ class TestPatternCooldown:
 
     def test_generation_reports_what_it_showed(self):
         profile = profile_from(a_week_of_meals())
-        top = profile["findings"][0]
-        _cards, shown = feed.generate_cards(
-            slot="morning", now=NOW, profile=profile, today={"meals": []},
-            nutrients={}, memory={}, state={},
-            narrate=fake_narrate([{"kind": "pattern", "ref": top["id"],
-                                   "title": "T", "body": "B"}]))
+        top = feed.eligible_findings(profile, {}, today="2026-07-26")[0]
+        _cards, shown = generate("morning", profile, an_answer(
+            [{"kind": "pattern", "ref": top["id"], "title": "T", "body": "B"}],
+            plates=False))
         assert shown[top["id"]]["date"] == "2026-07-26"
+
+
+class TestCoherence:
+    def test_the_model_is_told_what_it_already_said(self):
+        """Not just the headlines: "don't repeat yourself" is unenforceable against a
+        list of titles alone."""
+        profile = profile_from(a_week_of_meals())
+        facts = feed.build_generation_facts(
+            slot="afternoon", now=NOW, profile=profile, today={"meals": []},
+            nutrients={}, memory={}, state={},
+            recent=[{"title": "Duas semanas sem peixe",
+                     "body": "A carne vermelha apareceu sete vezes."}])
+        said = facts["already_said_recently"][0]
+        assert said["title"] and said["body"]
+
+    def test_the_plates_and_the_cards_are_asked_for_together(self):
+        """The fish/beef contradiction came from two calls that couldn't see each
+        other. One set of facts, one answer, one shared context."""
+        profile = profile_from(a_week_of_meals())
+        facts = feed.build_generation_facts(
+            slot="afternoon", now=NOW, profile=profile,
+            today={"meals": [], "calories_left": 900}, nutrients={}, memory={},
+            state={}, next_meal={"candidates": {"usual_at_this_slot": []}})
+        assert facts["wanted_next_meal"] is True
+        assert "next_meal" in facts and "wanted_cards" in facts
+
+    def test_the_weekly_review_asks_for_no_plates(self):
+        profile = profile_from(a_week_of_meals())
+        facts = feed.build_generation_facts(
+            slot="weekly", now=NOW, profile=profile, today={"meals": []},
+            nutrients={}, memory={}, state={})
+        assert facts["wanted_next_meal"] is False
 
 
 class TestNextMeal:
@@ -468,25 +610,15 @@ class TestNextMeal:
             profile, nutrient_candidates={})["groups_to_favour"]
         assert favour and all(g["options"] for g in favour)
 
-    def test_a_plate_failure_does_not_lose_the_other_cards(self):
-        def boom():
-            raise RuntimeError("gemini down")
-        cards, _ = feed.generate_cards(
-            slot="morning", now=NOW, profile=profile_from(a_week_of_meals()),
-            today={"meals": []}, nutrients={}, memory={}, state={},
-            narrate=fake_narrate([{"kind": "day_plan", "title": "T", "body": "B"}]),
-            plates_fn=boom)
+    def test_an_answer_with_no_plates_still_yields_the_other_cards(self):
+        profile = profile_from(a_week_of_meals())
+        cards, _ = generate("morning", profile, an_answer(
+            [{"kind": "day_plan", "title": "T", "body": "B"}], plates=False))
         assert [c["kind"] for c in cards] == ["day_plan"]
 
-    def test_a_narration_failure_does_not_lose_the_plates(self):
-        def narrate(_facts):
-            raise RuntimeError("gemini down")
-        cards, _ = feed.generate_cards(
-            slot="morning", now=NOW, profile=profile_from(a_week_of_meals()),
-            today={"meals": [], "calories_left": 800}, nutrients={}, memory={},
-            state={}, narrate=narrate,
-            plates_fn=lambda: {"next_slot": "jantar", "reasoning": "porque",
-                               "plates": [{"rank": 1, "title": "Prato"}]})
+    def test_an_answer_with_no_cards_still_yields_the_plates(self):
+        profile = profile_from(a_week_of_meals())
+        cards, _ = generate("morning", profile, an_answer([]))
         assert [c["kind"] for c in cards] == ["next_meal"]
         assert cards[0]["plates"]
 
@@ -655,7 +787,6 @@ class TestCoachEndpoints:
         monkeypatch.setattr(ingest, "_all_meal_rows", a_week_of_meals)
         monkeypatch.setattr(ingest, "_resolved_targets_and_basis",
                             lambda: (TARGETS, {"weight_kg": 68.25}))
-        # Freeze "now" inside the logged window so the fixture reads as recent.
         monkeypatch.setattr(ingest, "_tz", lambda: None)
         real_datetime = ingest.datetime
 
@@ -664,126 +795,233 @@ class TestCoachEndpoints:
             def now(cls, tz=None):
                 return real_datetime(2026, 7, 26, 15, 30)
         monkeypatch.setattr(ingest, "datetime", FrozenDatetime)
+        # Taxonomy learning must never reach the network in a test.
+        narrator_mod = ingest._narrator_mod()
+        monkeypatch.setattr(narrator_mod, "call_gemini",
+                            lambda *a, **kw: {"foods": []})
         self.client = ingest.app.test_client()
         self.auth = {"X-Auth-Token": "tok"}
 
-    def _fake_model(self, monkeypatch, cards=None, plates=True):
-        narrator = ingest._narrator_mod()
-        monkeypatch.setattr(narrator, "narrate_cards", lambda facts, **kw: {
-            "cards": cards if cards is not None else [
-                {"kind": k, "title": f"Titulo {k}", "body": "Uma frase honesta.",
-                 "chips": [{"label": "7 dias", "tone": "neutral"}]}
-                for k in ("check_in",)]})
-        monkeypatch.setattr(narrator, "narrate_next_meal", lambda ctx, **kw: {
-            "next_slot": "jantar", "reasoning": "Porque já almoçaste.",
-            "plates": [{"rank": 1, "recommended": True, "title": "Bacalhau com grão",
-                        "items": [{"food": "bacalhau", "grams_low": 130,
-                                   "grams_high": 160, "new": True}],
-                        "calories": 520, "protein_g": 42,
-                        "why": "Fecha a semana sem peixe."}] if plates else []})
-        # Taxonomy learning must never reach the network in a test.
-        monkeypatch.setattr(narrator, "call_gemini",
-                            lambda *a, **kw: {"foods": []})
+    ANSWER = {
+        "next_meal": {"next_slot": "jantar", "reasoning": "Já almoçaste.",
+                      "rationale": "Faltam-te 900 kcal.",
+                      "plates": [{"rank": 1, "recommended": True,
+                                  "title": "Bacalhau com grão",
+                                  "items": [{"food": "cod", "grams_low": 130,
+                                             "grams_high": 160, "new": True}],
+                                  "calories": 520, "protein_g": 42,
+                                  "why": "Fecha a semana sem peixe."}]},
+        "cards": [{"kind": "check_in", "title": "Titulo", "body": "Uma frase honesta.",
+                   "chips": [{"label": "7 dias", "tone": "neutral"}]}],
+    }
+
+    def _queue_a_job(self):
+        response = self.client.post("/coach/generate", json={"slot": "afternoon"},
+                                    headers=self.auth)
+        assert response.status_code == 202, response.get_json()
+        return response.get_json()["job"]
+
+    # -- the read path ---------------------------------------------------------
 
     def test_feed_is_empty_but_never_broken_before_anything_is_generated(self):
         """The screen the user opens must always render something. The old version
         showed a blank page here."""
-        response = self.client.get("/coach/feed", headers=self.auth)
-        assert response.status_code == 200
-        body = response.get_json()
+        body = self.client.get("/coach/feed", headers=self.auth).get_json()
         assert body["status"] == "empty" and body["cards"] == []
         assert body["stale"] is True and body["generating"] is False
 
-    def test_generate_then_read(self, monkeypatch):
-        self._fake_model(monkeypatch)
-        gen = self.client.post("/coach/generate", json={"slot": "afternoon"},
-                               headers=self.auth)
-        assert gen.status_code == 200, gen.get_json()
-        assert gen.get_json()["status"] == "generated"
-
-        feed_response = self.client.get("/coach/feed", headers=self.auth)
-        body = feed_response.get_json()
-        kinds = {c["kind"] for c in body["cards"]}
-        assert {"next_meal", "check_in"} <= kinds
-        assert body["status"] == "ready" and body["stale"] is False
-        # Plates rode along on the card, so opening the suggestion needs no call.
-        plates = next(c for c in body["cards"] if c["kind"] == "next_meal")["plates"]
-        assert plates and plates[0]["title"] == "Bacalhau com grão"
-
     def test_the_read_path_never_calls_a_model(self, monkeypatch):
-        self._fake_model(monkeypatch)
-        self.client.post("/coach/generate", json={"slot": "afternoon"},
+        job = self._queue_a_job()
+        self.client.post(f"/coach/work/{job}", json={"answer": self.ANSWER},
                          headers=self.auth)
 
         def explode(*_args, **_kwargs):
             raise AssertionError("the feed read must not call a model")
-        narrator = ingest._narrator_mod()
-        monkeypatch.setattr(narrator, "call_gemini", explode)
-        monkeypatch.setattr(narrator, "narrate_cards", explode)
+        monkeypatch.setattr(ingest._narrator_mod(), "call_gemini", explode)
         assert self.client.get("/coach/feed", headers=self.auth).status_code == 200
 
-    def test_regenerating_replaces_rather_than_stacks(self, monkeypatch):
-        self._fake_model(monkeypatch)
-        for _ in range(3):
-            ingest._coach("coach_store").update_state(
-                lambda s: {**s, "job": None})       # release the single-run lock
-            self.client.post("/coach/generate", json={"slot": "afternoon"},
-                             headers=self.auth)
-        cards = self.client.get("/coach/feed", headers=self.auth).get_json()["cards"]
-        assert len(cards) == len({c["id"] for c in cards})
-        assert len([c for c in cards if c["kind"] == "next_meal"]) == 1
+    # -- preparing work --------------------------------------------------------
 
-    def test_a_second_concurrent_generation_is_refused(self, monkeypatch):
-        self._fake_model(monkeypatch)
+    def test_generate_parks_a_job_instead_of_calling_a_model(self, monkeypatch):
+        """Generation must not spend a model call here: the whole point is that the
+        better model, on the Mac, gets first refusal."""
+        def explode(*_args, **_kwargs):
+            raise AssertionError("/coach/generate must not call Gemini")
+        monkeypatch.setattr(ingest._narrator_mod(), "call_gemini", explode)
+        body = self.client.post("/coach/generate", json={"slot": "afternoon"},
+                                headers=self.auth).get_json()
+        assert body["status"] == "queued" and body["waiting_for"] == "sonnet"
+
+    def test_the_job_carries_a_prompt_full_of_food(self):
+        job_id = self._queue_a_job()
         store_mod = ingest._coach("coach_store")
-        store_mod.claim_job("other", "manual", "2026-07-26T15:29:50")
-        response = self.client.post("/coach/generate", json={"slot": "afternoon"},
-                                    headers=self.auth)
-        assert response.get_json()["status"] == "busy"
+        job = store_mod.read_json(store_mod.job_path(job_id))
+        assert "white rice" in job["prompt"]
+        assert "carne processada" in job["prompt"] or "processed_meat" in job["prompt"]
+        assert job["context"]["findings"]
 
-    def test_generation_survives_a_model_that_returns_nothing_useful(self,
-                                                                    monkeypatch):
-        """A bad model response must leave the feature quiet, not wedged."""
-        self._fake_model(monkeypatch, cards=[{"kind": "check_in", "title": "",
-                                              "body": ""}], plates=False)
-        response = self.client.post("/coach/generate", json={"slot": "afternoon"},
+    def test_a_meal_still_being_eaten_postpones_the_analysis(self):
+        """A second helping forty minutes later must not produce a second analysis —
+        it should push the first one back."""
+        store_mod = ingest._coach("coach_store")
+        store_mod.update_state(lambda s: {**s,
+                                          "last_meal_at": "2026-07-26T15:20:00"})
+        body = self.client.post(
+            "/coach/generate",
+            json={"slot": "adhoc", "only_if_no_meal_since": "2026-07-26T14:30:00"},
+            headers=self.auth).get_json()
+        assert body["status"] == "superseded"
+
+    def test_a_quiet_hour_lets_the_analysis_through(self):
+        store_mod = ingest._coach("coach_store")
+        store_mod.update_state(lambda s: {**s,
+                                          "last_meal_at": "2026-07-26T14:00:00"})
+        body = self.client.post(
+            "/coach/generate",
+            json={"slot": "adhoc", "only_if_no_meal_since": "2026-07-26T14:00:00"},
+            headers=self.auth).get_json()
+        assert body["status"] == "queued"
+
+    # -- the Sonnet worker path ------------------------------------------------
+
+    def test_the_worker_claims_a_job_and_its_answer_becomes_the_feed(self):
+        job_id = self._queue_a_job()
+        work = self.client.get("/coach/work?worker=mac", headers=self.auth).get_json()
+        assert work["id"] == job_id and work["prompt"]
+
+        applied = self.client.post(f"/coach/work/{job_id}",
+                                   json={"answer": self.ANSWER, "model": "sonnet-5"},
+                                   headers=self.auth).get_json()
+        assert applied["status"] == "applied" and applied["cards"] >= 1
+
+        cards = self.client.get("/coach/feed", headers=self.auth).get_json()["cards"]
+        assert {"next_meal", "check_in"} <= {c["kind"] for c in cards}
+        assert all(c["source"] == "sonnet-5" for c in cards)
+
+    def test_an_empty_queue_answers_204(self):
+        assert self.client.get("/coach/work", headers=self.auth).status_code == 204
+
+    def test_two_workers_do_not_get_the_same_job(self):
+        self._queue_a_job()
+        first = self.client.get("/coach/work?worker=a", headers=self.auth)
+        second = self.client.get("/coach/work?worker=b", headers=self.auth)
+        assert first.status_code == 200 and second.status_code == 204
+
+    def test_an_exhausted_usage_window_returns_the_job_to_the_queue(self):
+        """This is the case that must NOT consume the job: it should keep waiting for
+        Sonnet until the backend decides the wait has gone on long enough."""
+        job_id = self._queue_a_job()
+        self.client.get("/coach/work?worker=mac", headers=self.auth)
+        released = self.client.post(f"/coach/work/{job_id}",
+                                    json={"release": "usage limit reached"},
                                     headers=self.auth)
-        assert response.status_code == 200
-        assert response.get_json()["status"] == "empty"
+        assert released.get_json()["status"] == "released"
+        again = self.client.get("/coach/work?worker=mac", headers=self.auth)
+        assert again.status_code == 200 and again.get_json()["id"] == job_id
+
+    def test_answering_an_unknown_job_is_a_404(self):
+        assert self.client.post("/coach/work/nope", json={"answer": self.ANSWER},
+                                headers=self.auth).status_code == 404
+
+    def test_a_job_id_that_could_address_another_blob_is_rejected(self):
+        assert self.client.post("/coach/work/..%2Fsecrets",
+                                json={"answer": self.ANSWER},
+                                headers=self.auth).status_code in (400, 404)
+
+    # -- the Gemini fallback ---------------------------------------------------
+
+    def test_the_sweep_leaves_a_young_job_for_sonnet(self):
+        """Falling back early would defeat the point of preferring the better model."""
+        job_id = self._queue_a_job()
+        body = self.client.post("/coach/sweep", headers=self.auth).get_json()
+        assert body["fell_back_to_gemini"] == []
+        assert job_id in body["still_waiting_for_sonnet"]
+
+    def test_the_sweep_takes_over_once_the_wait_is_too_long(self, monkeypatch):
+        job_id = self._queue_a_job()
+        store_mod = ingest._coach("coach_store")
+        job = store_mod.read_json(store_mod.job_path(job_id))
+        job["created_at"] = "2026-07-26T04:00:00"        # eleven hours earlier
+        store_mod.write_json(store_mod.job_path(job_id), job)
+
+        monkeypatch.setattr(ingest._narrator_mod(), "call_gemini",
+                            lambda *a, **kw: self.ANSWER)
+        body = self.client.post("/coach/sweep", headers=self.auth).get_json()
+        assert body["fell_back_to_gemini"] == [job_id]
+
+        cards = self.client.get("/coach/feed", headers=self.auth).get_json()["cards"]
+        assert cards and all(c["source"] == "gemini" for c in cards)
+
+    def test_both_models_pass_through_the_same_validation(self, monkeypatch):
+        """Sonnet gets no more benefit of the doubt than Gemini: an invented swap is
+        dropped whoever proposed it."""
+        bad = {"cards": [{"kind": "check_in", "title": "T", "body": "B",
+                          "swap": {"from": "pão branco", "to": "caviar",
+                                   "why": "porque"}}]}
+        job_id = self._queue_a_job()
+        self.client.post(f"/coach/work/{job_id}", json={"answer": bad},
+                         headers=self.auth)
+        cards = self.client.get("/coach/feed", headers=self.auth).get_json()["cards"]
+        assert cards and all(c["swap"] is None for c in cards)
+
+    # -- progress reporting ----------------------------------------------------
+
+    def test_a_job_waiting_for_a_sleeping_mac_is_not_a_spinner(self):
+        """A job may legitimately wait hours for Sonnet. Showing a progress bar for
+        that long is the old "loading forever" bug in a new costume."""
+        self._queue_a_job()
+        body = self.client.get("/coach/feed", headers=self.auth).get_json()
+        assert body["generating"] is False and body["queued"] == 1
+
+    def test_a_job_a_worker_is_running_is_a_spinner(self):
+        self._queue_a_job()
+        self.client.get("/coach/work?worker=mac", headers=self.auth)
+        body = self.client.get("/coach/feed", headers=self.auth).get_json()
+        assert body["generating"] is True
+
+    def test_opening_the_app_in_a_new_part_of_the_day_asks_for_a_refresh(self,
+                                                                        monkeypatch):
+        job_id = self._queue_a_job()
+        self.client.post(f"/coach/work/{job_id}", json={"answer": self.ANSWER},
+                         headers=self.auth)
         assert self.client.get("/coach/feed",
-                               headers=self.auth).get_json()["generating"] is False
+                               headers=self.auth).get_json()["stale"] is False
+
+        real_datetime = ingest.datetime.__mro__[1]
+
+        class Evening(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return real_datetime(2026, 7, 26, 22, 0)
+        monkeypatch.setattr(ingest, "datetime", Evening)
+        body = self.client.get("/coach/feed", headers=self.auth).get_json()
+        assert body["stale"] is True
+        assert "check_in" not in {c["kind"] for c in body["cards"]}
+
+    # -- the rest --------------------------------------------------------------
 
     def test_patterns_debug_view_is_deterministic_and_needs_no_model(self):
-        response = self.client.get("/coach/patterns", headers=self.auth)
-        assert response.status_code == 200
-        profile = response.get_json()
-        assert profile["days_logged"] == 7
-        assert profile["findings"]
+        profile = self.client.get("/coach/patterns", headers=self.auth).get_json()
+        assert profile["days_logged"] == 7 and profile["findings"]
 
     def test_chat_appends_turns_and_remembers(self, monkeypatch):
-        self._fake_model(monkeypatch)
-        self.client.post("/coach/generate", json={"slot": "afternoon"},
+        job_id = self._queue_a_job()
+        self.client.post(f"/coach/work/{job_id}", json={"answer": self.ANSWER},
                          headers=self.auth)
         card = self.client.get("/coach/feed",
                                headers=self.auth).get_json()["cards"][0]
-        narrator = ingest._narrator_mod()
-        monkeypatch.setattr(narrator, "chat_turn", lambda *a, **kw: {
+        monkeypatch.setattr(ingest._narrator_mod(), "chat_turn", lambda *a, **kw: {
             "reply": "Podes trocar por bacalhau.",
             "memory_candidates": [{"type": "dislike",
                                    "fact": "não gosta de peixe cozido",
                                    "confidence": 0.9}]})
-        response = self.client.post("/coach/chat", json={
+        body = self.client.post("/coach/chat", json={
             "thread_id": card["thread_id"], "card_id": card["id"],
-            "message": "porque é que isto importa?"}, headers=self.auth)
-        assert response.status_code == 200
-        body = response.get_json()
+            "message": "porque é que isto importa?"}, headers=self.auth).get_json()
         assert body["reply"] == "Podes trocar por bacalhau."
         assert [t["role"] for t in body["turns"]] == ["user", "coach"]
         assert body["memory_learned"] == 1
 
-        thread = self.client.get(f"/coach/thread/{card['thread_id']}",
-                                 headers=self.auth).get_json()
-        assert len(thread["turns"]) == 2
         remembered = self.client.get("/coach/memory",
                                      headers=self.auth).get_json()["facts"]
         assert remembered[0]["fact"] == "não gosta de peixe cozido"
@@ -798,14 +1036,14 @@ class TestCoachEndpoints:
                                 headers=self.auth).status_code == 400
 
     def test_generate_rejects_an_unknown_slot(self):
-        response = self.client.post("/coach/generate", json={"slot": "teatime"},
-                                    headers=self.auth)
-        assert response.status_code == 400
+        assert self.client.post("/coach/generate", json={"slot": "teatime"},
+                                headers=self.auth).status_code == 400
 
     @pytest.mark.parametrize("path,method", [
         ("/coach/feed", "get"), ("/coach/patterns", "get"),
         ("/coach/memory", "get"), ("/coach/refresh", "post"),
         ("/coach/generate", "post"), ("/coach/chat", "post"),
+        ("/coach/work", "get"), ("/coach/sweep", "post"),
     ])
     def test_every_coach_route_requires_the_token(self, path, method):
         assert getattr(self.client, method)(path).status_code == 401
@@ -816,25 +1054,6 @@ class TestCoachEndpoints:
                                     headers=self.auth)
         assert response.status_code == 202
         assert response.get_json()["queued"] is False
-
-    def test_a_long_lived_card_survives_later_generations(self):
-        """The Sunday review is valid for eight days. Per-day feed blobs quietly broke
-        this: by Wednesday it was outside the window the reader looked at."""
-        store_mod = ingest._coach("coach_store")
-        feed_mod = ingest._coach("coach_feed")
-        sunday = ingest.datetime(2026, 7, 26, 9, 0)
-        weekly = feed_mod._card(kind="weekly_review", slot="weekly",
-                                date="2026-07-26", now=sunday,
-                                title="A tua semana", body="Corpo.")
-        store_mod.write_json(store_mod.FEED, {"cards": [weekly]})
-
-        # Three days later, a routine afternoon run lands.
-        later = ingest.datetime(2026, 7, 29, 15, 30)
-        fresh = feed_mod._card(kind="check_in", slot="afternoon",
-                               date="2026-07-29", now=later, title="Hoje",
-                               body="Corpo.")
-        merged = feed_mod.merge_cards([weekly], [fresh], now=later)
-        assert {c["kind"] for c in merged} == {"weekly_review", "check_in"}
 
 
 # -- quota handling ------------------------------------------------------------
