@@ -471,9 +471,13 @@ def assemble_next_meal(context: Dict[str, Any],
 # beef. One call sees the whole feed at once, so the day analysis can reference the
 # suggestion it just made.
 
-_FEED_RULES = """És o nutricionista pessoal desta pessoa, a escrever tudo o que ela vê
-quando abre a app. Português de Portugal, tratamento por "tu". O objetivo dela é
-recomposição corporal: perder gordura mantendo músculo, com proteína alta.
+_FEED_RULES = """És o treinador pessoal desta pessoa — nutrição em primeiro lugar, e
+também o resto do que ela mede — a escrever tudo o que ela vê quando abre a app.
+Português de Portugal, tratamento por "tu".
+
+UM CARTÃO, UMA IDEIA. Cada cartão diz UMA coisa e propõe UMA ação. Três observações
+mornas valem menos do que uma boa. Se não tiveres nada de substancial para um tipo de
+cartão, não o escrevas — o silêncio é uma resposta legítima e a app sabe mostrá-lo.
 
 A REGRA CENTRAL — FALA DE COMIDA, NÃO DE NUTRIENTES.
 O que interessa é o que a pessoa realmente comeu: alimentos concretos, refeições,
@@ -560,7 +564,147 @@ PARTE 2 — OS CARTÕES (`cards`), um por cada tipo pedido em `wanted_cards`:
 - `weekly_review` (domingo): a semana em alimentos — o padrão mais importante e uma troca.
 - `win`: algo que está genuinamente a correr bem, dito em alimentos.
 - `pattern`: UMA observação sobre um padrão. Escolhe um dos `findings` e põe o `id` dele
-  em `ref`; o texto tem de dizer o mesmo que o `fact` desse finding, em linguagem humana."""
+  em `ref`; o texto tem de dizer o mesmo que o `fact` desse finding, em linguagem humana.
+- `link`: UMA ligação medida entre duas áreas da vida da pessoa. Só existe quando há um
+  finding com `domain: "link"`; põe o `id` dele em `ref`."""
+
+
+# -- the specialist frames -----------------------------------------------------
+#
+# The problem this solves: one prompt carrying every domain writes the AVERAGE of its
+# payload. Leading with a nutrient table produced only nutrient advice (which is why
+# food patterns lead the facts today), and simply adding sleep and training numbers
+# to that same prompt would dilute all of them equally — a coach that says three
+# shallow things instead of one deep one.
+#
+# So the prompt is ASSEMBLED, not fixed: only the frames for the domains that
+# actually produced a finding this run are included. A sleep card is written by a
+# prompt carrying sleep science and sleep-specific rules; a day with nothing but food
+# findings gets exactly the prompt the coach had before this existed. One model call
+# either way — specialisation is which frame is selected, not how many models run.
+#
+# Each frame says what depth looks like in that domain and, just as importantly,
+# what the cheap generic version sounds like so it can be avoided by name.
+
+_FRAME_NUTRITION = """ALIMENTAÇÃO — o que torna um conselho bom aqui.
+Fala de comida concreta e de escolhas, nunca de nutrientes em abstrato. O detalhe está
+em `today.meals`: alimentos, gramas, macros e micronutrientes de cada refeição. Avalia
+escolhas ("a aveia com manteiga de amendoim segurou-te a manhã"), o equilíbrio de cada
+refeição, e só depois o passo seguinte.
+GENÉRICO A EVITAR: "come mais fibra", "aumenta a proteína ao jantar"."""
+
+_FRAME_SLEEP = """SONO E RECUPERAÇÃO — o que torna um conselho bom aqui.
+Lê sempre contra a linha de base DESTA pessoa (`evidence.personal_average` e
+`evidence.line`), nunca contra um número de revista: 7h é muito para uns e pouco para
+outros, e 73 ms de HRV não querem dizer nada sem o histórico dela.
+O que conta mais, por esta ordem: a REGULARIDADE da hora de deitar (mexe mais no sono
+profundo do que o total), a eficiência (tempo na cama que não é sono), e só depois a
+duração. Uma noite má é terça-feira; o que interessa é o padrão que `evidence` mostra.
+Liga sempre ao que a pessoa controla — a hora do jantar, o treino, a cafeína, a hora a
+que se deita. É aí que a alimentação e o sono se tocam, e é esse o conselho útil.
+GENÉRICO A EVITAR: "tenta dormir 8 horas", "melhora a higiene do sono".
+NUNCA diagnostiques. Frequência cardíaca em repouso, HRV, SpO2 e temperatura da pele
+descrevem padrões de recuperação — não são sinais clínicos e não se fala deles como
+tal. Se algo parecer persistente, o passo é falar com um médico, dito uma vez e sem
+alarme."""
+
+_FRAME_ACTIVITY = """ATIVIDADE E TREINO — o que torna um conselho bom aqui.
+O que importa para o objetivo dela é o TREINO DE FORÇA: é o que decide se o peso que
+sai é gordura ou músculo. Passos e minutos ativos são contexto, não o tema.
+Liga o treino à comida do dia: um dia de treino é o dia em que a proteína e os hidratos
+mais contam, e um dia de descanso não precisa das mesmas calorias.
+GENÉRICO A EVITAR: "faz mais exercício", "tenta dar 10 000 passos"."""
+
+_FRAME_BODY = """COMPOSIÇÃO CORPORAL — o que torna um conselho bom aqui.
+O peso sozinho não diz nada: 2 kg a menos é uma vitória ou um problema consoante o
+tecido que saiu. Fala sempre do par massa magra / massa gorda, que é o que
+`evidence` traz.
+Uma leitura isolada é ruído (a bioimpedância varia com a hidratação) — só a tendência
+de semanas conta, e a `evidence` já vem calculada assim. Não recalcules nada.
+Quando está a correr bem, DIZ-LHE. É o objetivo dela a acontecer.
+GENÉRICO A EVITAR: comentar a variação de um dia, ou falar de peso sem falar de músculo."""
+
+_FRAME_DIGESTION = """DIGESTÃO — o que torna um conselho bom aqui.
+É um tema banal e prático: trata-o com naturalidade, sem rodeios e sem drama. A alavanca
+é quase sempre a fibra, a água e a regularidade das refeições — coisas que já estão nos
+factos. Uma frase chega.
+NUNCA faças medicina disto."""
+
+_FRAME_LINK = """AS LIGAÇÕES (`domain: "link"`) — o cartão mais valioso que escreves.
+É uma relação MEDIDA nos dados desta pessoa, entre duas áreas da vida dela, que ela
+nunca conseguiria ver sozinha. `evidence` traz tudo: `cause`, `effect`, `effect_delta`
+(o efeito nas unidades reais), `n_days`, `lag_days` e o `mechanism` — a explicação
+fisiológica.
+Como se escreve:
+1. o facto, com o número real ("nas noites a seguir aos jantares mais tardios, menos
+   18 minutos de sono profundo");
+2. o porquê, a partir do `mechanism` — e SÓ a partir dele;
+3. uma coisa concreta para fazer.
+REGRAS DURAS:
+- Escreve sempre como ASSOCIAÇÃO, nunca como causa: "nos dias em que…", "quando…",
+  "isto anda a par de…". Nunca "isto causa", nunca "por causa disto".
+- Não inventes ligações. Só podes falar de uma ligação que esteja nos `findings` com
+  `domain: "link"`. Se não houver nenhuma, não escrevas nenhum cartão `link`.
+- Não expliques o mecanismo por tuas palavras se ele contradisser o `mechanism` dado.
+- Números vêm da `evidence` tal e qual. Nunca recalcules."""
+
+_DOMAIN_FRAMES = {
+    "nutrition": _FRAME_NUTRITION,
+    "sleep": _FRAME_SLEEP,
+    "activity": _FRAME_ACTIVITY,
+    "body": _FRAME_BODY,
+    "digestion": _FRAME_DIGESTION,
+    "link": _FRAME_LINK,
+}
+
+# Order matters: food stays first because it is the daily spine of the app and the
+# thing the user opens it for.
+_FRAME_ORDER = ("nutrition", "link", "sleep", "activity", "body", "digestion")
+
+
+def _frames_for(facts: Dict[str, Any]) -> str:
+    """The specialist sections this generation needs — the domains that actually
+    produced a finding, plus nutrition, which is always in play.
+
+    This is the whole depth-without-dilution mechanism: on a day whose findings are
+    all about food the prompt is exactly the one the coach had before, and on a day
+    when sleep is the story the model is handed sleep expertise instead of a longer
+    list of everything.
+    """
+    present = {"nutrition"}
+    for finding in facts.get("findings") or ():
+        if isinstance(finding, dict) and finding.get("domain"):
+            present.add(str(finding["domain"]))
+    return "\n\n".join(_DOMAIN_FRAMES[d] for d in _FRAME_ORDER if d in present)
+
+
+def _blind_spots(facts: Dict[str, Any]) -> str:
+    """Tell the model, in words, what this user does not measure.
+
+    Silence is not enough. A model given no sleep data still writes confident sleep
+    advice — it has read a million articles that do. Naming the gap is what makes a
+    nutrition-only user's coach genuinely a nutrition coach rather than a general
+    wellness one that happens to be short of numbers.
+    """
+    caps = facts.get("capabilities") or {}
+    missing = list(caps.get("blind_spots") or ())
+    if not missing:
+        return ""
+    labels = {"sleep": "sono e recuperação", "activity": "atividade e treino",
+              "body": "composição corporal (peso, massa gorda, massa magra)",
+              "digestion": "digestão", "nutrition": "alimentação"}
+    named = ", ".join(labels.get(d, d) for d in missing)
+    return (f"\n\nO QUE NÃO VÊS — esta pessoa não mede: {named}.\n"
+            f"Não tens dados nenhuns sobre isso. Não faças perguntas sobre isso, não "
+            f"assumas nada e não dês conselhos nessas áreas, nem de passagem. O teu "
+            f"trabalho aqui é inteiramente sobre o que ela regista.")
+
+
+def _goal_line(facts: Dict[str, Any]) -> str:
+    """The user's actual goal, which is a different axis from what they measure."""
+    caps = facts.get("capabilities") or {}
+    label = str(caps.get("goal_label_pt") or "").strip()
+    return f"\n\nO OBJETIVO DESTA PESSOA: {label}." if label else ""
 
 _FEED_SCHEMA = """Devolve APENAS um objeto JSON com esta forma exata:
 {
@@ -583,8 +727,8 @@ _FEED_SCHEMA = """Devolve APENAS um objeto JSON com esta forma exata:
   },
   "cards": [
     {
-      "kind": "day_plan|check_in|day_summary|weekly_review|win|pattern",
-      "ref": "<o id do finding — só para kind=pattern; caso contrário \"\">",
+      "kind": "day_plan|check_in|day_summary|weekly_review|win|pattern|link",
+      "ref": "<o id do finding — para kind=pattern e kind=link; caso contrário \"\">",
       "title": "título curto (máx. 60 caracteres)",
       "body": "2 a 4 frases com substância",
       "chips": [{"label": "facto muito curto (máx. 24 caracteres)",
@@ -603,8 +747,18 @@ escrever ficheiros."""
 def build_feed_prompt(facts: Dict[str, Any]) -> str:
     """The one prompt behind the whole feed — built on the server so that Sonnet (on
     the Mac) and Gemini (the fallback) are given byte-identical instructions and their
-    answers pass through byte-identical validation."""
-    return (f"{_FEED_RULES}\n\nFACTOS (JSON, já calculados):\n"
+    answers pass through byte-identical validation.
+
+    Assembled per generation rather than constant: the shared voice and rules, then
+    the goal, then the blind spots, then only the specialist frames for the domains
+    that actually have something to say today. A day of pure food findings produces
+    the same prompt this had before domains existed.
+    """
+    return (f"{_FEED_RULES}"
+            f"{_goal_line(facts)}"
+            f"{_blind_spots(facts)}\n\n"
+            f"{_frames_for(facts)}\n\n"
+            f"FACTOS (JSON, já calculados):\n"
             f"{json.dumps(facts, ensure_ascii=False, indent=1, default=str)}\n\n"
             f"{_FEED_SCHEMA}")
 

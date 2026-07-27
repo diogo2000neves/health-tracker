@@ -1344,7 +1344,10 @@ def test_derive_targets_from_measured_data():
     assert b["calorie_target_kcal"] == 2100.0       # 12.5% below TDEE
     assert b["weight_kg"] == 70.0                    # LATEST, not the mean
     assert b["lean_mass_kg"] == 56.3
-    assert b["goal"] == "recomp" and b["protein_g_per_kg"] == 2.0
+    assert b["goal"] == "recomposition" and b["protein_g_per_kg"] == 2.0
+    # Every input names the layer it came from, so nothing declared is ever
+    # presented as measured.
+    assert b["sources"] == {"tdee": "measured", "weight": "measured"}
     assert t["protein_g"] == {"kind": "reach", "floor": 140.0, "unit": "g",
                               "source": "measured"}          # 2.0 g/kg * 70
     assert t["fat_g"]["floor"] == 56.0                       # 0.8 * 70
@@ -1604,7 +1607,7 @@ def test_today_basis_exposes_the_derivation_inputs(monkeypatch):
     b = _today_client(monkeypatch).get(
         "/today?date=2026-07-18", headers=_HDR).get_json()["basis"]
     assert b["tdee_kcal"] == 2400.0 and b["weight_kg"] == 70.0
-    assert b["protein_g_per_kg"] == 2.0 and b["goal"] == "recomp"
+    assert b["protein_g_per_kg"] == 2.0 and b["goal"] == "recomposition"
 
 
 def test_today_meals_carry_per_item_nutrients_for_drilldown(monkeypatch):

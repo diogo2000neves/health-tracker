@@ -6,7 +6,9 @@ previous incarnation of this client caught that and silently retried unbounded.
 """
 from datetime import date
 
-from src.google_health import DAILY_TYPES, FILTERS, ROLLUP_TYPES, SLEEP, GoogleHealthClient
+from src.google_health import (
+    DAILY_TYPES, EXERCISE, FILTERS, ROLLUP_TYPES, SLEEP, GoogleHealthClient,
+)
 
 
 class _FakeResp:
@@ -58,6 +60,18 @@ def test_sleep_is_filtered_on_the_wake_day():
     assert flt == ('sleep.interval.civil_end_time >= "2026-07-08" '
                    'AND sleep.interval.civil_end_time < "2026-07-17"')
     assert client._session.gets[0]["params"]["pageSize"] == 25  # sleep caps at 25
+
+
+def test_exercise_is_filtered_on_the_start_day():
+    # A workout is keyed on when it STARTED, the opposite of sleep — it never
+    # spans a "wake" the way a night does.
+    client = _client()
+    client.list_data_points(EXERCISE, family="exercise", start="2026-07-08",
+                            end="2026-07-17")
+    flt = client._session.gets[0]["params"]["filter"]
+    assert flt == ('exercise.interval.civil_start_time >= "2026-07-08" '
+                   'AND exercise.interval.civil_start_time < "2026-07-17"')
+    assert client._session.gets[0]["params"]["pageSize"] == 25  # exercise caps at 25
 
 
 def test_daily_types_filter_on_their_civil_date_in_snake_case():
@@ -144,6 +158,7 @@ def test_the_14_day_types_are_all_in_the_rollup_set():
 
 def test_data_type_sets_are_disjoint_and_populated():
     assert SLEEP not in ROLLUP_TYPES and SLEEP not in DAILY_TYPES
+    assert EXERCISE not in ROLLUP_TYPES and EXERCISE not in DAILY_TYPES
     assert not set(DAILY_TYPES) & set(ROLLUP_TYPES)
     assert "total-calories" in ROLLUP_TYPES      # calories out: rollup-only
-    assert set(FILTERS) == {"daily", "sleep"}
+    assert set(FILTERS) == {"daily", "sleep", "exercise"}

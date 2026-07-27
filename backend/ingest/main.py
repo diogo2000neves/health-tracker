@@ -104,6 +104,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
+from schema import capabilities as caps_mod
 from schema.registry import (
     BLOCK_LABELS, BLOCKS, CAUSAL_LABELS, DAILY_COLUMNS, daily_headers, names_in,
     ocr_ranges,
@@ -118,6 +119,9 @@ MEALS_TAB = "meals"
 DAILY_TAB = "daily_summary"
 TEMPLATES_TAB = "templates"
 TARGETS_TAB = "targets"
+# What this user measures, what they are aiming at, and the body they declared.
+# One row per setting; see schema/capabilities.py.
+CONFIG_TAB = "config"
 
 # One row per meal. `items` is a JSON array breaking the plate into ingredients,
 # each with its own portion, macros and a `nutrients` map; the flat columns are
@@ -311,6 +315,11 @@ TARGETS_LAST_COL = chr(ord("A") + len(TARGETS_TAB_HEADERS) - 1)  # "F"
 
 TARGET_REACH, TARGET_LIMIT, TARGET_WINDOW = "reach", "limit", "window"
 SRC_MEASURED, SRC_RDA, SRC_MANUAL = "measured", "rda", "manual"
+# A number derived from what the user TOLD us (the `config` tab) rather than from
+# anything measured — the only layer available to someone with no scale and no
+# tracker. Ranks below `measured` and above the built-in constants, and is labelled
+# separately so the app never calls a declared number a measured one.
+SRC_DECLARED, SRC_DEFAULT = "declared", "default"
 
 # A nutrient's kinetics `horizon` — how a deficit should be read (see _with_kinetics
 # and _NUTRIENT_KINETICS). This is intrinsic biology, not a per-user setting, so it is
@@ -428,6 +437,23 @@ TDEE_WINDOW_DAYS = 14          # rolling average of measured total_cals_out
 RECOMP_DEFICIT = 0.125         # calorie target centre: 12.5% below measured TDEE
 CALORIE_WINDOW_HALF = 0.075    # window is centre ±7.5% of TDEE => a 5%-20% deficit
 PROTEIN_G_PER_KG = 2.0         # hero metric: 2.0 g per kg body weight (~140 g)
+
+# Per-goal energy and protein parameters. The goal is a SEPARATE axis from what the
+# user measures (see schema/capabilities.py): owning a scale doesn't say what you
+# are aiming at, and aiming at muscle gain doesn't require one. A negative deficit
+# is a surplus.
+#
+# Protein rises as the deficit deepens, which is not arbitrary: protein is what
+# decides whether the weight lost is fat or muscle, so the harder the cut the more
+# of it is needed. `health` has no body-composition goal at all and just takes the
+# adequacy figure.
+_GOAL_PARAMS: Dict[str, Dict[str, float]] = {
+    "recomposition": {"deficit": RECOMP_DEFICIT, "protein_g_per_kg": PROTEIN_G_PER_KG},
+    "fat_loss":      {"deficit": 0.20,           "protein_g_per_kg": 2.2},
+    "muscle_gain":   {"deficit": -0.10,          "protein_g_per_kg": 1.8},
+    "maintenance":   {"deficit": 0.0,            "protein_g_per_kg": 1.6},
+    "health":        {"deficit": 0.0,            "protein_g_per_kg": 1.2},
+}
 FAT_G_PER_KG = 0.8             # floor for hormonal health
 FAT_CEILING_MULTIPLIER = 1.25  # ceiling = floor × 1.25 (~1.0 g/kg)
 FIBER_G_PER_1000KCAL = 14.0    # standard fibre recommendation
@@ -2105,28 +2131,64 @@ def _latest(rows: List[Dict[str, Any]], key: str) -> Optional[float]:
     return None
 
 
-def _derive_targets(
-        daily_rows: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """The macro targets computed from the user's OWN measured data, for the
-    recomposition goal (lose fat, hold muscle). Returns (targets, basis) where
-    `basis` is the inputs the numbers came from, so the app can show them honestly.
+def _derive_targets(daily_rows: List[Dict[str, Any]],
+                    caps: Optional["caps_mod.Capabilities"] = None
+                    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """The macro targets computed from the best data this user actually has.
+    Returns (targets, basis) where `basis` is the inputs the numbers came from, so
+    the app can show them honestly.
 
-    Energy: a rolling TDEE (measured total_cals_out) with a modest 12.5% deficit,
-    as a soft window (a 5%-20% deficit band). Protein/fat scale with body weight;
-    carbs fill the remaining energy; fibre scales with the calorie target; the
-    added-sugar and saturated-fat ceilings are 10% of energy each. Everything falls
-    back to sane constants when there is no history yet, so day one still works."""
-    tdee = _recent_average(daily_rows, "total_cals_out", TDEE_WINDOW_DAYS)
-    if tdee is None:
-        bmr = _latest(daily_rows, "bmr_kcal")
-        tdee = bmr * BMR_TO_TDEE if bmr else DEFAULT_TDEE
-    weight = _latest(daily_rows, "weight_kg") or DEFAULT_WEIGHT_KG
-    lean = _latest(daily_rows, "lean_mass_kg")
+    Energy: a rolling TDEE (measured total_cals_out) adjusted by the goal's calorie
+    offset, as a soft window. Protein/fat scale with body weight; carbs fill the
+    remaining energy; fibre scales with the calorie target; the added-sugar and
+    saturated-fat ceilings are 10% of energy each.
 
-    centre = tdee * (1 - RECOMP_DEFICIT)
-    cal_floor = tdee * (1 - RECOMP_DEFICIT - CALORIE_WINDOW_HALF)
-    cal_ceil = tdee * (1 - RECOMP_DEFICIT + CALORIE_WINDOW_HALF)
-    protein = PROTEIN_G_PER_KG * weight
+    **The source ladder is the whole point of the `caps` argument.** Each input
+    takes the best available layer and says which one it used:
+
+        measured  a real total_cals_out average / a real weigh-in
+        declared  what the user typed into the `config` tab (Mifflin-St Jeor for
+                  energy) — the only layer a friend with no watch and no scale has
+        default   the built-in constants, which describe nobody in particular
+
+    Without the declared layer a phone-only user got a hard-coded 2200 kcal and a
+    70 kg protein target no matter who they were; with it, the same code path
+    produces a target for their actual body. `basis.sources` records the choice per
+    input, so the app can label a number "medido" or "declarado" rather than
+    implying a measurement that never happened.
+    """
+    caps = caps or caps_mod.FULL
+    goal = _GOAL_PARAMS.get(caps.goal, _GOAL_PARAMS[caps_mod.DEFAULT_GOAL])
+    sources: Dict[str, str] = {}
+
+    tdee = _recent_average(daily_rows, "total_cals_out", TDEE_WINDOW_DAYS) \
+        if caps.has("activity") else None
+    if tdee is not None:
+        sources["tdee"] = SRC_MEASURED
+    else:
+        bmr = _latest(daily_rows, "bmr_kcal") if caps.has("body") else None
+        declared = caps.declared_tdee()
+        if bmr:
+            tdee, sources["tdee"] = bmr * BMR_TO_TDEE, SRC_MEASURED
+        elif declared is not None:
+            tdee, sources["tdee"] = declared, SRC_DECLARED
+        else:
+            tdee, sources["tdee"] = DEFAULT_TDEE, SRC_DEFAULT
+
+    weight = _latest(daily_rows, "weight_kg") if caps.has("body") else None
+    if weight is not None:
+        sources["weight"] = SRC_MEASURED
+    elif caps.declared_weight_kg is not None:
+        weight, sources["weight"] = caps.declared_weight_kg, SRC_DECLARED
+    else:
+        weight, sources["weight"] = DEFAULT_WEIGHT_KG, SRC_DEFAULT
+    lean = _latest(daily_rows, "lean_mass_kg") if caps.has("body") else None
+
+    deficit, protein_per_kg = goal["deficit"], goal["protein_g_per_kg"]
+    centre = tdee * (1 - deficit)
+    cal_floor = tdee * (1 - deficit - CALORIE_WINDOW_HALF)
+    cal_ceil = tdee * (1 - deficit + CALORIE_WINDOW_HALF)
+    protein = protein_per_kg * weight
     fat = FAT_G_PER_KG * weight
     carbs = max(0.0, (centre - 4 * protein - 9 * fat) / 4)
     fiber = FIBER_G_PER_1000KCAL * centre / 1000
@@ -2158,9 +2220,13 @@ def _derive_targets(
         "calorie_target_kcal": r10(centre),
         "weight_kg": round(weight, 2),
         "lean_mass_kg": round(lean, 2) if lean is not None else None,
-        "protein_g_per_kg": PROTEIN_G_PER_KG,
-        "calorie_deficit_pct": round(RECOMP_DEFICIT * 100, 1),
-        "goal": "recomp",
+        "protein_g_per_kg": protein_per_kg,
+        "calorie_deficit_pct": round(deficit * 100, 1),
+        "goal": caps.goal,
+        "goal_label_pt": caps_mod.GOAL_LABELS_PT.get(caps.goal, caps.goal),
+        # Which layer each input came from, so nothing is ever presented as
+        # measured when it was typed into a config tab.
+        "sources": sources,
     }
     return targets, basis
 
@@ -2400,6 +2466,86 @@ def _today_meals_out(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         })
     out.sort(key=lambda m: m["datetime"])
     return out
+
+
+# -- capabilities: which blocks this user actually measures ---------------------
+# One switch, read from the sheet, that decides what the API serves, what the app
+# draws and which domains the coach may speak about. See schema/capabilities.py for
+# why it is a set of blocks rather than a level. Cached briefly because every
+# request needs it and it changes about once in the life of a deployment.
+_CAPS_TTL_S = 120
+_caps_cache: Dict[str, Any] = {"at": 0.0, "value": None}
+
+
+def _read_config_grid() -> List[List[Any]]:
+    """The raw `config` tab, or [] if it hasn't been created yet."""
+    try:
+        return _read_tab(CONFIG_TAB)
+    except Exception:
+        return []
+
+
+def _ensure_config_tab() -> None:
+    meta = _execute(lambda: _sheets().spreadsheets().get(spreadsheetId=_sid()))
+    titles = {s["properties"]["title"] for s in meta.get("sheets", [])}
+    if CONFIG_TAB not in titles:
+        _execute(lambda: _sheets().spreadsheets().batchUpdate(
+            spreadsheetId=_sid(),
+            body={"requests": [{"addSheet": {
+                "properties": {"title": CONFIG_TAB}}}]}))
+    headers = list(caps_mod.CONFIG_TAB_HEADERS)
+    last_col = chr(ord("A") + len(headers) - 1)
+    rng = f"{CONFIG_TAB}!A1:{last_col}1"
+    current = _execute(lambda: _sheets().spreadsheets().values().get(
+        spreadsheetId=_sid(), range=rng)).get("values", [[]])
+    if not current or current[0] != headers:
+        _execute(lambda: _sheets().spreadsheets().values().update(
+            spreadsheetId=_sid(), range=f"{CONFIG_TAB}!A1",
+            valueInputOption="RAW", body={"values": [headers]}))
+
+
+def _seed_config(grid: List[List[Any]]) -> None:
+    """Materialise any missing config key into the sheet, exactly as `_seed_targets`
+    does for targets. Idempotent, so it is cheap to call on every read, and the
+    result is that a fresh sheet gains an editable, self-documenting description of
+    what this user measures instead of an empty grid."""
+    existing = {str(r.get("key") or "").strip().lower()
+                for r in _rows_as_dicts(grid)}
+    rows = [list(seed) for seed in caps_mod.CONFIG_SEED
+            if seed[0] not in existing]
+    if not rows:
+        return
+    _ensure_config_tab()
+    _execute(lambda: _sheets().spreadsheets().values().append(
+        spreadsheetId=_sid(), range=f"{CONFIG_TAB}!A1",
+        valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+        body={"values": rows}))
+
+
+def _capabilities() -> "caps_mod.Capabilities":
+    """This user's capability, from the `config` tab.
+
+    Never fatal and never restrictive on failure: a missing tab, a permissions blip
+    or a typo all fall back to `caps_mod.FULL`. Hiding a block the user really has
+    would look like data loss, which is far worse than showing an empty one.
+    """
+    now = time.time()
+    if _caps_cache["value"] is not None \
+            and now - float(_caps_cache["at"]) < _CAPS_TTL_S:
+        return _caps_cache["value"]
+    try:
+        grid = _read_config_grid()
+        try:  # materialise the defaults on first run; never fatal
+            _seed_config(grid)
+        except Exception:
+            app.logger.warning("config seed skipped (non-fatal)", exc_info=True)
+        caps = caps_mod.from_config(_rows_as_dicts(grid))
+    except Exception:
+        app.logger.warning("config read failed; assuming full capabilities",
+                           exc_info=True)
+        caps = caps_mod.FULL
+    _caps_cache.update({"at": now, "value": caps})
+    return caps
 
 
 def _read_targets_grid() -> List[List[Any]]:
@@ -3002,14 +3148,20 @@ def daily():
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
             return jsonify({"error": "from/to must be YYYY-MM-DD"}), 400
 
-    wanted = [b for b in BLOCKS if b not in ("key", "meta")]
+    # Capability first, request second. A block this user doesn't measure is not
+    # served even if a stale client asks for it by name — the switch has to be
+    # enforced where the data leaves, not where it is drawn, or an old build would
+    # keep rendering empty sleep charts for someone with no tracker.
+    caps = _capabilities()
+    known = [b for b in BLOCKS if b not in ("key", "meta")]
+    wanted = [b for b in known if caps.has(b)]
     if request.args.get("blocks"):
         asked = [b.strip() for b in request.args["blocks"].split(",") if b.strip()]
-        unknown = [b for b in asked if b not in wanted]
+        unknown = [b for b in asked if b not in known]
         if unknown:
             return jsonify({"error": f"unknown block(s) {unknown}",
-                            "known": wanted}), 400
-        wanted = asked
+                            "known": known}), 400
+        wanted = [b for b in asked if caps.has(b)]
 
     values = _read_tab(DAILY_TAB)
     rows = _rows_as_dicts(values)
@@ -3024,7 +3176,8 @@ def daily():
                 day[block] = {k: v for k, v in day[block].items() if k in tier1}
 
     return jsonify({"from": start, "to": end, "count": len(days),
-                    "blocks": wanted, "days": days}), 200
+                    "blocks": wanted, "days": days,
+                    "capabilities": caps.to_api()}), 200
 
 
 # Item fields a hand correction may overwrite. portion_g is informational only in
@@ -3178,8 +3331,9 @@ def today():
     all_meal_rows = _all_meal_rows()                    # the meals tab, read once
     meal_rows = [r for r in all_meal_rows               # today: consumed + the list
                  if str(r.get("datetime", "")).startswith(day)]
+    caps = _capabilities()
     daily_rows = _rows_as_dicts(_read_tab(DAILY_TAB))   # for the measured derivation
-    derived, basis = _derive_targets(daily_rows)
+    derived, basis = _derive_targets(daily_rows, caps)
 
     grid = _read_targets_grid()
     try:  # materialise the defaults into the sheet on first run; never fatal
@@ -3197,6 +3351,10 @@ def today():
         "basis": basis,
         "meals": meals_out,
         "history": _history_window(all_meal_rows, day, NUTRIENT_HISTORY_DAYS),
+        # The app draws itself from this: which tabs and sections exist at all, and
+        # what the goal is called. Rides along on a call the app already makes on
+        # every launch, so the switch costs no extra round trip.
+        "capabilities": caps.to_api(),
     }), 200
 
 
@@ -3286,7 +3444,7 @@ def _resolved_targets_and_basis() -> Tuple[Dict[str, Any], Dict[str, Any]]:
     and its basis — exactly what `/today` computes, factored out so every insights
     endpoint reads the identical science."""
     daily_rows = _rows_as_dicts(_read_tab(DAILY_TAB))
-    derived, basis = _derive_targets(daily_rows)
+    derived, basis = _derive_targets(daily_rows, _capabilities())
     targets = _with_kinetics(_resolve_targets(derived, _targets_from_grid(
         _read_targets_grid())))
     return targets, basis
@@ -3808,7 +3966,10 @@ def _coach_mod(name: str):
     return importlib.import_module(name)
 
 
-@functools.lru_cache(maxsize=8)
+# Sized to hold every coach module at once. It used to be 8, which was already one
+# short of the modules in play — and an evicted entry means re-importing on the next
+# call for no reason.
+@functools.lru_cache(maxsize=24)
 def _coach(name: str):
     return _coach_mod(name)
 
@@ -3832,6 +3993,167 @@ def _coach_window_meals(now: datetime) -> Tuple[List[Dict[str, Any]], List[Dict[
     start = (now.date() - timedelta(days=COACH_WINDOW_DAYS)).isoformat()
     return _window_meals(all_rows, start, today), [
         r for r in all_rows if str(r.get("datetime", "")).startswith(today)]
+
+
+# How far back the non-food domains look. Longer than the food window on purpose:
+# a body-composition trend needs weeks to mean anything, and the correlation engine
+# needs enough paired days to clear its own minimum n — 28 days of food patterns is
+# plenty for "you haven't eaten fish in twelve days" but far too short to say
+# anything honest about late dinners and deep sleep.
+COACH_METRIC_WINDOW_DAYS = int(os.environ.get("COACH_METRIC_WINDOW_DAYS", "120"))
+
+# The waking-day cutoff, mirroring src/run_daily.DAY_CUTOFF_HOUR. Both images read
+# the same env var, so the two copies cannot be configured apart.
+NUTRITION_DAY_CUTOFF_HOUR = int(os.environ.get("NUTRITION_DAY_CUTOFF_HOUR", "5"))
+
+
+def _coach_window_days(now: datetime,
+                       window_days: int = COACH_METRIC_WINDOW_DAYS
+                       ) -> List[Dict[str, Any]]:
+    """The `daily_summary` rows the coach reasons over, oldest first.
+
+    Until now the coach could see only the meals tab, which is why it could talk
+    about food and nothing else. Everything the tracker and the scale measure enters
+    here — and it is one read, shared by the domain findings and the link engine.
+    """
+    try:
+        rows = _rows_as_dicts(_read_tab(DAILY_TAB))
+    except Exception:
+        app.logger.warning("daily_summary read failed for the coach", exc_info=True)
+        return []
+    start = (now.date() - timedelta(days=window_days)).isoformat()
+    today = now.date().isoformat()
+    days = [r for r in rows if start <= str(r.get("date", "")) <= today]
+    days.sort(key=lambda r: str(r.get("date", "")))
+    return days
+
+
+def _waking_day(stamp: Any) -> str:
+    """The waking day a meal belongs to (05:00 cutoff), mirroring
+    `src.run_daily.nutrition_day` — a 00:17 dessert counts toward the evening it
+    followed. Mirrored rather than imported because ingest cannot import `src`; a
+    test pins the two implementations against each other."""
+    text = str(stamp or "")
+    if len(text) < 16:
+        return text[:10]
+    try:
+        parsed = datetime.fromisoformat(text.replace(" ", "T")[:19])
+    except ValueError:
+        return text[:10]
+    return (parsed - timedelta(hours=NUTRITION_DAY_CUTOFF_HOUR)).date().isoformat()
+
+
+def _meals_by_waking_day(meal_rows: Sequence[Dict[str, Any]]
+                         ) -> Dict[str, List[Dict[str, Any]]]:
+    """Meals bucketed the way the nutrition columns are keyed, so a meal-derived
+    feature and the `daily_summary` row it is compared against describe the same
+    day. Stubs are dropped — an `analysis failed` row is not a meal."""
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for row in meal_rows:
+        if _is_stub(row):
+            continue
+        day = _waking_day(row.get("datetime"))
+        if day:
+            out.setdefault(day, []).append(row)
+    return out
+
+
+# The handful of numbers a card may cite directly, per domain: the latest reading and
+# the person's own recent average, which is the only thing that makes a reading mean
+# anything. Deliberately NOT the raw window — the findings are the analysis, and
+# handing the model 80 columns as well would invite it to do its own and get it wrong.
+_METRIC_SUMMARY: Dict[str, Tuple[Tuple[str, str], ...]] = {
+    "sleep": (("sleep_mins", "sono (min)"),
+              ("sleep_efficiency_pct", "eficiência (%)"),
+              ("sleep_deep_mins", "sono profundo (min)"),
+              ("resting_hr_bpm", "FC repouso (bpm)"),
+              ("hrv_ms", "HRV (ms)")),
+    "activity": (("steps", "passos"),
+                 ("workout_mins", "treino (min)"),
+                 ("total_cals_out", "gasto total (kcal)")),
+    "body": (("weight_kg", "peso (kg)"),
+             ("body_fat_pct", "massa gorda (%)"),
+             ("lean_mass_kg", "massa magra (kg)")),
+}
+# How many recent days the "usual" figure averages over.
+_METRIC_RECENT_DAYS = 14
+
+
+def _coach_metrics_summary(days: Sequence[Dict[str, Any]],
+                           caps: "caps_mod.Capabilities"
+                           ) -> Optional[Dict[str, Any]]:
+    """Latest reading + recent average per headline metric, for the domains this user
+    has. None when there is nothing to say, so the key drops out of the prompt
+    entirely rather than sitting there as an empty object inviting comment."""
+    if not days:
+        return None
+    out: Dict[str, Any] = {}
+    for domain, metrics in _METRIC_SUMMARY.items():
+        if domain not in caps.domains():
+            continue
+        block: Dict[str, Any] = {}
+        for name, label in metrics:
+            values = [v for v in (_num_or_none(d.get(name))
+                                  for d in days[-_METRIC_RECENT_DAYS:])
+                      if v is not None]
+            if not values:
+                continue
+            block[name] = {
+                "label_pt": label,
+                "latest": round(values[-1], 1),
+                "usual": round(sum(values) / len(values), 1),
+                "days": len(values),
+            }
+        if block:
+            out[domain] = block
+    return out or None
+
+
+def _num_or_none(value: Any) -> Optional[float]:
+    """A sheet cell as a float. Booleans are rejected: a TRUE flag silently becoming
+    1.0 inside an average is how confident nonsense gets made."""
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        out = float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _coach_metric_findings(days: Sequence[Dict[str, Any]],
+                           caps: "caps_mod.Capabilities",
+                           meals_by_day: Dict[str, List[Dict[str, Any]]]
+                           ) -> List[Dict[str, Any]]:
+    """The deterministic non-food findings plus the cross-domain links.
+
+    Both halves are capability-gated at the source: `domains` decides which rules run
+    at all, and a link is skipped unless the user measures every block it spans. A
+    nutrition-only user therefore reaches the model with exactly the payload the old
+    coach had, which is what makes adding a friend a config change rather than a
+    code path.
+    """
+    if not days:
+        return []
+    findings_mod = _coach("domain_findings")
+    links_mod = _coach("links")
+
+    domains = [d for d in caps.domains() if d != "nutrition"]
+    out: List[Dict[str, Any]] = list(
+        findings_mod.build_findings(days, domains=domains))
+
+    try:
+        out.extend(links_mod.evaluate(
+            days,
+            features_by_day=links_mod.daily_features(meals_by_day),
+            columns={c.name: c.causal for c in DAILY_COLUMNS},
+            blocks=caps.blocks))
+    except Exception:
+        # A correlation is a bonus, never a reason to lose the whole feed.
+        app.logger.warning("link evaluation failed (non-fatal)", exc_info=True)
+
+    out.sort(key=lambda f: -f.get("severity", 0))
+    return out
 
 
 def _coach_profile(now: datetime, window_meals: List[Dict[str, Any]], *,
@@ -4275,9 +4597,15 @@ def _build_generation_job(now: datetime, *, slot: str,
     memory_mod = _coach("coach_memory")
     narrator = _narrator_mod()
 
+    caps = _capabilities()
     window_meals, today_rows = _coach_window_meals(now)
     consumed = _todays_consumed(today_rows)
     targets, _basis = _resolved_targets_and_basis()
+    # Everything the tracker and the scale measured. Read once, used twice: the
+    # per-domain findings and the link engine share this window.
+    metric_days = _coach_window_days(now) if caps.domains() != ("nutrition",) else []
+    metric_findings = _coach_metric_findings(
+        metric_days, caps, _meals_by_waking_day(window_meals))
     # Scheduled runs pay for taxonomy learning; the meal-triggered ones read it as-is.
     profile = _coach_profile(now, window_meals, learn=slot != "adhoc")
     taxonomy = store.read_json(store.TAXONOMY, default=None)
@@ -4287,7 +4615,8 @@ def _build_generation_job(now: datetime, *, slot: str,
     state = store.read_state()
     existing = _read_feed_cards(now)
 
-    if not profile.get("findings") and not today.get("meals"):
+    if not profile.get("findings") and not today.get("meals") \
+            and not metric_findings:
         return None
 
     # What HAPPENED today, as opposed to how this person eats in general — drinks,
@@ -4313,6 +4642,9 @@ def _build_generation_job(now: datetime, *, slot: str,
                                       taxonomy=taxonomy)
                    if "next_meal" in feed._wants(slot) else None),
         weekly=_coach_weekly_facts(profile) if slot == "weekly" else None,
+        metric_findings=metric_findings,
+        metrics=_coach_metrics_summary(metric_days, caps),
+        capabilities=caps.to_api(),
         recent=[{"title": str(c.get("title") or ""),
                  "body": str(c.get("body") or "")} for c in existing])
 
@@ -4346,6 +4678,9 @@ def _build_generation_job(now: datetime, *, slot: str,
             "today": {"calories_left": today.get("calories_left"),
                       "protein_left_g": today.get("protein_left_g"),
                       "meals": today.get("meals", [])},
+            # Carries the non-food findings too: assembly validates the answer
+            # against the same objects that produced the question, and a `link`
+            # card is dropped unless its ref is in here.
             "findings": findings,
         },
     }
@@ -4978,11 +5313,21 @@ def _build_report_job(now: datetime, *, period: str, ref) -> Optional[Dict[str, 
             rows, taxonomy=taxonomy,
             window_days=7, ref_day=end)
         previous = archive.recent_reports("weekly", before=key, limit=1)
+        caps = _capabilities()
+        # The links need their full window to have any statistical standing — seven
+        # days would clear no hypothesis's minimum n — so the engine reads its own
+        # window and the report shows the week's rows alongside what it found.
+        metric_window = _coach_window_days(now)
+        week_days = [d for d in metric_window
+                     if start <= str(d.get("date", "")) <= end]
         facts = reports_mod.weekly_facts(
             start=start, end=end, key=key, meals=meals, profile=profile,
             archive_entries=archive.read_range(start, end),
             previous=previous[0] if previous else None,
-            memory_facts=memory_facts)
+            memory_facts=memory_facts,
+            metric_findings=_coach_metric_findings(
+                metric_window, caps, _meals_by_waking_day(rows)),
+            days=week_days, capabilities=caps.to_api())
     else:
         child = "weekly" if period == "monthly" else "monthly"
         children = [r for r in archive.recent_reports(child, before="9999", limit=14)

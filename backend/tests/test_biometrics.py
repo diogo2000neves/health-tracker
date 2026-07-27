@@ -5,7 +5,8 @@ on 2026-07-14..16, trimmed only for length — so the string-typed numbers, the
 missing civil times and the nap flag are all exactly as the API sends them.
 """
 from src.biometrics import (
-    BIOMETRIC_COLUMNS, biometric_days, daily_activity, daily_recovery, daily_sleep,
+    BIOMETRIC_COLUMNS, biometric_days, daily_activity, daily_exercise,
+    daily_recovery, daily_sleep,
 )
 
 
@@ -242,20 +243,88 @@ def test_activity_ignores_days_the_tracker_produced_nothing():
         "date": {"year": 2026, "month": 7, "day": 15}}}]}) == {}
 
 
+# -- exercise (session list) -----------------------------------------------------
+def _exercise(start, end, exercise_type, active_duration=None, cals=None,
+             offset="3600s"):
+    metrics = {}
+    if cals is not None:
+        metrics["caloriesKcal"] = cals
+    point = {"exercise": {
+        "interval": {"startTime": start, "endTime": end,
+                     "startUtcOffset": offset, "endUtcOffset": offset},
+        "exerciseType": exercise_type,
+        "metricsSummary": metrics,
+    }}
+    if active_duration is not None:
+        point["exercise"]["activeDuration"] = active_duration
+    return point
+
+
+def test_exercise_lands_on_the_local_start_day_not_the_raw_utc_day():
+    # 23:30 UTC + 1h is already after midnight in Lisbon; a naive `[:10]` on the
+    # raw timestamp would land this on the 27th, but the wall-clock day the user
+    # actually started the session is the 28th — and it's the START that keys
+    # exercise (the opposite convention from sleep, which keys on the END).
+    session = _exercise("2026-07-27T23:30:00Z", "2026-07-28T00:15:00Z",
+                        "WALKING", active_duration="2700s")
+    days = daily_exercise([session])
+    assert list(days) == ["2026-07-28"]
+
+
+def test_exercise_sums_duration_and_calories_across_sessions_in_a_day():
+    lift = _exercise("2026-07-27T11:18:28Z", "2026-07-27T12:28:26Z",
+                     "STRENGTH_TRAINING", active_duration="4194s", cals=484)
+    walk = _exercise("2026-07-27T15:37:50Z", "2026-07-27T16:40:24Z",
+                     "WALKING", active_duration="3634s", cals=416)
+    row = daily_exercise([lift, walk])["2026-07-27"]
+    assert row["workout_count"] == 2
+    assert row["workout_mins"] == 130          # (4194 + 3634) / 60, rounded
+    assert row["workout_cals"] == 900
+    assert row["workout_types"] == "strength training, walking"
+
+
+def test_exercise_types_are_deduplicated_but_keep_first_seen_order():
+    a = _exercise("2026-07-27T07:00:00Z", "2026-07-27T07:30:00Z",
+                  "STRENGTH_TRAINING", active_duration="1800s")
+    b = _exercise("2026-07-27T18:00:00Z", "2026-07-27T18:20:00Z",
+                  "STRENGTH_TRAINING", active_duration="1200s")
+    row = daily_exercise([a, b])["2026-07-27"]
+    assert row["workout_types"] == "strength training"
+    assert row["workout_count"] == 2
+
+
+def test_exercise_omits_zero_metrics_rather_than_writing_zero():
+    # A session with no metricsSummary/activeDuration yet (still in progress) must
+    # not write a literal 0 for mins/cals — that would read as "a workout happened
+    # and burned nothing", not "we don't know yet". The type is already known
+    # though (the real API sends it from the moment a session starts).
+    row = daily_exercise([_exercise("2026-07-27T07:00:00Z", "2026-07-27T07:00:06Z",
+                                    "STRENGTH_TRAINING")])["2026-07-27"]
+    assert row == {"workout_count": 1, "workout_types": "strength training"}
+    assert "workout_mins" not in row and "workout_cals" not in row
+
+
+def test_exercise_ignores_unusable_points():
+    assert daily_exercise([{"exercise": {}}]) == {}
+    assert daily_exercise([]) == {}
+
+
 # -- merge ----------------------------------------------------------------------
-def test_biometric_days_merges_the_three_groups_per_date():
+def test_biometric_days_merges_the_four_groups_per_date():
     days = biometric_days(
         {"2026-07-16": {"sleep_mins": 525}},
         {"2026-07-16": {"hrv_ms": 73.1}},
         {"2026-07-16": {"steps": 728}, "2026-07-15": {"steps": 4151}},
+        {"2026-07-16": {"workout_count": 1}},
     )
-    assert days["2026-07-16"] == {"sleep_mins": 525, "hrv_ms": 73.1, "steps": 728}
+    assert days["2026-07-16"] == {"sleep_mins": 525, "hrv_ms": 73.1, "steps": 728,
+                                  "workout_count": 1}
     assert days["2026-07-15"] == {"steps": 4151}
 
 
 def test_biometric_days_respects_the_window():
     days = biometric_days({}, {}, {"2026-07-10": {"steps": 1}, "2026-07-16": {"steps": 2}},
-                          start="2026-07-15")
+                          {}, start="2026-07-15")
     assert list(days) == ["2026-07-16"]
 
 

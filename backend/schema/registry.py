@@ -2,9 +2,8 @@
 
 Everything else is generated from this file: the sheet's header row and column
 order, the `schema` tab, the plausibility bands the ingest service validates OCR
-against, the causal alignment of the `analysis` tab, the JSON the iOS app reads,
-and the Swift/SQL type exports. Change a column here and `python -m src.maintenance`
-migrates the sheet to match.
+against, the JSON the iOS app reads, and the Swift/SQL type exports. Change a
+column here and `python -m src.maintenance` migrates the sheet to match.
 
 Deliberately **pure stdlib** and dependency-free: it is copied into *both* container
 images (the daily job and the ingest service, which cannot import `src/`). That
@@ -26,7 +25,8 @@ in two places and could silently drift apart.
   unit: the sleep on row N happened the night *before* N, and the food on row N is
   eaten *after* that sleep and after the morning weigh-in. Correlating them on the
   same row asks "did tomorrow's dinner affect last night's sleep?" — backwards in
-  time. `src/analysis.py` uses this field to build a causally honest view.
+  time. `causal_inputs()` / `causal_outcomes()` below expose this field so callers
+  can pair day N's inputs against day N+1's outcomes themselves.
 """
 from __future__ import annotations
 
@@ -293,6 +293,28 @@ DAILY_COLUMNS: List[Column] = [
     Column("swim_strokes", "activity", "integer", "count", "fitbit", CALENDAR_DAY,
            NEUTRAL, tier=2, range=(0, 100000),
            description="Swim strokes counted on this day (blank on non-swim days)."),
+
+    # -- exercise (explicitly started/stopped workout sessions) ----------------
+    Column("workout_mins", "activity", "integer", "min", "fitbit", CALENDAR_DAY,
+           UP_GOOD, tier=1, range=(0, 600),
+           description="Total active duration of workouts explicitly started on "
+                       "the tracker (strength training, a tracked walk or ride, "
+                       "...), summed across every session this day. Distinct from "
+                       "total_active_mins, which also credits movement that never "
+                       "had a session started for it."),
+    Column("workout_count", "activity", "integer", "count", "fitbit", CALENDAR_DAY,
+           NEUTRAL, tier=2, range=(0, 10),
+           description="Number of distinct workout sessions started on the "
+                       "tracker this day. Blank on a day with no logged session."),
+    Column("workout_cals", "activity", "integer", "kcal", "fitbit", CALENDAR_DAY,
+           UP_GOOD, tier=2, range=(0, 3000),
+           description="Calories burned during logged workout sessions only — a "
+                       "subset of active_cals, which covers the whole day."),
+    Column("workout_types", "activity", "string", "", "fitbit", CALENDAR_DAY,
+           NEUTRAL, tier=2,
+           description="Distinct workout types logged this day (e.g. 'strength "
+                       "training, walking'), in the order first started that day. "
+                       "Blank on a day with no logged session."),
 
     # -- nutrition -------------------------------------------------------------
     Column("energy_balance_kcal", "nutrition", "integer", "kcal", "derived",

@@ -47,9 +47,15 @@ DAILY_TYPES = [
 # Sleep sessions (one per night, plus naps — see biometrics.daily_sleep).
 SLEEP = "sleep"
 
+# Exercise sessions: workouts explicitly started/stopped on the device (see
+# biometrics.daily_exercise). Empty until the user started logging workouts on
+# the tracker (2026-07-16) — re-verified populated against the live API on
+# 2026-07-27, so unlike floors/altitude/vo2-max below, this is not a hardware gap.
+EXERCISE = "exercise"
+
 # Types pulled via dailyRollUp. Verified populated for this user's tracker; the
-# ones that returned nothing (floors, altitude, vo2-max, exercise) are simply not
-# produced by the device and are left out rather than fetched for no reason.
+# ones that returned nothing (floors, altitude, vo2-max) are simply not produced
+# by the device and are left out rather than fetched for no reason.
 ROLLUP_TYPES = [
     "steps", "distance", "total-calories", "active-energy-burned",
     "active-minutes", "active-zone-minutes", "sedentary-period", "heart-rate",
@@ -62,14 +68,18 @@ ROLLUP_TYPES = [
 #   daily summaries -> `{type}.date`
 #   sleep           -> `sleep.interval.civil_end_time`  (the WAKE day — the API's
 #                      own convention, and the one the sheet uses)
+#   exercise        -> `exercise.interval.civil_start_time`  (the day the workout
+#                      STARTED, not ended — a session never spans a "wake")
 FILTERS = {
     "daily": '{t}.date >= "{start}" AND {t}.date < "{end}"',
     "sleep": 'sleep.interval.civil_end_time >= "{start}" '
              'AND sleep.interval.civil_end_time < "{end}"',
+    "exercise": '{t}.interval.civil_start_time >= "{start}" '
+                'AND {t}.interval.civil_start_time < "{end}"',
 }
 
 # sleep/exercise cap at 25; everything else defaults to 1440 (max 10000).
-_SLEEP_PAGE_SIZE = 25
+_SESSION_PAGE_SIZE = 25
 _PAGE_SIZE = 1000
 
 # dailyRollUp refuses a range longer than this, per data type (from the discovery
@@ -135,7 +145,8 @@ class GoogleHealthClient:
         """
         url = f"{BASE_URL}/users/{user}/dataTypes/{data_type}/dataPoints"
         params: Dict[str, Any] = {
-            "pageSize": _SLEEP_PAGE_SIZE if data_type == SLEEP else _PAGE_SIZE,
+            "pageSize": _SESSION_PAGE_SIZE if data_type in (SLEEP, EXERCISE)
+                       else _PAGE_SIZE,
         }
         if start and end:
             params["filter"] = FILTERS[family].format(

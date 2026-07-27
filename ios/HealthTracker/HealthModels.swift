@@ -184,6 +184,18 @@ struct Activity: Codable, Hashable {
     /// Swim strokes counted on this day (blank on non-swim days).
     /// measures: 00:00-24:00 on this date [count]
     var swimStrokes: Int?
+    /// Total active duration of workouts explicitly started on the tracker (strength training, a tracked walk or ride, ...), summed across every session this day. Distinct from total_active_mins, which also credits movement that never had a session started for it.
+    /// measures: 00:00-24:00 on this date [min]
+    var workoutMins: Int?
+    /// Number of distinct workout sessions started on the tracker this day. Blank on a day with no logged session.
+    /// measures: 00:00-24:00 on this date [count]
+    var workoutCount: Int?
+    /// Calories burned during logged workout sessions only — a subset of active_cals, which covers the whole day.
+    /// measures: 00:00-24:00 on this date [kcal]
+    var workoutCals: Int?
+    /// Distinct workout types logged this day (e.g. 'strength training, walking'), in the order first started that day. Blank on a day with no logged session.
+    /// measures: 00:00-24:00 on this date
+    var workoutTypes: String?
 
     enum CodingKeys: String, CodingKey {
         case totalCalsOut = "total_cals_out"
@@ -206,6 +218,10 @@ struct Activity: Codable, Hashable {
         case minsHrVigorous = "mins_hr_vigorous"
         case minsHrPeak = "mins_hr_peak"
         case swimStrokes = "swim_strokes"
+        case workoutMins = "workout_mins"
+        case workoutCount = "workout_count"
+        case workoutCals = "workout_cals"
+        case workoutTypes = "workout_types"
     }
 }
 

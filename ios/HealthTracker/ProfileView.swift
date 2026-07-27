@@ -18,11 +18,12 @@ struct ProfileView: View {
         NavigationStack {
             List {
                 if let r = store.response {
-                    goalSection(r.basis)
+                    goalSection(r)
                     bodySection(r.basis)
                     targetsSection(r)
+                    measuringSection(r.caps)
                     Section {
-                        Text("Estes objetivos são calculados a partir dos teus próprios dados e atualizam-se sozinhos. Para ajustes finos, edita o separador `targets` na folha de cálculo.")
+                        Text("Estes objetivos são calculados a partir dos teus próprios dados e atualizam-se sozinhos. Para ajustes finos, edita o separador `targets` na folha de cálculo; para mudar o que a app acompanha, o separador `config`.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                 } else {
@@ -39,27 +40,75 @@ struct ProfileView: View {
         }
     }
 
+    /// The goal comes from the `config` tab now. It used to read "Recomposição" for
+    /// everyone, which stops being true the moment a second person uses the app.
     @ViewBuilder
-    private func goalSection(_ basis: Basis) -> some View {
+    private func goalSection(_ r: TodayResponse) -> some View {
+        let label = r.basis.goalLabelPt ?? r.caps.goalLabelPt
         Section("Objetivo") {
-            HStack {
-                Label("Recomposição", systemImage: "figure.strengthtraining.traditional")
-                    .foregroundStyle(Palette.muscle)
-                Spacer()
-                Text("perder gordura, manter músculo")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .multilineTextAlignment(.trailing)
+            HStack(alignment: .firstTextBaseline) {
+                Image(systemName: "target").foregroundStyle(Palette.muscle)
+                Text(label)
+                    .font(.subheadline)
+                    .multilineTextAlignment(.leading)
             }
         }
     }
 
+    /// Each number says where it came from. A weight typed into the config tab and
+    /// a weight read off a scale are both useful, but they are not the same claim,
+    /// and showing them identically would be quietly dishonest.
     @ViewBuilder
     private func bodySection(_ basis: Basis) -> some View {
-        Section("Corpo (medido)") {
-            row("Peso", value(basis.weightKg, "kg", decimals: 1))
-            row("Massa magra", value(basis.leanMassKg, "kg", decimals: 1))
+        Section("Corpo") {
+            if basis.weightKg != nil {
+                row("Peso", value(basis.weightKg, "kg", decimals: 1),
+                    caption: basis.provenance("weight"))
+            }
+            if basis.leanMassKg != nil {
+                row("Massa magra", value(basis.leanMassKg, "kg", decimals: 1),
+                    caption: "medido")
+            }
             row("Gasto diário (TDEE)", value(basis.tdeeKcal, "kcal", decimals: 0),
-                caption: "média de 14 dias, medida")
+                caption: tdeeCaption(basis))
+        }
+    }
+
+    private func tdeeCaption(_ basis: Basis) -> String {
+        switch basis.sources?["tdee"] {
+        case "measured": return "média de 14 dias, medida"
+        case "declared": return "estimado a partir do que indicaste"
+        case "default":  return "valor por defeito — indica os teus dados no config"
+        default:         return "média de 14 dias, medida"
+        }
+    }
+
+    /// What the app is tracking for this person, and what it deliberately is not.
+    /// Without this the absence of a whole screen looks like a bug.
+    @ViewBuilder
+    private func measuringSection(_ caps: Capabilities) -> some View {
+        Section("O que a app acompanha") {
+            ForEach(caps.domains, id: \.self) { domain in
+                Label(Self.domainLabel(domain), systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(Palette.goodText)
+                    .font(.subheadline)
+            }
+            ForEach(caps.blindSpots, id: \.self) { domain in
+                Label(Self.domainLabel(domain), systemImage: "circle.dashed")
+                    .foregroundStyle(.secondary)
+                    .font(.subheadline)
+            }
+        }
+    }
+
+    private static func domainLabel(_ domain: String) -> String {
+        switch domain {
+        case "nutrition": return "Alimentação"
+        case "sleep":     return "Sono e recuperação"
+        case "activity":  return "Atividade e treino"
+        case "body":      return "Composição corporal"
+        case "digestion": return "Digestão"
+        default:          return domain.capitalized
         }
     }
 

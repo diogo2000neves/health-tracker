@@ -877,6 +877,14 @@ class TestCoachEndpoints:
         monkeypatch.setattr(ingest, "_all_meal_rows", a_week_of_meals)
         monkeypatch.setattr(ingest, "_resolved_targets_and_basis",
                             lambda: (TARGETS, {"weight_kg": 68.25}))
+        # No tab reads in a unit test. Without this the capability read and the
+        # coach's daily_summary window both reach for a real Sheets client and
+        # spend their retry budget failing, which is slow and proves nothing.
+        # An empty grid is also the honest default here: no `config` tab means
+        # full capabilities, and no metric rows means no non-food findings — so
+        # these tests keep exercising exactly the food-only path they were
+        # written for.
+        monkeypatch.setattr(ingest, "_read_tab", lambda tab: [])
         monkeypatch.setattr(ingest, "_tz", lambda: None)
         real_datetime = ingest.datetime
 

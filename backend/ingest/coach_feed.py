@@ -11,6 +11,12 @@ for a specific stretch of the day:
       last meal
     Sunday      weekly_review the week in food — one pattern, one swap
     any         pattern       "Peixe: nada registado em 12 dias"
+    any         link          "Nas noites a seguir a jantares tardios, menos 18 min
+                               de sono profundo" — a measured cross-domain effect
+
+A card carries a `domain` (nutrition, sleep, activity, body, digestion, link). The
+food cards keep their central place, but a `pattern` can now come from any domain
+and is chosen on severity against all the others — see `eligible_findings`.
 
 Generation follows when the user actually eats: a logged meal schedules a run an hour
 later and each further meal pushes it back, so the day summary arrives when dinner is
@@ -59,8 +65,18 @@ SLOTS = ("morning", "afternoon", "evening", "weekly", "adhoc")
 # habit gets one mention per week at most.
 PATTERN_COOLDOWN_DAYS = 8
 
+# A link is a slow, structural observation about how this person works — "late
+# dinners cost you deep sleep" does not become untrue, or more useful, by being said
+# again on Thursday. It gets a much longer silence than a food pattern.
+LINK_COOLDOWN_DAYS = 21
+
 # A finding may jump its cooldown if it got this much worse (absolute severity).
 SEVERITY_ESCALATION = 0.2
+
+# At most this many findings from any one domain may reach a single generation. The
+# whole point of ranking every domain in one list is that the most important thing
+# wins; the whole point of this cap is that it cannot then win five times over.
+MAX_FINDINGS_PER_DOMAIN = 1
 
 # At most this many cards live in the feed at once — a feed you scroll is a feed you
 # skim, and the whole point is that the top card is worth reading.
@@ -77,6 +93,10 @@ _TTL_HOURS = {
     "check_in": 7,
     "day_summary": 13,
     "pattern": 72,
+    # A link describes how this person works, not what happened today, so it stays
+    # up for days — long enough to be seen at least twice, which is what it takes to
+    # act on something structural.
+    "link": 5 * 24,
     "weekly_review": 8 * 24,
     "win": 48,
 }
@@ -89,6 +109,10 @@ _PRIORITY = {
     "day_plan": 90,
     "day_summary": 88,
     "weekly_review": 80,
+    # Above a plain pattern: a link is the rarest thing the coach produces and the
+    # one the user could not have worked out alone. Still below the cards about
+    # today, which are what the app was opened for.
+    "link": 70,
     "pattern": 60,
     "win": 40,
 }
@@ -110,23 +134,55 @@ def _wants(slot: str) -> Tuple[str, ...]:
 
 
 def eligible_findings(profile: Dict[str, Any], state: Dict[str, Any], *,
-                      today: str, limit: int = 2) -> List[Dict[str, Any]]:
+                      today: str, limit: int = 2,
+                      extra: Sequence[Dict[str, Any]] = (),
+                      per_domain: int = MAX_FINDINGS_PER_DOMAIN
+                      ) -> List[Dict[str, Any]]:
     """The findings a feed may show today: highest severity first, minus anything
-    still inside its cooldown (unless it has got materially worse)."""
+    still inside its cooldown (unless it has got materially worse).
+
+    `extra` carries the non-food domains (sleep, activity, body, digestion) and the
+    cross-domain links. They are ranked in the SAME list as the food findings rather
+    than appended after them, because a coach that always leads with food and
+    mentions sleep at the bottom is one that never really changed — the thing worth
+    saying today wins on severity, whatever it is about.
+
+    `per_domain` is what stops one bad week monopolising the feed. A rough fortnight
+    of sleep can easily produce the four highest-severity findings in the list; the
+    budget keeps at most one or two and lets the next domain through, so the user
+    still hears about food on a week they slept badly.
+    """
     shown = (state or {}).get("shown") or {}
+    pool = list(profile.get("findings", [])) + list(extra)
+    # Food findings carry no `domain` (they predate the concept and there is no
+    # reason to rewrite them); absent means nutrition.
+    pool.sort(key=lambda f: -float(f.get("severity") or 0))
+
     out: List[Dict[str, Any]] = []
-    for finding in profile.get("findings", []):
+    used: Dict[str, int] = {}
+    for finding in pool:
         record = shown.get(finding["id"])
         if isinstance(record, dict):
             days = _days_between(str(record.get("date") or ""), today)
-            worse = finding["severity"] - float(record.get("severity") or 0)
-            if days is not None and days < PATTERN_COOLDOWN_DAYS \
+            worse = float(finding.get("severity") or 0) \
+                - float(record.get("severity") or 0)
+            if days is not None and days < _cooldown_days(finding) \
                     and worse < SEVERITY_ESCALATION:
                 continue
+        domain = finding.get("domain") or "nutrition"
+        if used.get(domain, 0) >= per_domain:
+            continue
+        used[domain] = used.get(domain, 0) + 1
         out.append(finding)
         if len(out) >= limit:
             break
     return out
+
+
+def _cooldown_days(finding: Dict[str, Any]) -> int:
+    """How long this finding stays off the feed once shown."""
+    return LINK_COOLDOWN_DAYS if finding.get("domain") == "link" \
+        else PATTERN_COOLDOWN_DAYS
 
 
 def _swaps_pt(options: Dict[str, Any]) -> Dict[str, Any]:
@@ -148,7 +204,9 @@ def build_facts(*, slot: str, now: datetime, profile: Dict[str, Any],
                 today: Dict[str, Any], nutrients: Dict[str, Any],
                 memory: Dict[str, Any], findings: Sequence[Dict[str, Any]],
                 weekly: Optional[Dict[str, Any]] = None,
-                recent_titles: Sequence[str] = ()) -> Dict[str, Any]:
+                recent_titles: Sequence[str] = (),
+                metrics: Optional[Dict[str, Any]] = None,
+                capabilities: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """The prompt payload: food patterns FIRST, nutrients as supporting evidence.
 
     That ordering is the entire content fix. The old prompt led with a nutrient
@@ -197,12 +255,21 @@ def build_facts(*, slot: str, now: datetime, profile: Dict[str, Any],
                         for s in profile.get("streaks", [])[:3]],
         },
         "findings": [
-            {"id": f["id"], "kind": f["kind"], "fact": f["headline"],
-             "evidence": f["evidence"], "foods": f["foods"],
+            {"id": f["id"], "kind": f["kind"],
+             # The domain is what selects the specialist frame in the prompt and
+             # what the card is filed under, so it travels with every finding.
+             "domain": f.get("domain") or "nutrition",
+             "fact": f["headline"],
+             "evidence": f["evidence"], "foods": f.get("foods", []),
              "swap_options": _swaps_pt(profile.get("swaps", {}).get(f["id"], {}))}
             for f in findings
         ],
         "today": today,
+        # What the tracker and the scale measured, already reduced to the handful of
+        # numbers a card could honestly cite. Deliberately NOT the raw 80-column
+        # window: the findings above are the analysis, and handing the model the
+        # whole table as well would invite it to do its own — badly.
+        "body_and_activity": metrics or None,
         "nutrients_supporting": nutrients,
         "foods_the_user_eats": [
             # `group` is the pt-PT label, not the taxonomy id: nothing reads a
@@ -216,6 +283,11 @@ def build_facts(*, slot: str, now: datetime, profile: Dict[str, Any],
         "memory": (memory or {}).get("facts", [])[:20],
         "weekly": weekly,
         "already_said_recently": list(recent_titles)[:6],
+        # What this person measures at all. The model is told its blind spots
+        # explicitly rather than left to infer them from absent keys: given no sleep
+        # data it will still write confident sleep advice unless it is told the data
+        # does not exist.
+        "capabilities": capabilities,
     }
 
 
@@ -350,6 +422,7 @@ def _card(*, kind: str, slot: str, date: str, now: datetime, title: str, body: s
           swap: Optional[Dict[str, Any]] = None,
           plates: Optional[List[Dict[str, Any]]] = None,
           priority_bonus: float = 0.0,
+          domain: str = "nutrition",
           next_slot: str = "") -> Dict[str, Any]:
     card = {
         "id": card_id(date=date, kind=kind, topic=topic),
@@ -361,6 +434,9 @@ def _card(*, kind: str, slot: str, date: str, now: datetime, title: str, body: s
         "context": slot_for(now),
         "date": date,
         "topic": topic or None,
+        # Which area of the person's life this card is about. The app groups and
+        # colours by it, and the feed budgets by it.
+        "domain": domain,
         "created_at": now.isoformat(timespec="seconds"),
         "expires_at": _expires(kind, now),
         "priority": round(_PRIORITY.get(kind, 50) + priority_bonus, 2),
@@ -383,7 +459,10 @@ def build_generation_facts(*, slot: str, now: datetime, profile: Dict[str, Any],
                            memory: Dict[str, Any], state: Dict[str, Any],
                            next_meal: Optional[Dict[str, Any]] = None,
                            weekly: Optional[Dict[str, Any]] = None,
-                           recent: Sequence[Dict[str, str]] = ()
+                           recent: Sequence[Dict[str, str]] = (),
+                           metric_findings: Sequence[Dict[str, Any]] = (),
+                           metrics: Optional[Dict[str, Any]] = None,
+                           capabilities: Optional[Dict[str, Any]] = None
                            ) -> Dict[str, Any]:
     """Everything the model is given, for the whole feed, in one object.
 
@@ -394,14 +473,19 @@ def build_generation_facts(*, slot: str, now: datetime, profile: Dict[str, Any],
     """
     date = now.date().isoformat()
     wants = _wants(slot)
-    findings = (eligible_findings(profile, state, today=date)
+    findings = (eligible_findings(profile, state, today=date, extra=metric_findings)
                 if "pattern" in wants else [])
     facts = build_facts(slot=slot, now=now, profile=profile, today=today,
                         nutrients=nutrients, memory=memory, findings=findings,
-                        weekly=weekly,
+                        weekly=weekly, metrics=metrics, capabilities=capabilities,
                         recent_titles=[r.get("title", "") for r in recent])
+    # A `link` finding asks for a different card than a `pattern` does: it explains a
+    # mechanism rather than naming a habit, so it gets its own kind and its own
+    # section of the prompt.
+    has_link = any(f.get("domain") == "link" for f in findings)
+    has_pattern = any(f.get("domain") != "link" for f in findings)
     facts["wanted_cards"] = [k for k in wants if k not in ("next_meal", "pattern")] \
-        + (["pattern"] if findings else [])
+        + (["pattern"] if has_pattern else []) + (["link"] if has_link else [])
     facts["wanted_next_meal"] = "next_meal" in wants
     if next_meal is not None:
         facts["next_meal"] = next_meal
@@ -465,20 +549,33 @@ def assemble(answer: Dict[str, Any], *, slot: str, now: datetime,
             continue
 
         finding = by_finding.get(ref)
-        if kind == "pattern":
+        if kind in ("pattern", "link"):
             if not finding:
-                # A "pattern" card with no finding behind it is exactly the
-                # untethered advice this rebuild exists to remove.
-                log.info("dropping pattern card with unknown ref %r", ref)
+                # A card with no finding behind it is exactly the untethered advice
+                # this rebuild exists to remove. For a `link` it is the stricter
+                # rule that matters most: the model may not claim a correlation the
+                # engine did not measure.
+                log.info("dropping %s card with unknown ref %r", kind, ref)
+                continue
+            is_link = finding.get("domain") == "link"
+            if is_link != (kind == "link"):
+                # A link finding must produce a link card and vice versa — the two
+                # kinds carry different evidence and read differently in the app.
+                log.info("dropping %s card pointing at a %s finding", kind,
+                         finding.get("domain"))
                 continue
             cards.append(_card(
-                kind="pattern", slot=slot, date=date, now=now, title=title,
+                kind=kind, slot=slot, date=date, now=now, title=title,
                 body=body, topic=finding.get("group") or finding["kind"],
+                domain=finding.get("domain") or "nutrition",
                 chips=_chips(entry.get("chips")),
                 evidence={"finding": finding["id"], "fact": finding["headline"],
                           **finding["evidence"]},
-                swap=_validated_swap(entry.get("swap"), profile=profile,
-                                     finding=finding),
+                # Only a food finding can carry a swap; a sleep or link card has no
+                # food to trade, and `_validated_swap` would rightly reject one.
+                swap=(_validated_swap(entry.get("swap"), profile=profile,
+                                      finding=finding)
+                      if finding.get("foods") else None),
                 priority_bonus=10 * finding["severity"]))
             shown[finding["id"]] = {"date": date, "severity": finding["severity"]}
             continue

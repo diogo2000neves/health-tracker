@@ -47,13 +47,29 @@ struct TrendsView: View {
 
     @ViewBuilder
     private func content(_ days: [HealthDay]) -> some View {
+        // Each card is gated on the block it draws, so a user with no scale sees a
+        // screen about what they DO measure rather than three empty charts with a
+        // dash in every tile. Adherence is always shown: it reads logged intake,
+        // which every user has.
+        let caps = today.response?.caps ?? .full
         ScrollView {
             VStack(spacing: 16) {
-                RecompCard(days: days)
-                BodyChartsCard(days: days)
-                EnergyBalanceTrendCard(days: days)
+                if caps.has("body") {
+                    RecompCard(days: days)
+                    BodyChartsCard(days: days)
+                }
+                if caps.has("body") && caps.has("activity") {
+                    // The energy-balance loop needs both sides: calories out from
+                    // the tracker, and a weigh-in to show what they did.
+                    EnergyBalanceTrendCard(days: days)
+                }
                 AdherenceCard(days: days, today: today)
-                OutcomesCard(days: days)
+                if caps.has("activity") {
+                    TrainingCard(days: days)
+                }
+                if caps.has("sleep") || caps.has("recovery") {
+                    OutcomesCard(days: days)
+                }
             }
             .padding(16)
         }
@@ -393,6 +409,52 @@ private struct Heatmap: View {
             RoundedRectangle(cornerRadius: 2).fill(state.color).frame(width: 10, height: 10)
             Text(label).font(.caption2).foregroundStyle(.secondary)
         }
+    }
+}
+
+// MARK: - Training (an INPUT, so it belongs above the outcomes)
+
+/// Deliberately separate from the outcomes card below: training is something you
+/// *did* on the day, while sleep and recovery are what the body did afterwards. The
+/// headline is strength sessions per week, not steps — that is the number that
+/// decides whether a deficit costs muscle.
+private struct TrainingCard: View {
+    let days: [HealthDay]
+
+    private static let strengthWords = ["strength", "weight", "resistance",
+                                        "força", "musculação"]
+
+    var body: some View {
+        let workoutMins = series(days) { $0.activity?.workoutMins.map(Double.init) }
+        let steps = series(days) { $0.activity?.steps.map(Double.init) }
+        let recent = days.suffix(28)
+        let strengthDays = recent.filter { day in
+            let types = (day.activity?.workoutTypes ?? "").lowercased()
+            return Self.strengthWords.contains { types.contains($0) }
+        }.count
+        let weeks = max(1.0, Double(recent.count) / 7.0)
+        let perWeek = Double(strengthDays) / weeks
+
+        VStack(alignment: .leading, spacing: 14) {
+            SectionHeader(title: "Treino",
+                          systemImage: "figure.strengthtraining.traditional")
+            HStack(spacing: 10) {
+                OutcomeTile(title: "Força / semana",
+                            value: perWeek > 0
+                                ? perWeek.formatted(.number.precision(.fractionLength(1)))
+                                : "—",
+                            spark: workoutMins, color: Palette.muscle)
+                OutcomeTile(title: "Último treino",
+                            value: workoutMins.last.map { "\(Int($0.value)) min" } ?? "—",
+                            spark: workoutMins, color: Palette.protein)
+                OutcomeTile(title: "Passos",
+                            value: steps.last.map { "\(Int($0.value))" } ?? "—",
+                            spark: steps, color: Palette.accent)
+            }
+            Text("O treino de força é o que protege o músculo enquanto perdes gordura — conta mais do que os passos.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .card()
     }
 }
 

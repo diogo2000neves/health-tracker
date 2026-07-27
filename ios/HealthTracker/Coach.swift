@@ -107,6 +107,10 @@ struct CoachCard: Decodable, Identifiable, Hashable {
     let date: String?
     /// The food group or finding the card is about ("fish_white"), when it has one.
     let topic: String?
+    /// Which area of life this card is about: nutrition, sleep, activity, body,
+    /// digestion, or link. Absent on a payload written before domains existed, so
+    /// it defaults to nutrition — which is what every card back then was.
+    let domain: String
     let createdAt: String?
     let priority: Double
     let title: String
@@ -124,7 +128,8 @@ struct CoachCard: Decodable, Identifiable, Hashable {
     var kind: CoachCardKind { CoachCardKind(kindRaw) }
 
     enum CodingKeys: String, CodingKey {
-        case id, kind, slot, date, topic, priority, title, body, chips, swap, plates
+        case id, kind, slot, date, topic, domain, priority, title, body, chips
+        case swap, plates
         case createdAt = "created_at"
         case nextSlot = "next_slot"
         case threadId = "thread_id"
@@ -137,6 +142,7 @@ struct CoachCard: Decodable, Identifiable, Hashable {
         slot = try c.decodeIfPresent(String.self, forKey: .slot)
         date = try c.decodeIfPresent(String.self, forKey: .date)
         topic = try c.decodeIfPresent(String.self, forKey: .topic)
+        domain = try c.decodeIfPresent(String.self, forKey: .domain) ?? "nutrition"
         createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt)
         priority = try c.decodeIfPresent(Double.self, forKey: .priority) ?? 0
         title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
@@ -162,6 +168,11 @@ enum CoachCardKind: String {
     case weeklyReview = "weekly_review"
     case nextMeal = "next_meal"
     case pattern
+    /// A measured relationship between two areas of the user's life (late dinners
+    /// and deep sleep, training and protein). The rarest card and the one the user
+    /// could not have worked out alone, so it gets its own identity rather than
+    /// reading as one more pattern.
+    case link
     case win
     case unknown
 
@@ -177,6 +188,7 @@ enum CoachCardKind: String {
         case .weeklyReview: return "A TUA SEMANA"
         case .nextMeal: return "A PRÓXIMA REFEIÇÃO"
         case .pattern: return "UM PADRÃO"
+        case .link: return "UMA LIGAÇÃO"
         case .win: return "A CORRER BEM"
         case .unknown: return "DO COACH"
         }
@@ -190,6 +202,7 @@ enum CoachCardKind: String {
         case .weeklyReview: return "calendar"
         case .nextMeal: return "fork.knife"
         case .pattern: return "chart.bar.doc.horizontal.fill"
+        case .link: return "arrow.triangle.branch"
         case .win: return "checkmark.seal.fill"
         case .unknown: return "sparkles"
         }
@@ -199,6 +212,7 @@ enum CoachCardKind: String {
         switch self {
         case .win: return Palette.goodText
         case .pattern: return Palette.warningText
+        case .link: return Palette.muscle
         case .nextMeal: return Palette.accentText
         case .weeklyReview: return Palette.protein
         default: return Palette.accentText

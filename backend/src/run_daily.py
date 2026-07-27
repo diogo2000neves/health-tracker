@@ -4,8 +4,9 @@ Each run (Cloud Run Job):
 
   1. Pulls **Fitbit Air biometrics** from the Google Health API — sleep (stages,
      efficiency, naps kept apart), overnight recovery (resting HR, HRV, SpO2,
-     respiration, skin temperature) and activity (steps, distance, calories out,
-     active/zone minutes, heart-rate range) — and merges them per civil day.
+     respiration, skin temperature), activity (steps, distance, calories out,
+     active/zone minutes, heart-rate range) and exercise sessions (workout count,
+     minutes, calories and type) — and merges them per civil day.
   2. Rolls meals logged in the ``meals`` tab into ``daily_summary`` nutrition
      totals per day; non-food shots and failed analyses are ignored.
 
@@ -29,7 +30,7 @@ Each family becomes final at a different moment, which is the whole shape of thi
 file (see fetch_biometrics and daily_nutrition):
 
   * sleep + recovery -> final when the user WAKES  -> written to today's row
-  * activity         -> final at MIDNIGHT          -> today is never written
+  * activity + exercise -> final at MIDNIGHT       -> today is never written
   * nutrition        -> final at the 05:00 cutoff  -> today is never totalled
 
 So a fresh row grows in three steps: this morning it holds last night's sleep,
@@ -75,9 +76,12 @@ from src.analysis import (
     BASELINE_HEADERS,
     baseline_rows,
 )
-from src.biometrics import biometric_days, daily_activity, daily_recovery, daily_sleep
+from schema.capabilities import FULL, Capabilities, from_config
+from src.biometrics import (
+    biometric_days, daily_activity, daily_exercise, daily_recovery, daily_sleep,
+)
 from src.google_health import (
-    DAILY_TYPES, ROLLUP_TYPES, SLEEP, GoogleHealthClient,
+    DAILY_TYPES, EXERCISE, ROLLUP_TYPES, SLEEP, GoogleHealthClient,
 )
 from src.sheets import (
     BASELINES_TAB, DAILY_HEADERS, DAILY_TAB, MEALS_TAB, SheetClient, TIER1_NUTRIENTS,
@@ -167,18 +171,20 @@ def fetch_biometrics(client: GoogleHealthClient, start: str, end: str,
     route to `total-calories`). A data type the tracker never produced just comes
     back empty and its columns stay blank.
 
-    `activity_end` (exclusive; defaults to `end`) bounds the ROLLUP types on their
-    own, because the three families stop changing at different moments and lumping
-    them together is what put a half-day's calories on a day still under way:
+    `activity_end` (exclusive; defaults to `end`) bounds the ROLLUP types and
+    exercise sessions on their own, because the three families stop changing at
+    different moments and lumping them together is what put a half-day's calories
+    on a day still under way:
 
       * **sleep** and **recovery** describe the night that just ENDED. They are
         final the moment the user wakes, so today is fair game — indeed today's row
         is exactly where they belong (sleep is keyed on the wake day).
-      * **activity** accumulates until midnight. Today's rollup is a *partial* day
-        that looks identical to a finished one — 903 kcal at 11:00 reads like a
-        person who burned 903 kcal all day. Callers pass today here so it is never
-        fetched, matching the rule nutrition already follows: only total a day once
-        it is over.
+      * **activity** and **exercise** accumulate until midnight — a workout can
+        still be running mid-day just like a rollup can still be mid-day. Today's
+        figures are a *partial* day that looks identical to a finished one — 903
+        kcal at 11:00 reads like a person who burned 903 kcal all day. Callers pass
+        today here so neither is ever fetched, matching the rule nutrition already
+        follows: only total a day once it is over.
     """
     sleep_points = client.list_data_points(SLEEP, family="sleep", start=start, end=end)
     recovery_points = {
@@ -187,15 +193,21 @@ def fetch_biometrics(client: GoogleHealthClient, start: str, end: str,
         for data_type in DAILY_TYPES
     }
     first = date.fromisoformat(start)
-    last_activity = date.fromisoformat(activity_end or end)
+    activity_end = activity_end or end
+    last_activity = date.fromisoformat(activity_end)
+    day_has_finished = last_activity > first
     activity_points = {
         data_type: client.daily_rollup(data_type, first, last_activity)
         for data_type in ROLLUP_TYPES
-    } if last_activity > first else {}
+    } if day_has_finished else {}
+    exercise_points = client.list_data_points(
+        EXERCISE, family="exercise", start=start, end=activity_end
+    ) if day_has_finished else []
     return biometric_days(
         daily_sleep(sleep_points),
         daily_recovery(recovery_points),
         daily_activity(activity_points),
+        daily_exercise(exercise_points),
         start=start,
     )
 
@@ -315,7 +327,7 @@ def build_daily_rows(*sources: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]
 
 # -- derived views --------------------------------------------------------------
 def rebuild_views(sheet: SheetClient) -> Dict[str, int]:
-    """Regenerate the `analysis` and `baselines` tabs from daily_summary.
+    """Regenerate the `baselines` tab from daily_summary.
 
     Wholesale replacement, not incremental: these are pure functions of the
     observations, so rebuilding is both simpler and drift-proof. A stale derived
@@ -327,6 +339,22 @@ def rebuild_views(sheet: SheetClient) -> Dict[str, int]:
     sheet.replace_tab(BASELINES_TAB, [BASELINE_HEADERS] + baselines)
     return {"baselines": len(baselines)}
 
+
+
+# -- capabilities ---------------------------------------------------------------
+# The `config` tab is owned by the ingest service (it creates and seeds it, because
+# that is where a user's first request lands). The job only ever reads it, and reads
+# it defensively: a missing tab, an empty tab or a permissions blip all mean "assume
+# everything", which is exactly how this job behaved before capabilities existed.
+CONFIG_TAB = "config"
+
+
+def read_capabilities(sheet: SheetClient) -> Capabilities:
+    try:
+        return from_config(sheet.read_rows(CONFIG_TAB))
+    except Exception as err:
+        print(f"config: unreadable ({err}) — assuming full capabilities")
+        return FULL
 
 
 # -- entry point ----------------------------------------------------------------
@@ -356,11 +384,21 @@ def main() -> None:
     tz = ZoneInfo(os.environ.get("HEALTH_TZ", "Europe/Lisbon"))
     today = datetime.now(tz).date()
 
+    # What this user actually measures. A phone-only user has no tracker and no
+    # token, so there is nothing here to fetch — and reaching for one would spend a
+    # minute failing on every run. Read from the same `config` tab the ingest
+    # service uses, and defaulting to "everything" when the tab doesn't exist, so an
+    # existing deployment behaves exactly as it did before.
+    caps = read_capabilities(sheet)
+
     # 1. Fitbit Air biometrics. Never fatal: a token/API problem must not also cost
     #    us the nutrition roll-up, which needs nothing but the Sheet.
     biometrics: Dict[str, Dict[str, Any]] = {}
     bio_note = "skipped (no window)"
-    if start:
+    if not caps.needs_google_health():
+        bio_note = "skipped (this user has no tracker)"
+        print(f"biometrics: {bio_note}")
+    elif start:
         try:
             client = GoogleHealthClient(load_health_credentials())
             # Two different ends, on purpose (see fetch_biometrics): sleep and

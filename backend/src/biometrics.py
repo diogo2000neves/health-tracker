@@ -3,7 +3,7 @@
 Pure transforms — no network, no sheet — so every rule below is unit-tested.
 ``src/google_health.py`` fetches; this decides what a day's numbers mean.
 
-Three shapes arrive, and each keys its day differently:
+Four shapes arrive, and each keys its day differently:
 
 * **Sleep sessions** — a session spans midnight, so it belongs to the day the user
   *woke up on* (the API agrees: it filters sleep on `civil_end_time`). Naps are
@@ -12,6 +12,10 @@ Three shapes arrive, and each keys its day differently:
   corrupts it.
 * **Daily summaries** — already carry a civil `date`; taken as-is.
 * **Rollups** — already aggregated per civil day by the server.
+* **Exercise sessions** — a workout belongs to the day it *started* (the API
+  filters on `civil_start_time`, the opposite convention from sleep, because a
+  workout never spans a "wake" the way a night does). Several sessions on one day
+  are summed, not overwritten.
 
 Two traps this module exists to absorb:
 
@@ -295,10 +299,56 @@ def daily_activity(by_type: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Dict[s
             for day, cols in out.items()}
 
 
+# -- exercise (session list) ----------------------------------------------------
+def daily_exercise(points: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Workout sessions -> date -> {workout_count, workout_mins, workout_cals,
+    workout_types}.
+
+    Keyed on the local day the session STARTED — the API's own filter convention
+    (`exercise.interval.civil_start_time`) and the natural grain for a workout,
+    unlike sleep which is keyed on when it ended. Several sessions on the same day
+    (e.g. a walk and a lift) fold into one row instead of overwriting each other;
+    `workout_types` lists each distinct type once, in the order first started.
+    """
+    days: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {"count": 0, "mins": 0.0, "cals": 0.0, "types": []})
+
+    for point in points:
+        exercise = point.get("exercise") or {}
+        interval = exercise.get("interval") or {}
+        start = _local(interval.get("startTime", ""), interval.get("startUtcOffset"))
+        if start is None:
+            continue
+        bucket = days[start.date().isoformat()]
+        bucket["count"] += 1
+        duration = _duration_s(exercise.get("activeDuration"))
+        if duration:
+            bucket["mins"] += duration / 60
+        cals = _num((exercise.get("metricsSummary") or {}).get("caloriesKcal"))
+        if cals:
+            bucket["cals"] += cals
+        kind = str(exercise.get("exerciseType") or "").replace("_", " ").strip().lower()
+        if kind and kind not in bucket["types"]:
+            bucket["types"].append(kind)
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for day, bucket in days.items():
+        cols: Dict[str, Any] = {"workout_count": bucket["count"]}
+        if bucket["mins"]:
+            cols["workout_mins"] = _round(bucket["mins"])
+        if bucket["cals"]:
+            cols["workout_cals"] = _round(bucket["cals"])
+        if bucket["types"]:
+            cols["workout_types"] = ", ".join(bucket["types"])
+        out[day] = cols
+    return out
+
+
 # -- merge ---------------------------------------------------------------------
 def biometric_days(sleep: Dict[str, Dict[str, Any]],
                    recovery: Dict[str, Dict[str, Any]],
                    activity: Dict[str, Dict[str, Any]],
+                   exercise: Dict[str, Dict[str, Any]],
                    start: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
     """date -> the biometric columns for that day.
 
@@ -309,13 +359,14 @@ def biometric_days(sleep: Dict[str, Dict[str, Any]],
     date, append the day twice.
     """
     out: Dict[str, Dict[str, Any]] = {}
-    for day in sorted(set(sleep) | set(recovery) | set(activity)):
+    for day in sorted(set(sleep) | set(recovery) | set(activity) | set(exercise)):
         if start and day < start:
             continue
         cols: Dict[str, Any] = {}
         cols.update(sleep.get(day, {}))
         cols.update(recovery.get(day, {}))
         cols.update(activity.get(day, {}))
+        cols.update(exercise.get(day, {}))
         if cols:
             out[day] = cols
     return out

@@ -1,0 +1,60 @@
+{
+  "_comment": [
+    "Tunable thresholds for the non-food findings, kept out of the code for the same",
+    "reason nutrient_policy.json is: these numbers encode judgement about what counts",
+    "as a genuine issue, and judgement should be reviewable and changeable without a",
+    "deploy. Every value here has a built-in default in domain_findings.py, so",
+    "deleting a key is safe and deleting the file is safe."
+  ],
+
+  "bedtime_spread_mins": {
+    "_why": [
+      "The circular standard deviation of the time the user falls asleep. 60 min is",
+      "the point where a schedule stops being 'roughly the same time' — below it the",
+      "night-to-night variation is ordinary life, above it the body clock is being",
+      "asked to move, which shows up in deep sleep and next-day appetite."
+    ],
+    "line": 60
+  },
+
+  "training": {
+    "_why": [
+      "Two strength sessions a week is the low end of what maintains muscle in a",
+      "calorie deficit; it is a floor, not a target. The gap rule is about naming a",
+      "pause while it is still a pause. `strength_types` matches against the free-text",
+      "workout_types column, so it carries both the API's English type names and the",
+      "Portuguese words the user might see."
+    ],
+    "strength_sessions_per_week": 2,
+    "max_gap_days": 5,
+    "strength_types": ["strength", "weight", "resistance", "força", "musculação"]
+  },
+
+  "body": {
+    "_why": [
+      "Bioimpedance readings are hydration-noisy, so these compare half-window means",
+      "and use thresholds well clear of the day-to-day swing. 0.4 kg of lean mass and",
+      "0.4 percentage points of body fat are both roughly one SD of a fortnight's",
+      "readings — smaller moves than that are not signal.",
+      "min_days is higher than the module's MIN_DAYS because a body composition trend",
+      "genuinely needs a fortnight before it means anything."
+    ],
+    "min_days": 14,
+    "lean_loss_kg": 0.4,
+    "fat_pct_move": 0.4
+  },
+
+  "digestion": {
+    "_why": [
+      "bowel_movement is blank-means-no, so the rule only reads days that carry any",
+      "self-report at all: a stretch where the user stopped logging must not read as",
+      "constipation. min_logged_days is what enforces that. 0.6 (roughly 4 days in 7)",
+      "is the low end of normal frequency, not a medical threshold — the finding names",
+      "a pattern and pairs it with fibre, and says nothing clinical."
+    ],
+    "window_days": 14,
+    "min_days": 10,
+    "min_logged_days": 7,
+    "min_rate": 0.6
+  }
+}

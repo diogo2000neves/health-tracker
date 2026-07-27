@@ -31,11 +31,19 @@ struct TodayResponse: Decodable {
     /// older payload still decodes; use `historyDays`. Powers the rolling-average and
     /// week-consistency lenses on the Nutrients screen.
     let history: [DayIntake]?
+    /// What this user actually measures. The app draws itself from this rather than
+    /// from a build-time constant, so turning a block on in the sheet changes the UI
+    /// on the next fetch with no release. Optional so an older cached payload still
+    /// decodes — `caps` falls back to "everything", which is what every build before
+    /// this one assumed.
+    let capabilities: Capabilities?
 
     enum CodingKeys: String, CodingKey {
-        case date, consumed, targets, basis, meals, history
+        case date, consumed, targets, basis, meals, history, capabilities
         case mealCount = "meal_count"
     }
+
+    var caps: Capabilities { capabilities ?? .full }
 
     func consumed(_ key: String) -> Double { consumed[key] ?? 0 }
 
@@ -106,6 +114,11 @@ struct Basis: Decodable, Hashable {
     let proteinGPerKg: Double?
     let calorieDeficitPct: Double?
     let goal: String?
+    let goalLabelPt: String?
+    /// Which layer each input came from: "measured", "declared" or "default". The
+    /// Profile screen labels every number with it, so a figure typed into the config
+    /// tab is never shown as though a scale had produced it.
+    let sources: [String: String]?
 
     enum CodingKeys: String, CodingKey {
         case tdeeKcal = "tdee_kcal"
@@ -114,7 +127,51 @@ struct Basis: Decodable, Hashable {
         case leanMassKg = "lean_mass_kg"
         case proteinGPerKg = "protein_g_per_kg"
         case calorieDeficitPct = "calorie_deficit_pct"
-        case goal
+        case goalLabelPt = "goal_label_pt"
+        case goal, sources
+    }
+
+    /// How a derived number should be described to the user, in pt-PT.
+    func provenance(_ key: String) -> String? {
+        switch sources?[key] {
+        case "measured": return "medido"
+        case "declared": return "indicado por ti"
+        case "default":  return "valor por defeito"
+        default:         return nil
+        }
+    }
+}
+
+/// What this user measures, aims at, and has told us — the one switch the whole app
+/// reads. See `schema/capabilities.py`: a set of blocks, deliberately not a level,
+/// because someone with a watch but no scale is not "level 2.5".
+struct Capabilities: Decodable, Hashable {
+    let blocks: [String]
+    let domains: [String]
+    let blindSpots: [String]
+    let goal: String
+    let goalLabelPt: String
+
+    enum CodingKeys: String, CodingKey {
+        case blocks, domains, goal
+        case blindSpots = "blind_spots"
+        case goalLabelPt = "goal_label_pt"
+    }
+
+    /// Every block on — what every build before capabilities existed assumed, and
+    /// the right fallback for a payload that predates them.
+    static let full = Capabilities(
+        blocks: ["self_report", "sleep", "recovery", "activity", "nutrition", "body"],
+        domains: ["nutrition", "sleep", "activity", "body", "digestion"],
+        blindSpots: [], goal: "recomposition",
+        goalLabelPt: "recomposição corporal — perder gordura mantendo músculo")
+
+    func has(_ block: String) -> Bool { blocks.contains(block) }
+
+    /// True when there is any measured body/activity data at all — the gate for the
+    /// whole Trends screen, which is otherwise three empty charts.
+    var hasAnyMetrics: Bool {
+        has("body") || has("activity") || has("sleep") || has("recovery")
     }
 }
 

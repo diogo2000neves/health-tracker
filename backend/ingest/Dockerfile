@@ -28,6 +28,12 @@ COPY ingest/food_taxonomy.py .
 COPY ingest/food_patterns.py .
 COPY ingest/coach_feed.py .
 COPY ingest/coach_memory.py .
+# The non-food half of the coach: the deterministic findings for sleep, training,
+# body composition and digestion (with the thresholds that encode their judgement),
+# and the cross-domain link engine. Both are pure stdlib and loaded by name.
+COPY ingest/domain_findings.py .
+COPY ingest/domain_policy.json .
+COPY ingest/links.py .
 # The memory tiers: the append-only archive of everything the coach has said, the
 # event detector that reads the user's own meal notes, the budgeted retrieval that
 # decides what a prompt gets to see, and the weekly/monthly/yearly rollups.

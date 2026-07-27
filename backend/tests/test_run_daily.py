@@ -45,20 +45,25 @@ def test_activity_stops_at_today_while_sleep_runs_through_it():
     # activity stops at today (exclusive) — today's partial day is never asked for
     assert client.rollup_windows["total-calories"] == ("2026-07-10", "2026-07-17")
     assert client.rollup_windows["steps"] == ("2026-07-10", "2026-07-17")
+    # exercise follows the same rule as activity: a workout can still be running
+    # mid-day, so it stops at today too, not tomorrow like sleep does
+    assert client.list_windows["exercise"] == ("2026-07-10", "2026-07-17")
 
 
 def test_activity_end_defaults_to_end_for_plain_backfills():
     client = _FakeHealth()
     fetch_biometrics(client, "2026-07-10", "2026-07-17")
     assert client.rollup_windows["total-calories"] == ("2026-07-10", "2026-07-17")
+    assert client.list_windows["exercise"] == ("2026-07-10", "2026-07-17")
 
 
-def test_no_rollup_is_requested_when_no_civil_day_has_finished_yet():
+def test_no_rollup_or_exercise_is_requested_when_no_civil_day_has_finished_yet():
     # start == activity_end would be an empty (or inverted) range; the API 400s on
     # some of those, and there is nothing to ask for anyway.
     client = _FakeHealth()
     fetch_biometrics(client, "2026-07-17", "2026-07-18", activity_end="2026-07-17")
     assert client.rollup_windows == {}
+    assert "exercise" not in client.list_windows
     assert client.list_windows["sleep"] == ("2026-07-17", "2026-07-18")
 
 # -- nutrition rollup -------------------------------------------------------------

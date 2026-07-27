@@ -67,13 +67,24 @@ def weekly_facts(*, start: str, end: str, key: str,
                  profile: Dict[str, Any],
                  archive_entries: Sequence[Dict[str, Any]],
                  previous: Optional[Dict[str, Any]] = None,
-                 memory_facts: Sequence[Dict[str, Any]] = ()) -> Dict[str, Any]:
+                 memory_facts: Sequence[Dict[str, Any]] = (),
+                 metric_findings: Sequence[Dict[str, Any]] = (),
+                 days: Sequence[Dict[str, Any]] = (),
+                 capabilities: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """A week, in full: every meal with its items, everything the coach said, every
     conversation, and the deterministic group statistics.
 
     The week is small enough to include whole — seven days is perhaps twenty meals —
     and that completeness is the point. This is the one moment the model gets to see
     the raw material rather than a summary of it.
+
+    **This is also where breadth belongs.** A daily card is one idea about one
+    domain, because a card that tries to cover food, sleep and training at once
+    covers none of them. The week is the horizon that can afford the whole picture —
+    it runs once, the user reads all of it, and connecting the domains is precisely
+    what makes it worth reading. So `metric_findings` (every non-food finding and
+    every measured link, not just the one or two a daily feed had room for) and the
+    week's daily rows arrive here unbudgeted.
     """
     cards = [e for e in archive_entries if e.get("kind") == "card"]
     chats = [e for e in archive_entries if e.get("kind") == "chat"]
@@ -108,6 +119,20 @@ def weekly_facts(*, start: str, end: str, key: str,
             "findings": [{"fact": f["headline"], "severity": f["severity"]}
                          for f in profile.get("findings", [])[:8]],
         },
+        # Sleep, training, body composition, digestion — and the measured links
+        # between them and the food above. The daily feed sees one of these at a
+        # time; the review sees all of them, which is the only place the chains
+        # across a whole week can actually be read.
+        "the_rest_of_your_week": [
+            {"domain": f.get("domain"), "fact": f["headline"],
+             "evidence": f.get("evidence", {}), "severity": f.get("severity")}
+            for f in metric_findings
+        ] or None,
+        "daily_metrics": [
+            {k: v for k, v in day.items() if v not in (None, "")}
+            for day in days
+        ] or None,
+        "capabilities": capabilities,
         # What the coach actually said, day by day. The week's advice is as much a
         # subject of the review as the week's food: did it land, was it acted on, was
         # it the right thing to have said?

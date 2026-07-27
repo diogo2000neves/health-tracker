@@ -70,11 +70,12 @@ Two properties worth knowing:
 The tracker syncs to **Google Health** in the background — no app to open, nothing
 to tap — so unlike the scale, the API really is zero-touch here. The daily job
 pulls it with a **health-only** OAuth token (`health-oauth-token`; see gotcha 8)
-and fills ~40 columns per day. Scopes: `sleep.readonly`,
+and fills ~44 columns per day. Scopes: `sleep.readonly`,
 `health_metrics_and_measurements.readonly`, `activity_and_fitness.readonly`.
 
 Two endpoints, chosen per data type (`src/google_health.py`):
-* **`list`** for sleep sessions and the `daily-*` summaries (already one per day).
+* **`list`** for sleep sessions, exercise sessions and the `daily-*` summaries
+  (already one per day).
 * **`dailyRollUp`** for everything intraday (steps, distance, calories, heart
   rate…). It aggregates server-side over **civil** days — our exact day grain —
   instead of us summing ~200 one-minute buckets. It is also the *only* route to
@@ -97,11 +98,25 @@ Don't re-add a `sleep_score` column expecting the API to fill it.
 several non-nap sessions, the longest is the night and the rest become naps, so the
 sleep columns always describe one coherent sleep.
 
+**Exercise sessions are keyed on when they STARTED, not ended** — the opposite of
+sleep's convention (`exercise.interval.civil_start_time` vs
+`sleep.interval.civil_end_time`), because a workout never spans a "wake" the way a
+night does. Each session's type (`STRENGTH_TRAINING`, `WALKING`, `BIKING`, ...),
+active duration and calories are summed per day into `workout_count`,
+`workout_mins`, `workout_cals` and `workout_types` (`src/biometrics.daily_exercise`)
+— several sessions on one day (a walk and a lift, say) fold into the same row
+rather than overwriting each other. Fetched only up to `activity_end`, same as the
+rollup types: a workout can still be running mid-day, and a half-finished session
+must not read like a finished one. This data type came back **empty** the first
+time it was checked (2026-07-16) — the user hadn't started logging workouts on the
+tracker yet — and was re-verified populated on 2026-07-27; don't trust a stale
+"empty" note over a live re-check.
+
 **Not produced by this device** (verified empty against the live API, not guessed):
 floors and altitude (no altimeter), VO2 max / cardio fitness (needs a tracked run),
-exercise sessions, blood glucose, core body temperature. ECG and irregular-rhythm
-notifications sit behind their own extra scopes (`ecg`, `irn`) and were left
-ungranted — least privilege, and the hardware almost certainly lacks the sensor.
+blood glucose, core body temperature. ECG and irregular-rhythm notifications sit
+behind their own extra scopes (`ecg`, `irn`) and were left ungranted — least
+privilege, and the hardware almost certainly lacks the sensor.
 
 ### Source 3 — Meal photos
 iPhone **Shortcut** (a button in Control Center) → takes a photo → HTTP **POST**s
@@ -157,8 +172,9 @@ not the waking-day grain nutrition uses.
 unit, dtype, source, direction, plausible range, description and — the important
 one — its **causal window**. From it are generated: the sheet's header row and
 column order, the `schema` tab, the OCR plausibility bands the ingest service
-validates against, the causal alignment of the `analysis` tab, the iOS app's JSON
-and Swift types, and the SQL DDL. It is pure stdlib and copied into **both**
+validates against, the causal pairing exposed via `causal_inputs()` /
+`causal_outcomes()`, the iOS app's JSON and Swift types, and the SQL DDL. It is
+pure stdlib and copied into **both**
 container images (they can't import each other — which is exactly why the column
 list used to be hand-mirrored and able to drift). Change a column there, run
 `python -m src.maintenance`, done.
@@ -189,16 +205,67 @@ A row is an **observation of a date, not a causal unit**:
 
 So the food on row N is eaten *after* the sleep on row N. Correlating them on the
 same row asks *"did tomorrow's dinner affect last night's sleep?"* — backwards in
-time. Storage stays honest (each value stamped when measured); the fix lives in
-`src/analysis.py`, which pairs **inputs from day N with outcomes from day N+1**
-into the `analysis` tab, driven entirely by the registry's `causal` field.
+time. Storage stays honest (each value stamped when measured); the causal
+alignment is no longer materialised as a tab — `schema/registry.py`'s `causal`
+field (plus `causal_inputs()` / `causal_outcomes()`) is the remaining source of
+truth for pairing day N's inputs against day N+1's outcomes.
+
+**`ingest/links.py` is the one consumer of that field**, and it derives the lag
+rather than declaring it: an input on row N meets an outcome on row **N+1**, while
+an outcome on row N precedes that same row's inputs (offset **0**). Hand-writing a
+lag per hypothesis would reintroduce the exact off-by-one this field exists to
+prevent — so don't, and don't "simplify" `_offset` into a constant.
+
+## 2c. Capabilities — what a given user actually measures
+
+`schema/capabilities.py` + the sheet's **`config` tab**. One switch that decides what
+the API serves, what the app draws, and which domains the coach may speak about.
+
+**It is a set of blocks, not a level.** The obvious design is a ladder (level 1
+nutrition, level 2 add sleep…) and it breaks on the first real person: a friend with
+a watch but no scale is not "level 2.5". So the unit is the block — the vocabulary
+`registry.BLOCKS` already defines — and `PRESETS` (`nutrition`, `nutrition_sleep`,
+`nutrition_activity`, `full`) are only names for common sets.
+
+Everything else is *derived*, never separately configured:
+
+| from the blocks | what it decides |
+|---|---|
+| `columns()` | which sheet columns can ever be filled |
+| `sources()` / `needs_google_health()` | whether the daily job has anything to fetch at all — a phone-only user needs no OAuth and no scheduled job |
+| `visible_blocks()` | what `/daily` may serve (enforced server-side, so a stale client cannot ask its way past it) |
+| `domains()` / `blind_spots()` | which coach domains may produce findings, and which are named to the model as absent |
+| `can_link()` | a cross-domain link needs **both** its blocks, so a nutrition-only user gets none — absent, not silenced |
+
+**The declared profile.** The owner's calorie target derives from a *measured* TDEE
+and a *measured* weight. Someone with no watch and no scale has neither, so the
+config tab also carries sex/age/height/weight/activity level, used strictly as the
+lowest layer of `_derive_targets`:
+
+    manual override  >  measured  >  declared (Mifflin-St Jeor)  >  built-in constant
+
+`basis.sources` reports which layer each number came from, so the app never shows a
+declared figure as though a scale had produced it. **Goal is a separate axis** from
+capability (`GOALS` + `_GOAL_PARAMS`): owning a scale doesn't say what you're aiming
+at. It used to be hard-coded to "recomposição" in both the prompt and ProfileView.
+
+Reading it is deliberately un-fussy: a missing tab, a typo or a Sheets blip all fall
+back to **full capabilities**. Hiding a block the user really has looks like data
+loss, which is far worse than showing an empty one.
+
+**To onboard a friend**: point a deployment at their own sheet, set
+`blocks = nutrition` and their declared body in the `config` tab. Nothing else
+changes — no code path, no branch.
 
 ### The derived tabs (rebuilt every run, never edited)
-* **`analysis`** — the causally aligned view. Correlate here.
 * **`baselines`** — 28-day mean/SD/z per metric. An absolute value is
   uninterpretable (73 ms HRV is excellent for one person, a warning for another);
   against a personal baseline it becomes a sentence.
 * **`schema`** — the data dictionary, in the sheet next to the numbers.
+
+The causal alignment described above isn't a materialised tab — pair day N's
+inputs against day N+1's outcomes yourself using `schema/registry.py`'s `causal`
+field (`causal_inputs()` / `causal_outcomes()`).
 
 ## 3. Architecture
 
@@ -314,6 +381,81 @@ into the `analysis` tab, driven entirely by the registry's `causal` field.
 - Everything lives in GCP project **`health-tracker-501322`**, region
   **`europe-west1`**. Log-based alert policies email on any job error, ingest
   error, or failed build.
+
+## 3b. The Coach — depth without dilution
+
+The coach writes the cards in the app. Its founding rule is unchanged: **the model
+writes sentences; the code decides facts.** Every claim it can make originates in a
+deterministic module, and `coach_feed.assemble` re-attaches every id, expiry and
+piece of evidence rather than trusting the answer. What changed is that this now
+covers sleep, training, body composition and digestion — not only food.
+
+### The four layers
+
+1. **Findings, per domain, no model.** `food_patterns.build_findings` (food) and
+   `ingest/domain_findings.py` (everything else) produce the same finding shape.
+   Non-food rules are judged against *this person's* own mean and spread, must
+   persist over a declared window (three bad nights out of seven, not one), and stay
+   silent below `MIN_DAYS`. Thresholds that encode judgement live in
+   `domain_policy.json`, mirroring `nutrient_policy.json`.
+2. **Links, no model.** `ingest/links.py` — see below.
+3. **One ranked list.** `coach_feed.eligible_findings` ranks food and non-food
+   findings *together* on severity, so the thing most worth saying wins whatever it
+   is about — with `MAX_FINDINGS_PER_DOMAIN` stopping one bad week monopolising the
+   feed, and a longer cooldown for links than for patterns.
+4. **A prompt assembled from specialist frames.** `narrator._frames_for` includes
+   only the domains that actually produced a finding. A day of pure food findings
+   gets byte-identical instructions to the pre-domain coach; a sleep day gets sleep
+   expertise instead of a longer list of everything. **One model call either way** —
+   specialisation is which frame is selected, not how many models run.
+
+### Why not just give one model everything
+
+Because it writes the average of its payload. That is not a hypothetical: leading
+the old prompt with a nutrient table meant it could only ever produce nutrient
+advice, which is why food patterns lead the facts today. Adding sleep and training
+numbers to that same prompt would dilute all of them equally — three shallow
+observations instead of one good one.
+
+### Why the model is not allowed to find correlations
+
+Handing a model 90 rows × 80 columns produces fluent, confident, **invented**
+chains, and a false chain is worse than none because it gets acted on. There are
+~3,000 column pairs here; at p<0.05 pure noise yields ~150 "findings". So
+`links.py` holds a hand-written table of ~15 physiologically plausible hypotheses,
+each with its `mechanism` in one sentence, and:
+
+* the **lag comes from `registry.causal`**, never from the hypothesis (see §2c);
+* a **tertile contrast** in the effect's own units, not an r — "18 fewer minutes of
+  deep sleep" is a sentence, `r = -0.31` is not;
+* a **permutation test** (exact, assumption-free, pure stdlib);
+* **Benjamini-Hochberg** across everything evaluated in the run — without it,
+  testing two dozen hypotheses daily invents a chain most weeks;
+* a **stability check** (the effect holds in both halves of the window);
+* a **direction gate**: a result contradicting its own declared mechanism is
+  dropped, because the model would otherwise be handed an explanation that
+  contradicts the number it must quote;
+* and the card copy is required to say *associado a*, never *causa*.
+
+The model's job on a link is to explain the one that survived and turn it into an
+action. It may not claim a link the engine did not find — the same rule
+`_validated_swap` already enforces for foods.
+
+### Depth vs breadth is resolved by cadence, not by cramming
+
+| horizon | shape |
+|---|---|
+| **daily card** | one idea — one domain, or one link |
+| **weekly review** | the cross-domain read: `coach_reports.weekly_facts` gets *every* metric finding and link, unbudgeted, plus the week's daily rows |
+| **monthly / yearly** | rollups of those |
+
+### Capability integration
+
+A nutrition-only user's generation runs the same code and reaches the model with
+no metric findings, no links, no specialist frames beyond food — and an explicit
+"O QUE NÃO VÊS" line naming what they don't measure. **That line matters**: a model
+given no sleep data still writes confident sleep advice unless told the data does
+not exist.
 
 ## 4. Auth model (least-privilege)
 
@@ -441,6 +583,12 @@ token is read-only across `sleep`, `health_metrics_and_measurements` and
     which AI analysed the photo (audit); `image_sha` de-duplicates double-taps.
   - Rows with foods `not food` / `analysis failed` (or all-zero macros) are
     excluded from every roll-up.
+- **`config`**: `key | value | notes` — what this user measures (`blocks`), what
+  they are aiming at (`goal`), and the declared body used only when nothing is
+  measured (`sex`, `age`, `height_cm`, `weight_kg`, `activity_level`). Created and
+  seeded by the ingest service on first read; the daily job only ever reads it.
+  See §2c. **A missing or broken tab means full capabilities**, so an existing
+  deployment behaves exactly as it did before this tab existed.
 - **Schema changes**: add the column to `DAILY_HEADERS` and run
   `python -m src.maintenance` (inserts the column in place so history stays
   aligned). Never reorder or rename existing columns.
