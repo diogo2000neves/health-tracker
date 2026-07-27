@@ -98,6 +98,82 @@ class TestCanonicalisation:
         assert tax.group_by_rules(tax.canonical_name("white bread")) == "refined_grain"
 
 
+class TestDisplayNames:
+    """The app is pt-PT end to end while the log is keyed in English. These are the
+    rules that decide which name the user actually reads."""
+
+    def test_the_meals_own_name_pt_wins_over_everything(self):
+        """Written at ingest against the photo AND the user's note, so it is the only
+        source that can know the dish was a francesinha and not "a sandwich"."""
+        assert tax.display_pt("portuguese sandwich",
+                              name_pt="francesinha") == "francesinha"
+
+    def test_the_curated_table_covers_the_common_vocabulary(self):
+        assert tax.display_pt("white rice") == "arroz branco"
+        assert tax.display_pt("cod") == "bacalhau"
+        assert tax.display_pt("boiled cod (bacalhau)") == "bacalhau"
+
+    def test_a_name_already_in_portuguese_is_left_alone(self):
+        assert tax.display_pt("arroz branco") == "arroz branco"
+
+    def test_brands_and_english_loanwords_are_not_translated(self):
+        """"proteína de soro de leite" is not what anyone in Portugal says."""
+        assert tax.display_pt("whey protein") == "whey protein"
+        assert tax.display_pt("Big Tasty") == "Big Tasty"
+
+    def test_an_unknown_food_falls_back_to_its_english_name(self):
+        """A missing translation must never blank a meal — the worst case is a food
+        that reads in the wrong language, never a food that isn't there."""
+        assert tax.display_pt("mystery gruel") == "mystery gruel"
+
+    def test_the_learned_blob_fills_what_the_table_cannot(self):
+        blob = {"pt": {tax.display_key("skin-on chicken thigh"):
+                       "coxa de frango com pele"}}
+        assert tax.display_pt("skin-on chicken thigh",
+                              blob) == "coxa de frango com pele"
+
+    def test_lookup_keeps_the_logged_detail_and_the_bucket_apart(self):
+        """The canonical name has had the cooking method stripped for grouping, so
+        showing it back would quietly drop detail the app is meant to display."""
+        blob = {"pt": {tax.display_key("grilled chicken breast"):
+                       "peito de frango grelhado"}}
+        info = tax.lookup(blob, "grilled chicken breast")
+        assert info["canonical"] == "chicken breast"
+        assert info["pt"] == "peito de frango grelhado"
+        assert info["pt_canonical"] == "peito de frango"
+
+
+class TestTranslationLearning:
+    def test_only_names_nothing_can_place_are_worth_a_call(self):
+        names = ["white rice", "whey protein", "mystery gruel", "Mystery Gruel"]
+        # The first two resolve from the curated table; the last two are one food.
+        assert tax.untranslated_names(None, names) == ["mystery gruel"]
+
+    def test_a_learned_name_is_folded_in_and_stops_being_asked_about(self):
+        blob, learned = tax.translate_unknown(
+            None, ["mystery gruel"],
+            lambda _p: {"foods": [{"name": "mystery gruel", "pt": "papa misteriosa"}]})
+        assert learned == 1
+        assert tax.display_pt("mystery gruel", blob) == "papa misteriosa"
+        assert tax.untranslated_names(blob, ["mystery gruel"]) == []
+
+    def test_an_answer_for_a_name_we_never_asked_about_is_dropped(self):
+        """A hallucinated key would otherwise sit in the lexicon forever, renaming a
+        food nobody ever logged."""
+        blob, learned = tax.translate_unknown(
+            None, ["mystery gruel"],
+            lambda _p: {"foods": [{"name": "caviar", "pt": "caviar"}]})
+        assert learned == 0 and blob["pt"] == {}
+
+    def test_a_failed_call_leaves_the_english_name_standing(self):
+        def _boom(_prompt):
+            raise RuntimeError("no model today")
+
+        blob, learned = tax.translate_unknown(None, ["mystery gruel"], _boom)
+        assert learned == 0
+        assert tax.display_pt("mystery gruel", blob) == "mystery gruel"
+
+
 class TestGrouping:
     @pytest.mark.parametrize("name,group", [
         ("pear", "fruit"),                    # not a legume, despite "pea"
@@ -443,7 +519,9 @@ class TestSwapValidation:
         self.profile = profile_from(a_week_of_meals())
         self.finding = feed.eligible_findings(self.profile, {},
                                               today="2026-07-26")[0]
-        self.offered = self.profile["swaps"][self.finding["id"]]["to"][0]["food"]
+        offered = self.profile["swaps"][self.finding["id"]]["to"][0]
+        self.offered = offered["food"]            # the English key, as stored
+        self.offered_pt = offered.get("pt") or offered["food"]  # as the model sees it
 
     def _run(self, swap):
         cards, _ = generate("afternoon", self.profile, an_answer([
@@ -462,8 +540,20 @@ class TestSwapValidation:
     def test_a_supported_swap_survives_with_its_new_flag(self):
         swap = self._run({"from": "beef steak", "to": self.offered,
                           "why": "porque"})
-        assert swap and swap["from"] == "beef steak" and swap["to"] == self.offered
+        # Accepted from the English spelling, but rendered in pt-PT: the card is
+        # read inside Portuguese prose, so both sides come back translated.
+        assert swap and swap["from"] == "bife de vaca"
+        assert swap["to"] == self.offered_pt
         assert isinstance(swap["new"], bool)
+
+    def test_a_swap_phrased_in_portuguese_is_accepted(self):
+        """The coach is prompted in Portuguese and shown Portuguese food names, so
+        this is the spelling it actually answers with — the validator must not read
+        it as a food the user never logged."""
+        swap = self._run({"from": "bife de vaca", "to": self.offered_pt,
+                          "why": "porque"})
+        assert swap and swap["from"] == "bife de vaca"
+        assert swap["to"] == self.offered_pt
 
     def test_a_pattern_card_without_a_real_finding_is_dropped(self):
         cards, shown = generate("afternoon", self.profile, an_answer([
@@ -856,7 +946,10 @@ class TestCoachEndpoints:
         job_id = self._queue_a_job()
         store_mod = ingest._coach("coach_store")
         job = store_mod.read_json(store_mod.job_path(job_id))
-        assert "white rice" in job["prompt"]
+        # In pt-PT: the prompt is Portuguese and forbids naming a food that isn't in
+        # it, so an English name here would be a food the coach cannot talk about.
+        assert "arroz branco" in job["prompt"]
+        assert "white rice" not in job["prompt"]
         assert "carne processada" in job["prompt"] or "processed_meat" in job["prompt"]
         assert job["context"]["findings"]
 

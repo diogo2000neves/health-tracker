@@ -1610,11 +1610,86 @@ def test_today_basis_exposes_the_derivation_inputs(monkeypatch):
 def test_today_meals_carry_per_item_nutrients_for_drilldown(monkeypatch):
     meals = _today_client(monkeypatch).get(
         "/today?date=2026-07-18", headers=_HDR).get_json()["meals"]
-    assert [m["foods"] for m in meals] == ["Oats", "Chicken & rice"]  # sorted, no stub
+    # Names come out in pt-PT (the app's language) and `foods` is rebuilt from the
+    # translated items rather than translated as a string — see _display_foods.
+    assert [m["foods"] for m in meals] == ["aveia", "frango, arroz"]  # sorted, no stub
     lunch = meals[1]
-    assert {i["name"] for i in lunch["items"]} == {"chicken", "rice"}
-    chicken = next(i for i in lunch["items"] if i["name"] == "chicken")
+    assert {i["name"] for i in lunch["items"]} == {"frango", "arroz"}
+    chicken = next(i for i in lunch["items"] if i["name"] == "frango")
     assert chicken["nutrients"]["zinc_mg"] == 3.0    # the drill-down source
+
+
+# -- pt-PT display names -------------------------------------------------------
+# The sheet is keyed in English (FDC grounding and the whole food taxonomy are); the
+# app is Portuguese. `name_pt` is written at ingest, beside `name`, and the display
+# layer prefers it over the shared lexicon.
+def test_normalize_items_keeps_the_portuguese_name(monkeypatch):
+    items = ingest._normalize_items([
+        {"name": "grilled chicken breast", "name_pt": "peito de frango grelhado",
+         "portion_g": 150, "calories": 250, "protein_g": 45, "carbs_g": 0,
+         "fat_g": 6}])
+    assert items[0]["name"] == "grilled chicken breast"
+    assert items[0]["name_pt"] == "peito de frango grelhado"
+
+
+def test_a_name_that_is_the_same_in_both_languages_is_not_stored_twice():
+    """"whey protein" is what a Portuguese speaker says, so there is nothing to
+    carry — the display layer falls back to `name` when `name_pt` is absent."""
+    items = ingest._normalize_items([
+        {"name": "whey protein", "name_pt": "Whey Protein", "portion_g": 30,
+         "calories": 120, "protein_g": 24, "carbs_g": 2, "fat_g": 1}])
+    assert "name_pt" not in items[0]
+
+
+def test_today_shows_the_models_own_portuguese_name(monkeypatch):
+    """The dish the user named themselves must survive: "francesinha" is not
+    recoverable from the English "portuguese sandwich" it was stored under."""
+    grid = [
+        ingest.MEALS_HEADERS,
+        ["2026-07-18T13:00:00+01:00", "portuguese sandwich", json.dumps([
+            {"name": "portuguese sandwich", "name_pt": "francesinha",
+             "portion_g": 400, "calories": 900, "protein_g": 45, "carbs_g": 60,
+             "fat_g": 50}]),
+         900, 45, 60, 50, 0.8, "m", "", 400, "sha1", "", ""],
+    ]
+    meals = _today_client(monkeypatch, meals=grid).get(
+        "/today?date=2026-07-18", headers=_HDR).get_json()["meals"]
+    assert meals[0]["items"][0]["name"] == "francesinha"
+    assert meals[0]["foods"] == "francesinha"
+    # The English key is an internal join key, not something the app should render.
+    assert "name_pt" not in meals[0]["items"][0]
+
+
+def test_a_food_name_containing_a_comma_survives_intact(monkeypatch):
+    """`foods` is rebuilt from the items, never split back apart on commas — the
+    ingest prompt's own example name is "chicken thigh, skin-on"."""
+    grid = [
+        ingest.MEALS_HEADERS,
+        ["2026-07-18T13:00:00+01:00", "chicken thigh, skin-on", json.dumps([
+            {"name": "chicken thigh, skin-on", "name_pt": "coxa de frango, com pele",
+             "portion_g": 150, "calories": 300, "protein_g": 30, "carbs_g": 0,
+             "fat_g": 20}]),
+         300, 30, 0, 20, 0.8, "m", "", 150, "sha1", "", ""],
+    ]
+    meals = _today_client(monkeypatch, meals=grid).get(
+        "/today?date=2026-07-18", headers=_HDR).get_json()["meals"]
+    assert meals[0]["items"][0]["name"] == "coxa de frango, com pele"
+    assert meals[0]["foods"] == "coxa de frango, com pele"
+
+
+def test_an_untranslatable_food_still_shows_up(monkeypatch):
+    """A missing translation must never hide a meal — the fallback is the English
+    name, which is exactly what the app showed before any of this existed."""
+    grid = [
+        ingest.MEALS_HEADERS,
+        ["2026-07-18T13:00:00+01:00", "mystery gruel", json.dumps([
+            {"name": "mystery gruel", "portion_g": 100, "calories": 100,
+             "protein_g": 5, "carbs_g": 10, "fat_g": 2}]),
+         100, 5, 10, 2, 0.5, "m", "", 100, "sha1", "", ""],
+    ]
+    meals = _today_client(monkeypatch, meals=grid).get(
+        "/today?date=2026-07-18", headers=_HDR).get_json()["meals"]
+    assert meals[0]["items"][0]["name"] == "mystery gruel"
 
 
 # -- GET /nutrients (the per-nutrient reference knowledge base) -----------------

@@ -239,6 +239,8 @@ REGRAS ABSOLUTAS:
 - Sem linguagem médica nem diagnósticos. Se algo pede análises, sugere "vale a pena
   um exame", nunca um veredito.
 - Enquadra a suficiência como vitória; nunca incentives comer menos por comer menos.
+- Os nomes dos alimentos nos FACTOS já vêm em português de Portugal. Usa-os TAL E
+  QUAL; nunca escrevas o nome de um alimento em inglês.
 - Uma frase por campo. Concreto, caloroso, humano. Nada de jargão."""
 
 _REPORT_SCHEMA = """Devolve APENAS um objeto JSON com esta forma exata:
@@ -263,6 +265,8 @@ def build_weekly_prompt(diagnosis: Dict[str, Any],
                         profile: List[Dict[str, Any]],
                         continuity: Optional[Dict[str, Any]] = None) -> str:
     """Assemble the prompt for the weekly coach."""
+    # Already pt-PT: `insights.build_food_profile` keys the vocabulary on the display
+    # name, so the report can quote these straight into Portuguese prose.
     top_foods = [f["food"] for f in profile[:20]]
     facts = {
         "window": diagnosis.get("window"),
@@ -387,7 +391,10 @@ Nota importante sobre ajuste após refeições inesperadas:
 - Se a pessoa já comeu uma refeição pesada (muitas calorias, muita proteína, muita
   gordura), as sugestões seguintes devem ser mais leves para caber no orçamento.
 - Se comeu algo muito ligeiro, mantém as sugestões normais.
-- Usa o teu bom senso para avaliar o impacto do que já foi comido hoje."""
+- Usa o teu bom senso para avaliar o impacto do que já foi comido hoje.
+
+Nomes de alimentos: os DADOS já trazem tudo em português de Portugal. Escreve-os TAL
+E QUAL, incluindo em `items[].food` e nos títulos dos pratos. Nunca em inglês."""
 
 _PLATES_V2_SCHEMA = """Devolve APENAS um objeto JSON com esta forma exata:
 {
@@ -512,6 +519,9 @@ repitas nada que esteja em `already_said_recently`.
 REGRAS ABSOLUTAS:
 - Só podes falar de alimentos que aparecem em `foods_the_user_eats`, em
   `findings[].swap_options` ou em `next_meal.candidates`. Não inventes alimentos.
+- Os nomes dos alimentos nos FACTOS já vêm em português de Portugal. Usa-os TAL E
+  QUAL, incluindo em `swap`, nos títulos dos pratos e em `items[].food`. Nunca
+  escrevas o nome de um alimento em inglês, nem traduzas um nome que já te é dado.
 - Numa troca (`swap`): o `from` TEM de ser um alimento que a pessoa registou e o `to` TEM
   de vir das `swap_options.to` desse finding. Se não houver troca honesta, `swap: null`.
 - A troca tem de fazer sentido À MESA: cada alimento traz a refeição em que é

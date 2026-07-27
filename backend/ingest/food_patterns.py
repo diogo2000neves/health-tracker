@@ -145,6 +145,14 @@ def read_meals(window_meals: Sequence[Dict[str, Any]],
             items.append({
                 "raw": raw_name,
                 "food": info["canonical"],
+                # Two pt-PT names, for two jobs: `pt` keeps the logged detail
+                # ("peito de frango grelhado") for anything quoting one meal, while
+                # `pt_food` names the canonical bucket ("peito de frango") that the
+                # aggregations below count under. Mixing them would let the coach
+                # say "grilled chicken breast, 5 times" about a bucket that also
+                # holds the boiled ones.
+                "pt": info["pt"],
+                "pt_food": info["pt_canonical"],
                 "group": info["group"],
                 "fried": info["fried"],
                 "grams": grams,
@@ -188,6 +196,7 @@ def group_stats(meals: Sequence[Dict[str, Any]], *, window_days: int,
     """
     days = logged_days(meals)
     day_count = max(len(days), 1)
+    pt = pt_index(meals)
     stats: Dict[str, Dict[str, Any]] = {}
     for meal in meals:
         for item in meal["items"]:
@@ -220,6 +229,7 @@ def group_stats(meals: Sequence[Dict[str, Any]], *, window_days: int,
         rec["week_max"] = info.get("week_max")
         rec["top_foods"] = [f for f, _ in sorted(rec.pop("foods").items(),
                                                 key=lambda kv: kv[1], reverse=True)[:4]]
+        rec["top_foods_pt"] = [pt.get(f, f) for f in rec["top_foods"]]
     # Groups with a `more` posture that never appeared at all still matter — "no
     # fish in the window" is the single most useful thing here, and it lives in the
     # absence of a row. Materialise them at zero.
@@ -232,9 +242,24 @@ def group_stats(meals: Sequence[Dict[str, Any]], *, window_days: int,
             "grams": 0, "calories": 0, "days_logged": 0, "last": "",
             "days_since_last": None, "posture": "more",
             "week_min": info.get("week_min"), "week_max": info.get("week_max"),
-            "top_foods": [],
+            "top_foods": [], "top_foods_pt": [],
         }
     return stats
+
+
+def pt_index(meals: Sequence[Dict[str, Any]]) -> Dict[str, str]:
+    """canonical English food -> its pt-PT name.
+
+    Every aggregation below keys on the canonical name — that is the entire point of
+    the taxonomy — but everything they FEED is Portuguese prose. Rather than thread
+    the display name through each one, they look it up here and carry it alongside
+    their key.
+    """
+    out: Dict[str, str] = {}
+    for meal in meals:
+        for item in meal["items"]:
+            out.setdefault(item["food"], item["pt_food"])
+    return out
 
 
 def food_stats(meals: Sequence[Dict[str, Any]], *, ref_day: str
@@ -246,9 +271,10 @@ def food_stats(meals: Sequence[Dict[str, Any]], *, ref_day: str
     for meal in meals:
         for item in meal["items"]:
             rec = agg.setdefault(item["food"], {
-                "food": item["food"], "group": item["group"], "times": 0,
+                "food": item["food"], "pt": item["pt_food"],
+                "group": item["group"], "times": 0,
                 "portions": [], "slots": {}, "last": "", "raw_names": set(),
-                "fried_times": 0,
+                "pt_names": set(), "fried_times": 0,
             })
             rec["times"] += 1
             if item["grams"] > 0:
@@ -256,6 +282,7 @@ def food_stats(meals: Sequence[Dict[str, Any]], *, ref_day: str
             rec["slots"][meal["slot"]] = rec["slots"].get(meal["slot"], 0) + 1
             rec["last"] = max(rec["last"], meal["date"])
             rec["raw_names"].add(item["raw"])
+            rec["pt_names"].add(item["pt"])
             if item["fried"]:
                 rec["fried_times"] += 1
     out = []
@@ -267,6 +294,10 @@ def food_stats(meals: Sequence[Dict[str, Any]], *, ref_day: str
         rec["slot_label"] = SLOT_LABELS.get(rec["top_slot"], rec["top_slot"])
         rec["days_since_last"] = _days_between(rec["last"], ref_day)
         rec["raw_names"] = sorted(rec["raw_names"])[:4]
+        # Both spellings are kept so a model answer can be matched back to this food
+        # however it phrased it — the coach is prompted in Portuguese and will say
+        # "peito de frango", but the log's own word may be either.
+        rec["pt_names"] = sorted(rec["pt_names"])[:4]
         out.append(rec)
     out.sort(key=lambda r: (-r["times"], r["food"]))
     return out
@@ -291,6 +322,7 @@ def variety(meals: Sequence[Dict[str, Any]], foods: Sequence[Dict[str, Any]]
         "distinct_fruits": len(fruit),
         "top_share": round(sum(f["times"] for f in foods[:5]) / total, 2),
         "top_foods": [f["food"] for f in foods[:5]],
+        "top_foods_pt": [f.get("pt") or f["food"] for f in foods[:5]],
         "days_logged": days,
     }
 
@@ -341,6 +373,7 @@ def streaks(meals: Sequence[Dict[str, Any]], *, ref_day: str
     """
     days = logged_days(meals)
     index = {day: i for i, day in enumerate(days)}
+    pt = pt_index(meals)
     seen: Dict[Tuple[str, str], List[int]] = {}
     for meal in meals:
         for item in meal["items"]:
@@ -361,7 +394,7 @@ def streaks(meals: Sequence[Dict[str, Any]], *, ref_day: str
                 best, best_end = run, run_end
         if best >= STREAK_MIN_DAYS:
             out.append({
-                "food": food, "slot": slot,
+                "food": food, "pt": pt.get(food, food), "slot": slot,
                 "slot_label": SLOT_LABELS.get(slot, slot),
                 "days": best,
                 "ended": days[best_end],
@@ -387,8 +420,10 @@ def nutrient_drivers(meals: Sequence[Dict[str, Any]], key: str, *, top: int = 3
             total += amount
     if total <= 0:
         return []
+    pt = pt_index(meals)
     ranked = sorted(sums.items(), key=lambda kv: kv[1], reverse=True)[:top]
-    return [{"food": food, "pct": round(100 * amount / total)}
+    return [{"food": food, "pt": pt.get(food, food),
+             "pct": round(100 * amount / total)}
             for food, amount in ranked]
 
 
@@ -440,8 +475,8 @@ def build_findings(*, groups: Dict[str, Dict[str, Any]],
                           f"referência de {week_max}"),
                 evidence={"servings_per_week": per_week, "reference_max": week_max,
                           "occurrences": rec.get("occurrences"),
-                          "top_foods": rec.get("top_foods", [])},
-                foods=rec.get("top_foods", [])))
+                          "top_foods": rec.get("top_foods_pt", [])},
+                foods=rec.get("top_foods_pt", [])))
 
         if week_min and per_week < week_min * UNDER_RATIO:
             short = 1 - (per_week / week_min)
@@ -455,8 +490,8 @@ def build_findings(*, groups: Dict[str, Dict[str, Any]],
                           + ("; nada registado na janela" if per_week == 0 else "")),
                 evidence={"servings_per_week": per_week, "reference_min": week_min,
                           "days_since_last": rec.get("days_since_last"),
-                          "top_foods": rec.get("top_foods", [])},
-                foods=rec.get("top_foods", [])))
+                          "top_foods": rec.get("top_foods_pt", [])},
+                foods=rec.get("top_foods_pt", [])))
 
     # Refined vs whole grains: a ratio says more than either count alone.
     refined = (groups.get("refined_grain") or {}).get("servings_per_week") or 0.0
@@ -469,8 +504,8 @@ def build_findings(*, groups: Dict[str, Dict[str, Any]],
                       f"semana são refinados"),
             evidence={"refined_per_week": refined, "whole_per_week": whole,
                       "whole_share": round(whole / (refined + whole), 2),
-                      "top_foods": (groups.get("refined_grain") or {}).get("top_foods", [])},
-            foods=(groups.get("refined_grain") or {}).get("top_foods", [])))
+                      "top_foods": (groups.get("refined_grain") or {}).get("top_foods_pt", [])},
+            foods=(groups.get("refined_grain") or {}).get("top_foods_pt", [])))
 
     # Composition: a slot that usually arrives without a plant food.
     for slot, rec in slots.items():
@@ -500,9 +535,9 @@ def build_findings(*, groups: Dict[str, Dict[str, Any]],
             headline=(f"{round(100 * variety_stats['top_share'])}% do que comes vem "
                       f"dos mesmos 5 alimentos"),
             evidence={"top_share": variety_stats["top_share"],
-                      "top_foods": variety_stats["top_foods"],
+                      "top_foods": variety_stats["top_foods_pt"],
                       "distinct_foods": variety_stats["distinct_foods"]},
-            foods=variety_stats["top_foods"]))
+            foods=variety_stats["top_foods_pt"]))
 
     if variety_stats["distinct_vegetables"] <= 3:
         out.append(_finding(
@@ -517,9 +552,9 @@ def build_findings(*, groups: Dict[str, Dict[str, Any]],
     for streak in food_streaks[:2]:
         out.append(_finding(
             "streak", None, 0.5 if streak["current"] else 0.3,
-            headline=(f"{streak['food']} ao {streak['slot_label']} "
-                      f"{streak['days']} dias seguidos"),
-            evidence=dict(streak), foods=[streak["food"]]))
+            headline=(f"{streak.get('pt') or streak['food']} ao "
+                      f"{streak['slot_label']} {streak['days']} dias seguidos"),
+            evidence=dict(streak), foods=[streak.get("pt") or streak["food"]]))
 
     out.sort(key=lambda f: -f["severity"])
     return out
@@ -623,7 +658,9 @@ def swap_candidates(finding: Dict[str, Any], foods: Sequence[Dict[str, Any]], *,
     if group:
         for food in foods:
             if food["group"] == group:
-                from_foods.append({"food": food["food"], "times": food["times"],
+                from_foods.append({"food": food["food"],
+                                   "pt": food.get("pt") or food["food"],
+                                   "times": food["times"],
                                    "median_portion_g": food["median_portion_g"],
                                    "slot": food["top_slot"],
                                    "slot_label": food["slot_label"]})
@@ -653,7 +690,9 @@ def swap_candidates(finding: Dict[str, Any], foods: Sequence[Dict[str, Any]], *,
         # Foods eaten at the same meal as the one being replaced come first.
         eaten.sort(key=lambda f: (f["top_slot"] != target_slot, -f["times"]))
         for food in eaten[:2]:
-            to_foods.append({"food": food["food"], "group": target,
+            to_foods.append({"food": food["food"],
+                             "pt": food.get("pt") or food["food"],
+                             "group": target,
                              "median_portion_g": food["median_portion_g"],
                              "times": food["times"], "new": False,
                              "slot": food["top_slot"],
@@ -661,8 +700,10 @@ def swap_candidates(finding: Dict[str, Any], foods: Sequence[Dict[str, Any]], *,
                              "fits_the_meal": food["top_slot"] == target_slot})
         if not eaten:
             slot_staples = _SLOT_STAPLES.get(target_slot or "", {}).get(target)
+            # `_STAPLES` is written in pt-PT already — these are foods the user has
+            # never logged, so there is no English canonical to carry.
             for staple in (slot_staples or _STAPLES.get(target, ()))[:2]:
-                to_foods.append({"food": staple, "group": target,
+                to_foods.append({"food": staple, "pt": staple, "group": target,
                                  "median_portion_g": tax.GROUP_INFO.get(
                                      target, {}).get("serving_g", 100),
                                  "times": 0, "new": True, "slot": None,

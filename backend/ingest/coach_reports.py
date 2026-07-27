@@ -87,7 +87,10 @@ def weekly_facts(*, start: str, end: str, key: str,
              "slot": meal["slot"], "calories": round(meal["calories"]),
              "protein_g": round(meal["protein_g"], 1),
              "note": meal.get("note", ""),
-             "items": [{"food": i["food"], "grams": round(i["grams"]),
+             # pt-PT: the report this feeds is written in Portuguese and quotes
+             # these names back verbatim.
+             "items": [{"food": i.get("pt") or i["food"],
+                        "grams": round(i["grams"]),
                         "group": i["group"]} for i in meal["items"]]}
             for meal in meals
         ],
@@ -96,11 +99,12 @@ def weekly_facts(*, start: str, end: str, key: str,
             "groups": {k: {"servings_per_week": v.get("servings_per_week"),
                            "reference_min": v.get("week_min"),
                            "reference_max": v.get("week_max"),
-                           "top_foods": v.get("top_foods", [])}
+                           "top_foods": v.get("top_foods_pt", [])}
                        for k, v in (profile.get("groups") or {}).items()},
             "variety": profile.get("variety"),
             "meal_slots": profile.get("slots"),
-            "streaks": profile.get("streaks", [])[:5],
+            "streaks": [{**s, "food": s.get("pt") or s["food"]}
+                        for s in profile.get("streaks", [])[:5]],
             "findings": [{"fact": f["headline"], "severity": f["severity"]}
                          for f in profile.get("findings", [])[:8]],
         },

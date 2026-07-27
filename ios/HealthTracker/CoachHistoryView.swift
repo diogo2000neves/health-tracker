@@ -65,7 +65,10 @@ struct CoachHistoryView: View {
 
     var body: some View {
         NavigationStack {
-            Group {
+            // A VStack, not a Group: modifiers on a Group are applied to each child
+            // in turn, which gave the screen two "Fechar" buttons — one from the
+            // picker, one from the list.
+            VStack(spacing: 0) {
                 Picker("", selection: $tab) {
                     Text("Revisões").tag(0)
                     Text("Tudo").tag(1)

@@ -104,10 +104,15 @@ folate_ug, biotin_ug, selenium_ug, iodine_ug
 OUTPUT - return ONLY a single JSON object, no markdown fence, no prose around it:
 {{"reasoning": "<your step 1-6 working>", "revision_notes": "<how you read the \
 portions and, if there was a note, how you applied it exactly once>", "items": \
-[{{"name": "<lowercase singular english>", "cooking_method": "<e.g. grilled>", \
+[{{"name": "<lowercase singular english>", "name_pt": "<the same food in \
+European Portuguese>", "cooking_method": "<e.g. grilled>", \
 "portion_g": <g>, "calories": <kcal>, "protein_g": <g>, "carbs_g": <g>, \
 "fat_g": <g>, "nutrients": {{"fiber_g": <g>, "sodium_mg": <mg>}}}}], \
 "confidence": <0.0-1.0>}}
+`name_pt` is what the app shows the user, who is Portuguese: same food, same level \
+of detail, pt-PT and not Brazilian ("peito de frango grelhado"). If the note names \
+the dish, reuse the user's own word ("francesinha", "arroz de pato"). Leave brands \
+and terms said in English alone ("whey protein", "Big Tasty"). Never leave it empty.
 Give PER-ITEM numbers only; do not sum the meal. If the photo genuinely shows no \
 food, return "items": []."""
 

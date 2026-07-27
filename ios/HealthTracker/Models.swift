@@ -183,6 +183,9 @@ struct MealItem: Decodable, Hashable, Identifiable {
     let fatG: Double
     let nutrients: [String: Double]
 
+    // Not unique within a meal — "potato" and "boiled potato" are separate items
+    // that both display as "batata". Anything iterating items keys on position
+    // instead; this exists only to satisfy Identifiable.
     var id: String { name }
 
     enum CodingKeys: String, CodingKey {

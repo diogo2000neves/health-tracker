@@ -52,8 +52,12 @@ def _render_estimate(label: str, items: List[Dict[str, Any]]) -> str:
     for it in items:
         method = it.get("cooking_method")
         method = f", {method}" if method else ""
+        # The pt-PT name rides along so the adjudicator can carry the estimate's own
+        # wording through instead of inventing a fresh translation for an item it
+        # decided to keep unchanged.
+        pt = f" [pt: {it['name_pt']}]" if it.get("name_pt") else ""
         lines.append(
-            f"  - {it['name']}{method}: {it.get('portion_g', 0):g} g | "
+            f"  - {it['name']}{pt}{method}: {it.get('portion_g', 0):g} g | "
             f"{it.get('calories', 0):g} kcal "
             f"P{it.get('protein_g', 0):g} C{it.get('carbs_g', 0):g} "
             f"F{it.get('fat_g', 0):g}")
@@ -121,10 +125,16 @@ this way (empty if trivially agreed).
 
 OUTPUT — return ONLY a single JSON object, no markdown fence, no prose around it:
 {{"reasoning": "<your reconciliation working>", "items": [{{"name": "<lowercase \
-singular english>", "cooking_method": "<e.g. grilled>", "portion_g": <g>, \
+singular english>", "name_pt": "<the same food in European Portuguese>", \
+"cooking_method": "<e.g. grilled>", "portion_g": <g>, \
 "calories": <kcal>, "protein_g": <g>, "carbs_g": <g>, "fat_g": <g>, \
 "nutrients": {{"fiber_g": <g>, "sodium_mg": <mg>}}, "resolution": "agreed", \
 "resolution_note": ""}}], "confidence": <0.0-1.0>}}
+`name_pt` is what the app shows the user, who is Portuguese: same food, same level \
+of detail, pt-PT and not Brazilian ("peito de frango grelhado"). If the note names \
+the dish, reuse the user's own word ("francesinha", "arroz de pato"). Leave brands \
+and terms said in English alone ("whey protein", "Big Tasty"). Whenever you keep an \
+item from an estimate, keep ITS `name_pt` too — never drop the field.
 Give PER-ITEM numbers only; do not sum the meal. If the image genuinely shows no \
 food, return "items": []."""
 

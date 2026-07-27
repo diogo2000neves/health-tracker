@@ -81,8 +81,13 @@ def normalize_nutrients(raw: Any) -> Dict[str, float]:
 
 
 def normalize_items(raw: Any) -> List[Dict[str, Any]]:
-    """Coerce a model's item list into clean {name, portion_g, macros,
-    cooking_method?, nutrients?} dicts — the exact shape ingest stores."""
+    """Coerce a model's item list into clean {name, name_pt?, portion_g, macros,
+    cooking_method?, nutrients?} dicts — the exact shape ingest stores.
+
+    `name_pt` is the pt-PT name the app displays. It matters here because this
+    pipeline REWRITES the stored items cell: an audit that dropped the field would
+    silently un-translate every meal it touched the night after it was logged.
+    """
     items: List[Dict[str, Any]] = []
     for entry in raw or []:
         if not isinstance(entry, dict):
@@ -98,6 +103,9 @@ def normalize_items(raw: Any) -> List[Dict[str, Any]]:
             "carbs_g": _round_num(entry.get("carbs_g")),
             "fat_g": _round_num(entry.get("fat_g")),
         }
+        name_pt = str(entry.get("name_pt", "")).strip()[:120]
+        if name_pt and name_pt.casefold() != name.casefold():
+            item["name_pt"] = name_pt
         method = str(entry.get("cooking_method", "")).strip()[:40]
         if method:
             item["cooking_method"] = method

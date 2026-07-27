@@ -150,7 +150,12 @@ def detect(meals: Sequence[Dict[str, Any]], *, day: str,
         # registered as a quiet evening. One logged alcoholic item is one drink.
         servings = float(len(drinks))
         times = sorted(_hhmm(m["datetime"]) for m, _i in drinks)
-        what = sorted({i["food"] for _m, i in drinks})
+        # Two lists, because they do different jobs: `what` is read by a human (and
+        # quoted inside Portuguese headlines), while `topics` is a matching key that
+        # already-archived events were written with — translating those would stop
+        # today's event from ever recalling last month's.
+        what = sorted({i.get("pt") or i["food"] for _m, i in drinks})
+        topic_keys = sorted({i["food"] for _m, i in drinks})
         if servings >= DRINKS_HEAVY:
             importance, kind = 0.9, "drinking_occasion"
             headline = (f"{servings:g} bebidas alcoólicas entre {times[0]} e "
@@ -163,7 +168,7 @@ def detect(meals: Sequence[Dict[str, Any]], *, day: str,
             headline = f"uma bebida alcoólica ({', '.join(what)}), {weekday}"
         events.append(_event(
             kind, day=day, importance=importance, headline=headline,
-            detail=", ".join(what), topics=["alcohol", *what], at=times[0],
+            detail=", ".join(what), topics=["alcohol", *topic_keys], at=times[0],
             evidence={"drinks": servings, "what": what, "first": times[0],
                       "last": times[-1], "weekday": weekday,
                       "grams": round(sum(i["grams"] for _m, i in drinks))}))
@@ -186,13 +191,13 @@ def detect(meals: Sequence[Dict[str, Any]], *, day: str,
             headline=(f"{markers[0]} ao {slot} — "
                       f"{round(meal['calories'])} kcal numa refeição"),
             detail=notes.get(meal["datetime"], "") or ", ".join(
-                i["food"] for i in meal["items"]),
+                i.get("pt") or i["food"] for i in meal["items"]),
             topics=["eaten_out", *markers, *(i["group"] for i in meal["items"])],
             at=_hhmm(meal["datetime"]),
             evidence={"markers": markers, "calories": round(meal["calories"]),
                       "protein_g": round(meal["protein_g"], 1),
                       "slot": meal["slot"],
-                      "foods": [i["food"] for i in meal["items"]],
+                      "foods": [i.get("pt") or i["food"] for i in meal["items"]],
                       "note": notes.get(meal["datetime"], "")}))
 
     # -- the day's size ----------------------------------------------------------

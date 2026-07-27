@@ -129,6 +129,21 @@ def eligible_findings(profile: Dict[str, Any], state: Dict[str, Any], *,
     return out
 
 
+def _swaps_pt(options: Dict[str, Any]) -> Dict[str, Any]:
+    """A finding's swap options with every food name in pt-PT. The English key is
+    dropped on the way out — `_validated_swap` re-derives it from the profile, so
+    the model never has to echo a name it can't write a sentence around."""
+    if not options:
+        return options
+    out = dict(options)
+    for side in ("from", "to"):
+        out[side] = [{**entry, "food": entry.get("pt") or entry["food"],
+                      **({"group": tax.label(entry["group"])}
+                         if entry.get("group") else {})}
+                     for entry in options.get(side, [])]
+    return out
+
+
 def build_facts(*, slot: str, now: datetime, profile: Dict[str, Any],
                 today: Dict[str, Any], nutrients: Dict[str, Any],
                 memory: Dict[str, Any], findings: Sequence[Dict[str, Any]],
@@ -140,19 +155,32 @@ def build_facts(*, slot: str, now: datetime, profile: Dict[str, Any],
     table, so the model could only ever produce nutrient advice; here the model sees
     "fries four times this week, no fish in twelve days" and the nutrient numbers
     only as corroboration.
+
+    LANGUAGE: every food name in here is the pt-PT one. The prompt is Portuguese and
+    forbids naming a food that isn't in this payload, so sending English canonicals
+    left the model no way to write a Portuguese sentence about them — that is where
+    "chicken breast ao almoço" came from. The English name never reaches the model;
+    it stays behind as the key `_validated_swap` matches answers against.
     """
     groups = profile.get("groups", {})
     interesting = {
         key: {
+            # The dict key stays the taxonomy id (a `pattern` card's `ref` is built
+            # from it), so the pt-PT name of the group has to travel inside.
+            "label": rec.get("label") or tax.label(key),
             "servings_per_week": rec.get("servings_per_week"),
             "reference_min": rec.get("week_min"),
             "reference_max": rec.get("week_max"),
             "days_since_last": rec.get("days_since_last"),
-            "top_foods": rec.get("top_foods", []),
+            "top_foods": rec.get("top_foods_pt", []),
         }
         for key, rec in groups.items()
         if rec.get("week_min") or rec.get("week_max") or rec.get("occurrences")
     }
+    variety = dict(profile.get("variety") or {})
+    # Carries both spellings; only the Portuguese one may reach the model.
+    if "top_foods_pt" in variety:
+        variety["top_foods"] = variety.pop("top_foods_pt")
     return {
         "slot": slot,
         "now": now.strftime("%H:%M"),
@@ -160,20 +188,28 @@ def build_facts(*, slot: str, now: datetime, profile: Dict[str, Any],
         "food_patterns": {
             "days_logged": profile.get("days_logged"),
             "groups": interesting,
-            "variety": profile.get("variety"),
+            "variety": variety,
             "meal_slots": profile.get("slots"),
-            "streaks": profile.get("streaks", [])[:3],
+            # Projected, not passed through: a streak carries both names, and
+            # leaving the English one visible is an invitation for the model to
+            # quote it back inside a Portuguese sentence.
+            "streaks": [{**s, "food": s.get("pt") or s["food"]}
+                        for s in profile.get("streaks", [])[:3]],
         },
         "findings": [
             {"id": f["id"], "kind": f["kind"], "fact": f["headline"],
              "evidence": f["evidence"], "foods": f["foods"],
-             "swap_options": profile.get("swaps", {}).get(f["id"], {})}
+             "swap_options": _swaps_pt(profile.get("swaps", {}).get(f["id"], {}))}
             for f in findings
         ],
         "today": today,
         "nutrients_supporting": nutrients,
         "foods_the_user_eats": [
-            {"food": f["food"], "group": f["group"], "times": f["times"],
+            # `group` is the pt-PT label, not the taxonomy id: nothing reads a
+            # group back off the model's answer, so the id would only be one more
+            # English word sitting in a Portuguese prompt.
+            {"food": f.get("pt") or f["food"], "group": tax.label(f["group"]),
+             "times": f["times"],
              "typical_portion_g": f["median_portion_g"], "usually_at": f["slot_label"]}
             for f in profile.get("foods", [])[:25]
         ],
@@ -231,13 +267,21 @@ def _clip(text: Any, limit: int) -> str:
 
 
 def _logged_food_names(profile: Dict[str, Any]) -> Dict[str, str]:
-    """Canonical -> display name for everything in the log, plus the raw names the
-    log used, so a model answer can be matched however it phrased the food."""
+    """Every spelling of every logged food -> the pt-PT name to display it under.
+
+    Indexed under all four forms a food can appear in — the English canonical, its
+    pt-PT name, and the raw spellings the log used in either language — because the
+    coach is prompted in Portuguese and will answer in Portuguese, while the log and
+    the taxonomy speak English. Matching only the English side is what would make
+    the validator throw away a correct Portuguese swap as "not in the log".
+    """
     names: Dict[str, str] = {}
     for food in profile.get("foods", []):
-        names[tax.normalize(food["food"])] = food["food"]
-        for raw in food.get("raw_names", []):
-            names[tax.normalize(raw)] = food["food"]
+        display = food.get("pt") or food["food"]
+        for spelling in (food["food"], food.get("pt"),
+                         *food.get("raw_names", []), *food.get("pt_names", [])):
+            if spelling:
+                names[tax.normalize(spelling)] = display
     return names
 
 
@@ -267,13 +311,20 @@ def _validated_swap(raw: Any, *, profile: Dict[str, Any],
             return None
 
     options = (profile.get("swaps", {}).get(finding["id"], {}) if finding else {})
-    allowed = {tax.normalize(o["food"]): o for o in options.get("to", [])}
+    allowed: Dict[str, Dict[str, Any]] = {}
+    for option in options.get("to", []):
+        # Same reasoning as _logged_food_names: the model was offered these in
+        # Portuguese, so it will name them in Portuguese, but the option itself is
+        # keyed in English. Accept either.
+        for spelling in (option["food"], option.get("pt")):
+            if spelling:
+                allowed.setdefault(tax.normalize(spelling), option)
     match = allowed.get(tax.normalize(dst)) or allowed.get(tax.canonical_name(dst))
     if not match:
         log.info("dropping swap: %r was not among the offered options", dst)
         return None
 
-    return {"from": logged[src_key], "to": match["food"],
+    return {"from": logged[src_key], "to": match.get("pt") or match["food"],
             "why": _clip(raw.get("why"), 200), "new": bool(match.get("new"))}
 
 
@@ -611,17 +662,24 @@ def next_meal_candidates(profile: Dict[str, Any], *,
     out: Dict[str, Any] = {"by_nutrient": nutrient_candidates or {}}
 
     from_findings: List[Dict[str, Any]] = []
+    seen_foods: List[str] = []
     for finding in profile.get("findings", [])[:3]:
         options = profile.get("swaps", {}).get(finding["id"], {})
         for entry in options.get("to", []):
-            if entry["food"] not in [f["food"] for f in from_findings]:
-                from_findings.append({**entry, "because": finding["headline"]})
+            # Dedup on the English key (one food, one entry) but hand the model the
+            # Portuguese name — it is what the plates will be written in.
+            if entry["food"] in seen_foods:
+                continue
+            seen_foods.append(entry["food"])
+            from_findings.append({**entry, "food": entry.get("pt") or entry["food"],
+                                  "group": tax.label(entry["group"]),
+                                  "because": finding["headline"]})
     out["for_findings"] = from_findings[:8]
 
     usual = [f for f in profile.get("foods", [])
              if not slot_hint or f.get("top_slot") == slot_hint]
     out["usual_at_this_slot"] = [
-        {"food": f["food"], "group": f["group"],
+        {"food": f.get("pt") or f["food"], "group": tax.label(f["group"]),
          "typical_portion_g": f["median_portion_g"], "times": f["times"]}
         for f in usual[:10]
     ]
@@ -630,7 +688,7 @@ def next_meal_candidates(profile: Dict[str, Any], *,
         {"group": key, "label": rec["label"],
          "servings_per_week": rec.get("servings_per_week"),
          "reference_min": rec.get("week_min"),
-         "options": [o["food"] for o in
+         "options": [o.get("pt") or o["food"] for o in
                      fp.swap_candidates({"kind": "group_under", "group": key,
                                          "id": f"group_under:{key}"},
                                         profile.get("foods", []))["to"]][:3]}

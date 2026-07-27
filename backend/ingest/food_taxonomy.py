@@ -35,6 +35,13 @@ Groups carry a posture (`more` / `less` / `neutral`) and weekly reference servin
 from mainstream dietary guidance (fish twice a week, legumes three times, processed
 meat as little as possible, most grains whole). Those are framing for observations
 about what was logged — never diagnoses.
+
+The module also owns the other half of a food's identity: its **pt-PT display
+name** (`display_pt`, `translate_unknown`). The keys above are English by necessity
+— FDC is a USDA database and every rule here is written against English — but the
+app and the coach are Portuguese, so a food that is counted as "chicken breast" has
+to be *read* as "peito de frango". Same division of labour as the groups: a curated
+table first, one cached model call only for what it can't place.
 """
 from __future__ import annotations
 
@@ -245,6 +252,141 @@ def canonical_name(raw: str) -> str:
     return key
 
 
+# -- stage 2b: the pt-PT display lexicon ---------------------------------------
+#
+# The app is Portuguese (Portugal) end to end, but `name` is deliberately English:
+# FDC is a USDA database, and every alias, group rule and aggregation key above is
+# written against English. So a food carries TWO names — the English key it is
+# counted under, and the pt-PT name a person actually reads.
+#
+# Meals logged from now on carry their own `name_pt`, written by the ingest model
+# (which sees the photo AND the user's own Portuguese note, so "francesinha" stays
+# "francesinha"). THIS table is the fallback for two cases that field cannot serve:
+# the months of history logged before it existed, and the canonical vocabulary the
+# coach reasons in — "chicken breast" is a bucket name, not something any model
+# wrote, so it needs a translation of its own.
+#
+# Curated rather than generated because this vocabulary is small, closed and
+# already half-written: the pt-PT half of `_RAW_ALIASES` and `_RAW_GROUP_RULES` is
+# the same food list seen from the other side. What isn't here is learned once by
+# `translate_unknown` and cached in the taxonomy blob, exactly like a group is.
+_RAW_PT: Dict[str, str] = {
+    # -- meat, fish, eggs
+    "chicken": "frango", "chicken breast": "peito de frango",
+    "chicken thigh": "coxa de frango", "chicken sandwich": "sandes de frango",
+    "turkey": "peru", "turkey breast": "peito de peru", "duck": "pato",
+    "beef": "carne de vaca", "beef steak": "bife de vaca", "beef patty": "hambúrguer de vaca",
+    "veal": "vitela", "pork": "porco", "lamb": "borrego", "ribeye": "entrecosto",
+    "steak": "bife", "burger": "hambúrguer", "patty": "hambúrguer",
+    "mince": "carne picada", "red meat": "carne vermelha", "cured meat": "carne curada",
+    "ham": "fiambre", "bacon": "bacon", "sausage": "salsicha",
+    "blood sausage": "morcela", "chorizo": "chouriço", "salami": "salame",
+    "pate": "paté", "frankfurter": "salsicha", "hot dog": "cachorro",
+    "fish": "peixe", "raw fish": "peixe cru", "cod": "bacalhau", "salmon": "salmão",
+    "tuna": "atum", "sardine": "sardinha", "mackerel": "cavala", "trout": "truta",
+    "hake": "pescada", "haddock": "arinca", "herring": "arenque", "sole": "linguado",
+    "sea bass": "robalo", "tilapia": "tilápia", "anchovy": "anchova",
+    "shrimp": "camarão", "prawn": "gamba", "squid": "lula", "octopus": "polvo",
+    "clam": "amêijoa", "mussel": "mexilhão", "crab": "caranguejo", "lobster": "lavagante",
+    "seafood": "marisco", "sushi roll": "sushi", "egg": "ovo", "omelette": "omelete",
+    # -- grains and bread
+    "rice": "arroz", "white rice": "arroz branco", "brown rice": "arroz integral",
+    "bread": "pão", "white bread": "pão branco", "wholemeal bread": "pão integral",
+    "baguette": "baguete", "toast": "torrada", "roll": "papo-seco", "bun": "pão",
+    "bread mash": "migas", "pasta": "massa", "spaghetti": "esparguete",
+    "macaroni": "macarrão", "noodle": "noodles", "couscous": "cuscuz",
+    "oats": "aveia", "quinoa": "quinoa", "buckwheat": "trigo-sarraceno",
+    "bulgur": "bulgur", "rye": "centeio", "spelt": "espelta", "flour": "farinha",
+    "cereal": "cereais", "granola": "granola", "muesli": "muesli",
+    "kefir granola": "granola com kefir", "tortilla": "tortilha", "wrap": "wrap",
+    "whole grain": "cereal integral", "cracker": "bolacha de água e sal",
+    # -- vegetables and legumes
+    "vegetable": "legumes", "vegetable medley": "macedónia de legumes",
+    "vegetable soup": "sopa de legumes", "soup": "sopa", "salad": "salada",
+    "potato": "batata", "sweet potato": "batata-doce", "french fries": "batatas fritas",
+    "potato chips": "batatas fritas de pacote", "hash brown": "batata ralada frita",
+    "carrot": "cenoura", "onion": "cebola", "tomato": "tomate", "lettuce": "alface",
+    "cucumber": "pepino", "pepper": "pimento", "broccoli": "brócolos",
+    "cauliflower": "couve-flor", "cabbage": "couve", "kale": "couve-galega",
+    "spinach": "espinafres", "watercress": "agrião", "asparagus": "espargos",
+    "courgette": "courgette", "zucchini": "courgette", "aubergine": "beringela",
+    "mushroom": "cogumelos", "beetroot": "beterraba", "pea": "ervilhas",
+    "green bean": "feijão-verde", "bean": "feijão", "beans": "feijão",
+    "black beans": "feijão preto", "chickpea": "grão-de-bico", "lentil": "lentilhas",
+    "edamame": "edamame", "hummus": "húmus", "tofu": "tofu", "yam": "inhame",
+    # -- fruit
+    "fruit": "fruta", "apple": "maçã", "pear": "pera", "orange": "laranja",
+    "tangerine": "tangerina", "clementine": "clementina", "banana": "banana",
+    "grape": "uvas", "strawberry": "morangos", "berry": "frutos vermelhos",
+    "peach": "pêssego", "plum": "ameixa", "cherry": "cerejas", "fig": "figo",
+    "melon": "melão", "watermelon": "melancia", "pineapple": "ananás",
+    "mango": "manga", "kiwi": "kiwi", "avocado": "abacate", "coconut": "coco",
+    "acai": "açaí", "lemon": "limão",
+    # -- dairy
+    "milk": "leite", "condensed milk": "leite condensado", "cheese": "queijo",
+    "fresh cheese": "queijo fresco", "curd": "requeijão", "cottage cheese": "cottage cheese",
+    "yogurt": "iogurte", "yoghurt": "iogurte", "greek yogurt": "iogurte grego",
+    "skyr": "skyr", "quark": "quark", "kefir": "kefir", "cream": "natas",
+    "cream sauce": "molho de natas", "butter": "manteiga", "margarine": "margarina",
+    "ice cream": "gelado", "pudding": "pudim", "mozzarella": "mozzarella",
+    "parmesan": "parmesão", "cheddar": "cheddar", "feta": "queijo feta",
+    # -- fats, nuts, seeds
+    "olive oil": "azeite", "vegetable oil": "óleo vegetal",
+    "sunflower oil": "óleo de girassol", "coconut oil": "óleo de coco",
+    "avocado oil": "óleo de abacate", "oil": "óleo", "lard": "banha",
+    "peanuts": "amendoins", "peanut butter": "manteiga de amendoim",
+    "almond": "amêndoas", "walnut": "nozes", "hazelnut": "avelãs",
+    "cashew": "cajus", "pistachio": "pistácios", "nut butter": "manteiga de frutos secos",
+    "seed": "sementes", "chia": "chia", "flax": "linhaça", "tahini": "tahini",
+    "mayonnaise": "maionese",
+    # -- sweets, snacks, drinks
+    "sugar": "açúcar", "honey": "mel", "jam": "compota", "chocolate": "chocolate",
+    "cake": "bolo", "cookie": "bolacha", "biscuit": "bolacha", "pastry": "pastel",
+    "croissant": "croissant", "donut": "donut", "brownie": "brownie",
+    "waffle": "waffle", "candy": "rebuçados", "dessert": "sobremesa",
+    "popcorn": "pipocas", "pretzel": "pretzel", "nacho": "nachos", "crisps": "batatas fritas",
+    "chips": "batatas fritas", "snack": "snack", "syrup": "xarope",
+    "water": "água", "coffee": "café", "tea": "chá", "iced tea": "chá gelado",
+    "infusion": "infusão", "juice": "sumo", "soda": "refrigerante", "cola": "cola",
+    "energy drink": "bebida energética", "smoothie": "smoothie",
+    "milkshake": "batido", "beer": "cerveja", "wine": "vinho",
+    "red wine": "vinho tinto", "white wine": "vinho branco", "port": "vinho do Porto",
+    "sangria": "sangria", "cider": "sidra", "vodka": "vodka", "gin": "gin",
+    "whisky": "whisky", "rum": "rum", "tequila": "tequila", "liqueur": "licor",
+    "pizza": "pizza", "sandwich": "sandes", "salt": "sal",
+}
+
+# Terms a Portuguese speaker uses in English anyway. Translating these mechanically
+# ("proteína de soro de leite") reads worse than leaving them, so `display_pt`
+# returns them untouched rather than reaching for the model.
+_KEEP_AS_IS = ("whey protein", "protein powder", "protein shake", "protein bar",
+               "protein drink", "protein ice cream", "casein", "creatine", "bcaa",
+               "multivitamin", "supplement", "cottage cheese", "wrap", "smoothie",
+               "granola", "muesli", "ketchup", "wasabi")
+
+def display_key(raw: str) -> str:
+    """The lexicon's key: case-, accent- and punctuation-insensitive, but otherwise
+    the name AS LOGGED.
+
+    Deliberately not `normalize`. That one exists to make "grilled chicken breast"
+    and "boiled chicken breast" the same bucket — which is right for counting and
+    wrong for showing, because it would also make them the same *label*. Keying the
+    display lexicon here is what lets a learned entry carry "grelhado" while the
+    grouping still counts both under one food.
+    """
+    text = strip_accents(str(raw or "")).lower()
+    text = re.sub(r"[^a-z0-9%\s-]", " ", text).replace("-", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+PT_NAMES: Dict[str, str] = {}
+for _k, _v in _RAW_PT.items():
+    PT_NAMES.setdefault(display_key(_k), _v)
+    PT_NAMES.setdefault(normalize(_k), _v)
+_KEEP_KEYS = frozenset(
+    k for term in _KEEP_AS_IS for k in (display_key(term), normalize(term)))
+
+
 # Group rules, most specific first: (group, keywords). Keywords are normalised and
 # matched as a whole token run inside the canonical name.
 _RAW_GROUP_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
@@ -414,7 +556,8 @@ def label(group: str) -> str:
 
 # -- stage 3: the learned taxonomy blob ----------------------------------------
 
-TAXONOMY_VERSION = 1
+# 2 added the `pt` map — the learned half of the pt-PT display lexicon.
+TAXONOMY_VERSION = 2
 
 _CLASSIFY_RULES = """Classificas alimentos de um registo alimentar português. Para cada
 nome dado, devolve o alimento canónico (nome curto, sem marca nem modo de preparação) e
@@ -441,28 +584,67 @@ def build_classify_prompt(names: List[str]) -> str:
 
 
 def empty_taxonomy() -> Dict[str, Any]:
-    return {"version": TAXONOMY_VERSION, "foods": {}}
+    return {"version": TAXONOMY_VERSION, "foods": {}, "pt": {}}
+
+
+def display_pt(raw: str, taxonomy: Optional[Dict[str, Any]] = None, *,
+               name_pt: Optional[str] = None) -> str:
+    """The pt-PT name to SHOW for a logged food. Never raises, never returns empty:
+    an unknown food falls back to its own English name, because a meal the user can
+    read in the wrong language beats a meal that isn't there.
+
+    Resolution runs most-specific first. The meal's own `name_pt` wins outright —
+    it was written against the actual photo and note. Then the exact logged spelling
+    (so "grilled chicken breast" can keep its "grelhado"), and only then the
+    canonical bucket, which by construction has lost the qualifiers.
+    """
+    raw = str(raw or "").strip()
+    if name_pt and str(name_pt).strip():
+        return str(name_pt).strip()
+    if not raw:
+        return raw
+
+    exact, key, canonical = display_key(raw), normalize(raw), canonical_name(raw)
+    if exact in _KEEP_KEYS or key in _KEEP_KEYS:
+        return raw
+    learned = (taxonomy or {}).get("pt") or {}
+    # Exact spelling first (it can carry the cooking method), then the bucket.
+    for candidate in (learned.get(exact), PT_NAMES.get(exact),
+                      learned.get(key), PT_NAMES.get(key),
+                      learned.get(canonical), PT_NAMES.get(canonical)):
+        if candidate and str(candidate).strip():
+            return str(candidate).strip()
+    return raw
 
 
 def lookup(taxonomy: Optional[Dict[str, Any]], raw: str) -> Dict[str, Any]:
     """Everything known about one logged food name: its canonical name, its group,
-    and where that group came from (`rule`, `llm` or `fallback`).
+    where that group came from (`rule`, `llm` or `fallback`), and the pt-PT name to
+    display it under.
 
     The learned blob is consulted only for names the rules can't place, so a stale
     or wrong model answer can never override the curated taxonomy.
     """
     canonical = canonical_name(raw)
     fried = is_fried(raw)
+    # The display name is resolved from the RAW name, not the canonical one: the
+    # canonical has had cooking method and qualifiers stripped for grouping, and
+    # showing "frango" for what the user logged as grilled chicken breast throws
+    # away detail the app is meant to show.
+    pt = display_pt(raw, taxonomy)
+    pt_canonical = display_pt(canonical, taxonomy)
     group = group_by_rules(canonical)
     if group:
         return {"canonical": canonical, "group": group, "source": "rule",
-                "fried": fried}
+                "fried": fried, "pt": pt, "pt_canonical": pt_canonical}
     learned = (taxonomy or {}).get("foods", {}).get(canonical)
     if isinstance(learned, dict) and learned.get("group") in GROUP_INFO:
-        return {"canonical": str(learned.get("canonical") or canonical),
-                "group": str(learned["group"]), "source": "llm", "fried": fried}
+        resolved = str(learned.get("canonical") or canonical)
+        return {"canonical": resolved, "group": str(learned["group"]),
+                "source": "llm", "fried": fried, "pt": pt,
+                "pt_canonical": display_pt(resolved, taxonomy)}
     return {"canonical": canonical, "group": "other", "source": "fallback",
-            "fried": fried}
+            "fried": fried, "pt": pt, "pt_canonical": pt_canonical}
 
 
 def unknown_names(taxonomy: Optional[Dict[str, Any]],
@@ -513,4 +695,103 @@ def classify_unknown(taxonomy: Optional[Dict[str, Any]], raws: Iterable[str],
                       "group": group}
         learned += 1
     base["foods"] = foods
+    return base, learned
+
+
+# -- the learned half of the pt-PT lexicon -------------------------------------
+#
+# Same shape and same division of labour as `classify_unknown` above: the model
+# only ever CONTRIBUTES to a reference table that the code then reads
+# deterministically, so what the app displays never changes run to run.
+#
+# This call is self-extinguishing. Meals logged since `name_pt` exists carry their
+# own display name and never reach here; what's left is the historical backlog and
+# the coach's canonical buckets, both finite. Once they're learned the taxonomy has
+# every name and this stops firing entirely.
+_TRANSLATE_RULES = """Traduzes nomes de alimentos para português de Portugal (pt-PT),
+para serem mostrados numa app de registo alimentar. Os nomes vêm em inglês (ou já em
+português) de um registo alimentar.
+
+Regras:
+- Português EUROPEU, nunca do Brasil: "peito de frango" e não "peito de frango
+  grelhadinho"; "sumo" e não "suco"; "casa de banho" e não "banheiro".
+- Minúsculas, sem artigo à frente ("arroz branco", não "o arroz branco").
+- Mantém EXATAMENTE o mesmo nível de detalhe do nome dado: "grilled chicken breast"
+  -> "peito de frango grelhado" (não só "frango"); "skin-on chicken thigh" -> "coxa
+  de frango com pele".
+- Marcas, nomes próprios e termos que em Portugal se dizem em inglês ficam como
+  estão: "whey protein", "Big Tasty", "cottage cheese", "wrap", "smoothie".
+- Se o nome JÁ estiver em português, devolve-o tal como está.
+- Nunca inventes um alimento diferente do que te é dado. Se não souberes traduzir,
+  devolve o nome original.
+
+Devolve APENAS: {{"foods": [{{"name": "<o nome dado>", "pt": "..."}}]}}"""
+
+
+def build_translate_prompt(names: List[str]) -> str:
+    listed = "\n".join(f"- {n}" for n in names)
+    return f"{_TRANSLATE_RULES}\n\nNOMES A TRADUZIR:\n{listed}"
+
+
+def untranslated_names(taxonomy: Optional[Dict[str, Any]],
+                       raws: Iterable[str]) -> List[str]:
+    """The logged spellings nothing can put a Portuguese name to yet — the exact set
+    worth one translation call. Returns the ORIGINAL spelling (not the normalised
+    key) because the model translates real words better than stemmed ones."""
+    out: List[str] = []
+    seen: set = set()
+    for raw in raws:
+        raw = str(raw or "").strip()
+        if not raw:
+            continue
+        key = display_key(raw)
+        # `display_pt` returns the input unchanged both when it found nothing AND
+        # when the term is deliberately left in English, so the keep-list has to be
+        # checked separately — otherwise "whey protein" would be re-sent for
+        # translation on every single run, forever.
+        if key in seen or key in _KEEP_KEYS or normalize(raw) in _KEEP_KEYS:
+            continue
+        if display_pt(raw, taxonomy) != raw:
+            continue
+        seen.add(key)
+        out.append(raw)
+    return out
+
+
+def translate_unknown(taxonomy: Optional[Dict[str, Any]], raws: Iterable[str],
+                      call: Callable[[str], Dict[str, Any]], *,
+                      limit: int = 60) -> Tuple[Dict[str, Any], int]:
+    """Learn the pt-PT name for everything the curated table can't place, and fold
+    the answers into `taxonomy`. Returns (taxonomy, number learned).
+
+    A failure is swallowed exactly as in `classify_unknown`: the food keeps showing
+    its English name and the app still renders, which always beats an empty screen.
+    """
+    base = dict(taxonomy or empty_taxonomy())
+    base.setdefault("version", TAXONOMY_VERSION)
+    base.setdefault("foods", {})
+    base.setdefault("pt", {})
+    names = untranslated_names(base, raws)[:limit]
+    if not names:
+        return base, 0
+    try:
+        answer = call(build_translate_prompt(names))
+    except Exception as exc:
+        log.warning("food translation failed (non-fatal): %s", exc)
+        return base, 0
+
+    pt_map = dict(base.get("pt") or {})
+    learned = 0
+    for entry in (answer.get("foods") or []):
+        if not isinstance(entry, dict):
+            continue
+        key = display_key(str(entry.get("name") or ""))
+        pt = str(entry.get("pt") or "").strip()[:120]
+        # An answer for a name we never asked about is a hallucinated key that
+        # would sit in the lexicon forever — drop it rather than store it.
+        if not key or not pt or key not in {display_key(n) for n in names}:
+            continue
+        pt_map[key] = pt
+        learned += 1
+    base["pt"] = pt_map
     return base, learned

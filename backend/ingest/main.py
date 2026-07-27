@@ -496,8 +496,21 @@ method changes both weight (water loss/absorption) and fat. Split composite
 plates into separate items ("meat with rice" = two items). Distinguish
 look-alikes by visual cues (tangerine vs orange, sweet potato vs potato, salmon
 vs trout, prosciutto vs bacon, white vs brown rice). Name items in lowercase
-singular English. If a packaged item shows a nutrition label, READ IT and scale
-to the visible portion — labels beat estimation.
+singular English in `name`. If a packaged item shows a nutrition label, READ IT and
+scale to the visible portion — labels beat estimation.
+
+Also give every item a `name_pt`: the SAME food named in European Portuguese
+(pt-PT, not Brazilian), lowercase, as a person in Portugal would say it at the
+table — "peito de frango", "arroz branco", "queijo fresco". Rules:
+  - If the user's note names the dish, reuse THEIR word exactly ("francesinha",
+    "arroz de pato", "migas") — never re-translate what they already wrote, and
+    set `name` to the closest English description of it.
+  - Keep brands, proper nouns and terms Portuguese speakers normally say in
+    English unchanged ("whey protein", "Big Tasty", "cottage cheese", "Pingo
+    Doce") — a forced translation reads worse than the original.
+  - Match `name`'s level of detail: "skin-on chicken thigh" -> "coxa de frango com
+    pele", not just "frango".
+  - If the Portuguese is identical to the English, repeat it; never leave it empty.
 
 4) WEIGH EACH ITEM (cooked, as served).
 Estimate each item's real edible weight in grams from its size in the frame and
@@ -741,7 +754,16 @@ butter, dressings, added sugar — exactly as you would for a photo; these are t
 largest calorie-error source.
 
 3) IDENTIFY EACH ITEM PRECISELY and split composite meals into separate items
-("chicken with rice" = two items). Name items in lowercase singular English.
+("chicken with rice" = two items). Name items in lowercase singular English in
+`name`.
+
+Also give every item a `name_pt`: the SAME food in European Portuguese (pt-PT, not
+Brazilian), lowercase, as a person in Portugal would say it. The description is
+usually ALREADY in Portuguese — when it is, reuse the user's own words verbatim
+("francesinha", "arroz de pato", "secreto de porco") and make `name` the English
+description of that. Keep brands and terms normally said in English unchanged
+("whey protein", "Big Tasty"). Match `name`'s level of detail. Never leave it
+empty — if the Portuguese is identical to the English, repeat it.
 
 4) WEIGH EACH ITEM (cooked, as eaten) in grams from the stated or typical serving
 and the food's density.
@@ -831,11 +853,17 @@ RESPONSE_SCHEMA = types.Schema(
             type=types.Type.ARRAY,
             items=types.Schema(
                 type=types.Type.OBJECT,
-                property_ordering=["name", "cooking_method", "portion_g",
-                                   "calories", "protein_g", "carbs_g", "fat_g",
-                                   "nutrients"],
+                property_ordering=["name", "name_pt", "cooking_method",
+                                   "portion_g", "calories", "protein_g",
+                                   "carbs_g", "fat_g", "nutrients"],
                 properties={
                     "name": types.Schema(type=types.Type.STRING),
+                    # The pt-PT name the app displays. Written here, beside the
+                    # English key, because this call is the only place that sees
+                    # BOTH the photo and the user's own (Portuguese) note — so a
+                    # dish they named themselves keeps their words instead of
+                    # round-tripping through English and back.
+                    "name_pt": types.Schema(type=types.Type.STRING),
                     "cooking_method": types.Schema(type=types.Type.STRING),
                     "portion_g": types.Schema(type=types.Type.NUMBER),
                     "calories": types.Schema(type=types.Type.NUMBER),
@@ -1038,8 +1066,15 @@ def _normalize_nutrients(raw: Any) -> Dict[str, float]:
 
 
 def _normalize_items(raw: Any) -> List[Dict[str, Any]]:
-    """Coerce the model's item list into clean {name, portion_g, macros,
-    cooking_method?, nutrients?} dicts."""
+    """Coerce the model's item list into clean {name, name_pt?, portion_g, macros,
+    cooking_method?, nutrients?} dicts.
+
+    `name` is the English canonical key — FDC grounding, the food taxonomy and every
+    aggregation key off it. `name_pt` is what the app shows. Kept only when the model
+    actually gave something different: a name that is identical in both languages
+    ("whey protein", a brand) needs no second copy, and the display layer falls back
+    to `name` whenever `name_pt` is absent.
+    """
     items: List[Dict[str, Any]] = []
     for entry in raw or []:
         if not isinstance(entry, dict):
@@ -1055,6 +1090,9 @@ def _normalize_items(raw: Any) -> List[Dict[str, Any]]:
             "carbs_g": _round_num(entry.get("carbs_g")),
             "fat_g": _round_num(entry.get("fat_g")),
         }
+        name_pt = str(entry.get("name_pt", "")).strip()[:120]
+        if name_pt and name_pt.casefold() != name.casefold():
+            item["name_pt"] = name_pt
         method = str(entry.get("cooking_method", "")).strip()[:40]
         if method:
             item["cooking_method"] = method
@@ -2260,12 +2298,84 @@ def _history_window(meal_rows: List[Dict[str, Any]], ref_day: str,
     return out
 
 
+# -- pt-PT display names --------------------------------------------------------
+# The sheet stores English: `items[].name` is the key FDC grounding, the food
+# taxonomy and every aggregation are written against. The app is Portuguese
+# (Portugal) throughout, so the API translates on the way out.
+#
+# Nothing is translated HERE, though — resolving a name is a pure table lookup in
+# `food_taxonomy.display_pt`, fed by the meal's own `name_pt` (written at ingest,
+# against the photo and the user's note) and by the curated + learned lexicon. No
+# model call, no write, no failure mode: a name nothing can place shows in English,
+# which is what it did before this existed.
+
+# The taxonomy blob lives in GCS and is read on every coach run. Re-reading it per
+# request would put a network round trip on the app's main screen for a table that
+# changes only when the coach learns a new food (rare, and increasingly never), so
+# it's held for a minute. A stale read costs one meal one English name for 60 s.
+_TAXONOMY_TTL_S = 60
+_taxonomy_cached: Tuple[float, Optional[Dict[str, Any]]] = (0.0, None)
+
+
+def _display_taxonomy() -> Optional[Dict[str, Any]]:
+    """The taxonomy blob for display lookups, cached briefly. Returns None rather
+    than raising — `display_pt` treats that as "curated table only"."""
+    global _taxonomy_cached
+    cached_at, blob = _taxonomy_cached
+    now = time.time()
+    if blob is not None and now - cached_at < _TAXONOMY_TTL_S:
+        return blob
+    try:
+        store = _coach("coach_store")
+        blob = store.read_json(store.TAXONOMY, default=None)
+    except Exception:
+        app.logger.warning("taxonomy read for display failed (non-fatal)",
+                           exc_info=True)
+        blob = None
+    _taxonomy_cached = (now, blob)
+    return blob
+
+
+def _display_items(items: List[Dict[str, Any]],
+                   taxonomy: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """`items` with each `name` replaced by its pt-PT display name.
+
+    `name_pt` is consumed here rather than passed through: the app renders one name
+    per item, and every client-side path (the drill-down, the nutrient attribution,
+    the share sheet) should show the same string without having to know which field
+    to prefer.
+    """
+    tax = _coach("food_taxonomy")
+    out: List[Dict[str, Any]] = []
+    for item in items:
+        item = dict(item)
+        item["name"] = tax.display_pt(item.get("name", ""), taxonomy,
+                                      name_pt=item.pop("name_pt", None))
+        out.append(item)
+    return out
+
+
+def _display_foods(items: List[Dict[str, Any]], fallback: str) -> str:
+    """The meal's one-line food list, rebuilt from its already-translated items.
+
+    Deliberately NOT a translation of the stored `foods` cell. That cell is itself
+    just ", ".join(item names) (see _meal_from_items), and item names legitimately
+    contain commas — "chicken thigh, skin-on" is an example in the ingest prompt —
+    so splitting it back apart would shatter such a name into fragments that match
+    nothing. Rebuilding from the items is exact. `fallback` covers a legacy row
+    whose items cell is empty but whose `foods` text isn't.
+    """
+    return ", ".join(str(i.get("name", "")).strip()
+                     for i in items if str(i.get("name", "")).strip()) or fallback
+
+
 def _today_meals_out(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """The day's meals for /today: the same shape as /meals but WITH each meal's
     per-ingredient `items` (each carrying its `nutrients` map), so the app can show,
     for any nutrient, exactly which foods contributed it — the drill-down feature —
     without a second request."""
     macro_keys = ("calories", "protein_g", "carbs_g", "fat_g")
+    taxonomy = _display_taxonomy()
     out: List[Dict[str, Any]] = []
     for row in rows:
         if _is_stub(row):
@@ -2274,16 +2384,18 @@ def _today_meals_out(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if max(macros.values()) <= 0 and not _has_any_nutrients(row):
             continue
         when = str(row.get("datetime") or "")
+        items = _display_items(
+            _normalize_items(_parse_items_cell(row.get("items"))), taxonomy)
         out.append({
             "datetime": when,
             "time": when[11:16],
-            "foods": str(row.get("foods") or "").strip(),
+            "foods": _display_foods(items, str(row.get("foods") or "").strip()),
             "note": str(row.get("note") or "").strip(),
             "template": str(row.get("template") or "").strip(),
             "photo_url": str(row.get("photo_url") or "").strip(),
             "edited": bool(str(row.get("edited_at") or "").strip()),
             **macros,
-            "items": _normalize_items(_parse_items_cell(row.get("items"))),
+            "items": items,
         })
     out.sort(key=lambda m: m["datetime"])
     return out
@@ -3006,6 +3118,7 @@ def meals():
 
     rows = _todays_meals(day)  # filters the meals tab by the date prefix
     macro_keys = ("calories", "protein_g", "carbs_g", "fat_g")
+    taxonomy = _display_taxonomy()
     meals_out: List[Dict[str, Any]] = []
     for r in rows:
         if _is_stub(r):
@@ -3014,10 +3127,14 @@ def meals():
         if max(macros.values()) <= 0 and not _has_any_nutrients(r):
             continue
         when = str(r.get("datetime") or "")
+        # The items are parsed only to rebuild `foods` in pt-PT — they are not part
+        # of this response (that is /today's job), so they are dropped afterwards.
+        items = _display_items(
+            _normalize_items(_parse_items_cell(r.get("items"))), taxonomy)
         meals_out.append({
             "datetime": when,
             "time": when[11:16],  # "HH:MM" off the ISO string
-            "foods": str(r.get("foods") or "").strip(),
+            "foods": _display_foods(items, str(r.get("foods") or "").strip()),
             "note": str(r.get("note") or "").strip(),
             "template": str(r.get("template") or "").strip(),
             **macros,
@@ -3228,7 +3345,8 @@ def insights_food_profile():
     ref = datetime.now(_tz()).date()
     start = (ref - timedelta(days=PROFILE_WINDOW_DAYS)).isoformat()
     profile = _insights_mod().build_food_profile(
-        _window_meals(all_rows, start, ref.isoformat()), NUTRIENT_KEYS)
+        _window_meals(all_rows, start, ref.isoformat()), NUTRIENT_KEYS,
+        _display_taxonomy())
     return jsonify({"generated_for": ref.isoformat(),
                     "window_days": PROFILE_WINDOW_DAYS, "foods": profile}), 200
 
@@ -3253,7 +3371,8 @@ def insights_next_meal_context():
     start = (now.date() - timedelta(days=PROFILE_WINDOW_DAYS)).isoformat()
     window_meals = _window_meals(all_rows, start, day)
     ins = _insights_mod()
-    profile = ins.build_food_profile(window_meals, NUTRIENT_KEYS)
+    taxonomy = _display_taxonomy()
+    profile = ins.build_food_profile(window_meals, NUTRIENT_KEYS, taxonomy)
 
     is_v2 = request.args.get("v2") == "1"
     if is_v2:
@@ -3263,7 +3382,7 @@ def insights_next_meal_context():
             food_profile=profile,
             today_rows=today_rows, window_meals=window_meals,
             window_days=PROFILE_WINDOW_DAYS,
-            current_time=now.strftime("%H:%M"))
+            current_time=now.strftime("%H:%M"), taxonomy=taxonomy)
     else:
         ctx = ins.next_meal_context(
             consumed=consumed, targets=targets,
@@ -3428,7 +3547,7 @@ def insights_generate_weekly():
                           (datetime.fromisoformat(week_start).date() -
                            timedelta(days=_PROFILE_WINDOW_DAYS_NARRATOR)).isoformat(),
                           week_start),
-            NUTRIENT_KEYS)
+            NUTRIENT_KEYS, _display_taxonomy())
 
         if diagnosis.get("window", {}).get("days_logged", 0) < 4:
             return jsonify({
@@ -3534,7 +3653,9 @@ def insights_generate_next_meal():
         focus_key = _get_current_focus()
 
         ins = _insights_mod()
-        food_profile = ins.build_food_profile(window_meals, NUTRIENT_KEYS)
+        nm_taxonomy = _display_taxonomy()
+        food_profile = ins.build_food_profile(window_meals, NUTRIENT_KEYS,
+                                              nm_taxonomy)
 
         # Build enhanced context with timing profile and today's meals.
         context = ins.next_meal_context_v2(
@@ -3544,7 +3665,7 @@ def insights_generate_next_meal():
             today_rows=today_rows,
             window_meals=window_meals,
             window_days=_PROFILE_WINDOW_DAYS_NARRATOR,
-            current_time=current_time,
+            current_time=current_time, taxonomy=nm_taxonomy,
         )
 
         if not context.get("candidates"):
@@ -3731,9 +3852,17 @@ def _coach_profile(now: datetime, window_meals: List[Dict[str, Any]], *,
                  for i in patterns._parse_items(row.get("items"))]
         taxonomy, learned = taxonomy_mod.classify_unknown(
             taxonomy, names, _gemini_call("foods", temperature=0.1))
-        if learned:
+        # The pt-PT half of the same reference table. Meals logged since the ingest
+        # model started writing `name_pt` never reach this, so what it sees is the
+        # historical backlog plus the odd food the curated lexicon doesn't carry —
+        # a set that shrinks to nothing. Learned here, on the background generation
+        # path, so no request ever waits on a translation.
+        taxonomy, translated = taxonomy_mod.translate_unknown(
+            taxonomy, names, _gemini_call("foods", temperature=0.0))
+        if learned or translated:
             store.write_json(store.TAXONOMY, taxonomy)
-            app.logger.info("taxonomy learned %d new foods", learned)
+            app.logger.info("taxonomy learned %d new foods, %d new pt names",
+                            learned, translated)
 
     return patterns.build_food_profile(
         window_meals, taxonomy=taxonomy, window_days=COACH_WINDOW_DAYS,
@@ -3771,7 +3900,11 @@ def _coach_today(now: datetime, today_rows: List[Dict[str, Any]],
     for meal in patterns.read_meals(today_rows, taxonomy):
         items = []
         for item in meal["items"]:
-            entry = {"food": item["food"], "grams": round(item["grams"]),
+            # pt-PT, and the logged-detail one rather than the canonical bucket:
+            # this is the model's view of one specific plate, so "peito de frango
+            # grelhado" is exactly the detail it should be commenting on.
+            entry = {"food": item.get("pt") or item["food"],
+                     "grams": round(item["grams"]),
                      "group": item["group"], "calories": round(item["calories"])}
             if item["fried"]:
                 entry["fried"] = True
@@ -3836,7 +3969,9 @@ def _next_meal_context(now: datetime, *, profile: Dict[str, Any],
                        today: Dict[str, Any], consumed: Dict[str, float],
                        targets: Dict[str, Dict[str, Any]],
                        window_meals: List[Dict[str, Any]],
-                       memory: Dict[str, Any]) -> Dict[str, Any]:
+                       memory: Dict[str, Any],
+                       taxonomy: Optional[Dict[str, Any]] = None,
+                       ) -> Dict[str, Any]:
     """Everything the plate generator gets: the clock, the day, the user's timing
     habits, the remaining budget, and candidate foods from BOTH the nutrient
     shortfalls and the food-level findings."""
@@ -3844,11 +3979,15 @@ def _next_meal_context(now: datetime, *, profile: Dict[str, Any],
     feed = _coach("coach_feed")
     memory_mod = _coach("coach_memory")
 
-    legacy_profile = ins.build_food_profile(window_meals, NUTRIENT_KEYS)
+    # The taxonomy travels down so the nutrient-side candidates name their foods
+    # in the same pt-PT as the food-pattern side; two halves of one prompt calling
+    # the same food two different things is worse than either name alone.
+    legacy_profile = ins.build_food_profile(window_meals, NUTRIENT_KEYS, taxonomy)
     nutrient_ctx = ins.next_meal_context_v2(
         consumed=consumed, targets=targets, focus_key=None,
         food_profile=legacy_profile, today_rows=[], window_meals=window_meals,
-        window_days=COACH_WINDOW_DAYS, current_time=now.strftime("%H:%M"))
+        window_days=COACH_WINDOW_DAYS, current_time=now.strftime("%H:%M"),
+        taxonomy=taxonomy)
     slot_hint = feed.slot_for(now)
     return {
         "current_time": now.strftime("%H:%M"),
@@ -4169,7 +4308,8 @@ def _build_generation_job(now: datetime, *, slot: str,
         memory=memory, state=state,
         next_meal=(_next_meal_context(now, profile=profile, today=today,
                                       consumed=consumed, targets=targets,
-                                      window_meals=window_meals, memory=memory)
+                                      window_meals=window_meals, memory=memory,
+                                      taxonomy=taxonomy)
                    if "next_meal" in feed._wants(slot) else None),
         weekly=_coach_weekly_facts(profile) if slot == "weekly" else None,
         recent=[{"title": str(c.get("title") or ""),

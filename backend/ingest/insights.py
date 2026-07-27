@@ -36,6 +36,8 @@ import json
 import statistics
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import food_taxonomy as tax
+
 # -- tunable thresholds --------------------------------------------------------
 # A reach nutrient below this fraction of its floor (averaged over the window) is a
 # deficit; at/above it is adequate. 0.8 matches the app's amber "close" band.
@@ -98,6 +100,20 @@ def _norm_name(name: Any) -> str:
     return " ".join(str(name or "").lower().split())
 
 
+def _display_name(item: Dict[str, Any],
+                  taxonomy: Optional[Dict[str, Any]] = None) -> str:
+    """The pt-PT name for one logged item — the key this module aggregates under.
+
+    Aggregating on the DISPLAY name (rather than the English one, translating later)
+    is deliberate here: unlike food_patterns, this module has no canonical layer, so
+    its keys are already just whatever string the log used. Making that string the
+    Portuguese one means the food profile, the nutrient attribution and the day's
+    meal summary all name a food the same way the rest of the coach does.
+    """
+    return _norm_name(tax.display_pt(_norm_name(item.get("name")), taxonomy,
+                                     name_pt=item.get("name_pt")))
+
+
 def _item_keys(item: Dict[str, Any]) -> Dict[str, float]:
     n = item.get("nutrients")
     return n if isinstance(n, dict) else {}
@@ -148,7 +164,8 @@ def _coverage(window_meals: Sequence[Dict[str, Any]], key: str) -> float:
 
 
 def _attribution(window_meals: Sequence[Dict[str, Any]], key: str,
-                 top: int = 3) -> List[Dict[str, Any]]:
+                 top: int = 3,
+                 taxonomy: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """The foods that contributed this nutrient across the window, biggest first.
 
     For a deficit these are the sources already working (eat more of them); for an
@@ -163,7 +180,7 @@ def _attribution(window_meals: Sequence[Dict[str, Any]], key: str,
             amount = _num(_item_keys(item).get(key))
             if amount <= 0:
                 continue
-            name = _norm_name(item.get("name"))
+            name = _display_name(item, taxonomy)
             if not name:
                 continue
             sums[name] = sums.get(name, 0.0) + amount
@@ -501,7 +518,9 @@ def _meal_slot(datetime_str: str) -> str:
 
 
 def build_food_profile(window_meals: Sequence[Dict[str, Any]],
-                       nutrient_keys: Sequence[str]) -> List[Dict[str, Any]]:
+                       nutrient_keys: Sequence[str],
+                       taxonomy: Optional[Dict[str, Any]] = None,
+                       ) -> List[Dict[str, Any]]:
     """The user's food vocabulary, mined from their logged meals: for each distinct
     food, how often and when it's eaten, a typical portion, and its per-gram nutrient
     density (so the next-meal engine can compute how much of it closes a gap). Pure
@@ -513,7 +532,7 @@ def build_food_profile(window_meals: Sequence[Dict[str, Any]],
         slot = _meal_slot(row.get("datetime", ""))
         when = str(row.get("datetime") or "")
         for item in _parse_items(row.get("items")):
-            name = _norm_name(item.get("name"))
+            name = _display_name(item, taxonomy)
             portion = _num(item.get("portion_g"))
             if not name or portion <= 0:
                 continue
@@ -692,7 +711,9 @@ def build_meal_timing_profile(window_meals: Sequence[Dict[str, Any]],
     return profile
 
 
-def build_today_meals_summary(today_rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def build_today_meals_summary(today_rows: Sequence[Dict[str, Any]],
+                              taxonomy: Optional[Dict[str, Any]] = None,
+                              ) -> List[Dict[str, Any]]:
     """Build a summary of today's logged meals for the AI context.
 
     Returns list like:
@@ -709,7 +730,7 @@ def build_today_meals_summary(today_rows: Sequence[Dict[str, Any]]) -> List[Dict
         # Collect food names from items.
         item_names = []
         for item in _parse_items(row.get("items")):
-            name = _norm_name(item.get("name"))
+            name = _display_name(item, taxonomy)
             if name:
                 item_names.append(name)
 
@@ -731,7 +752,9 @@ def next_meal_context_v2(*, consumed: Dict[str, float],
                           today_rows: Sequence[Dict[str, Any]],
                           window_meals: Sequence[Dict[str, Any]],
                           window_days: int,
-                          current_time: str) -> Dict[str, Any]:
+                          current_time: str,
+                          taxonomy: Optional[Dict[str, Any]] = None,
+                          ) -> Dict[str, Any]:
     """Enhanced next-meal context that includes the user's timing patterns and
     today's logged meals so the AI can determine the next slot dynamically.
 
@@ -775,7 +798,7 @@ def next_meal_context_v2(*, consumed: Dict[str, float],
 
     # Build timing profile and today's meals summary.
     meal_pattern = build_meal_timing_profile(window_meals, window_days)
-    today_meals = build_today_meals_summary(today_rows)
+    today_meals = build_today_meals_summary(today_rows, taxonomy)
 
     return {
         "current_time": current_time,

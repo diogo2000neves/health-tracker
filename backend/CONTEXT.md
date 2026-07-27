@@ -427,6 +427,16 @@ token is read-only across `sleep`, `health_metrics_and_measurements` and
     `cooking_method` and a `nutrients` map (~36 possible nutrients, only the
     non-negligible ones stored). The flat columns are the row totals; the daily
     job sums the Tier-1 nutrients from `items` into `daily_summary`.
+  - **Two names per item.** `name` is lowercase singular **English** — the key FDC
+    grounding, `food_taxonomy` and every aggregation are written against, and the
+    only language USDA's database speaks. `name_pt` is the **pt-PT** name the app
+    displays, written by the same call because it is the only place that sees both
+    the photo and the user's own (Portuguese) note — so "francesinha" survives
+    instead of round-tripping through "portuguese sandwich". It is omitted when the
+    two would be identical ("whey protein"), and the display layer falls back to
+    `name`. Anything that rewrites `items` (the nutrition audit) must carry it
+    through, or the meal silently un-translates. Historical rows have no `name_pt`
+    and resolve through the shared lexicon in `food_taxonomy.display_pt`.
   - `confidence` uses a fixed 0.1–1.0 rubric (model-independent); `model` records
     which AI analysed the photo (audit); `image_sha` de-duplicates double-taps.
   - Rows with foods `not food` / `analysis failed` (or all-zero macros) are

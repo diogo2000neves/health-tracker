@@ -478,9 +478,12 @@ private struct MealRow: View {
 	        let item: MealItem
 	    }
 
-	    /// An item tapped to see its full micronutrient profile.
+	    /// An item tapped to see its full micronutrient profile. Identified by its
+	    /// position, like `EditTarget` — names really are not unique, and less so now
+	    /// that they are translated: "potato" and "boiled potato" are two items in the
+	    /// log that both read "batata" on screen.
 	    private struct NutrientTarget: Identifiable {
-	        let id: String      // item name is unique within a meal
+	        let id: Int
 	        let item: MealItem
 	        let title: String
 	    }
@@ -525,7 +528,7 @@ private struct MealRow: View {
 	                        .padding(.vertical, 2)
 	                        .contentShape(Rectangle())
 	                        .onTapGesture {
-	                            nutrientTarget = NutrientTarget(id: item.name, item: item, title: item.name.capitalized)
+	                            nutrientTarget = NutrientTarget(id: index, item: item, title: item.name.capitalized)
 	                        }
 	                    }
 	                } header: {
