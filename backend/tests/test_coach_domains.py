@@ -61,6 +61,40 @@ class TestRankingAcrossDomains:
         assert domains.count("sleep") == feed.MAX_FINDINGS_PER_DOMAIN
         assert "nutrition" in domains
 
+    def test_a_day_with_several_real_problems_reports_all_of_them(self):
+        # The regression this replaced: six genuine findings competed for two slots
+        # and "you are losing muscle" lost. Several areas each deserving a sentence
+        # should each get one.
+        profile = {"findings": [finding("food:fries", 0.55)]}
+        extra = [finding("activity:training_gap", 1.0, domain="activity"),
+                 finding("body:losing_lean_mass", 0.50, domain="body"),
+                 finding("link:late_calories", 0.75, domain="link")]
+        got = feed.eligible_findings(profile, {}, today=TODAY, extra=extra)
+        domains = {f.get("domain", "nutrition") for f in got}
+        assert domains == {"activity", "body", "link", "nutrition"}
+
+    def test_a_quiet_day_stays_quiet(self):
+        # The other half of the trade: the severity floor is what stops the higher
+        # budget becoming spam. Nothing here is worth interrupting anyone with.
+        profile = {"findings": [finding("food:mild", 0.2)]}
+        extra = [finding("sleep:mild", 0.15, domain="sleep"),
+                 finding("activity:mild", 0.3, domain="activity")]
+        assert feed.eligible_findings(profile, {}, today=TODAY, extra=extra) == []
+
+    def test_the_budget_still_caps_a_pathological_day(self):
+        extra = [finding(f"d{i}:x", 0.9, domain=f"d{i}") for i in range(9)]
+        got = feed.eligible_findings({}, {}, today=TODAY, extra=extra)
+        assert len(got) == feed.MAX_FINDINGS_PER_GENERATION
+
+    def test_a_wider_feed_does_not_repeat_itself(self):
+        # Raising the per-day budget must not multiply repetition: the cooldown is
+        # a separate mechanism and still holds every finding for its full silence.
+        extra = [finding("sleep:short", 0.9, domain="sleep"),
+                 finding("activity:gap", 0.9, domain="activity")]
+        state = {"shown": {"sleep:short": {"date": "2026-07-24", "severity": 0.9}}}
+        got = feed.eligible_findings({}, state, today=TODAY, extra=extra)
+        assert [f["id"] for f in got] == ["activity:gap"]
+
     def test_a_link_gets_a_much_longer_silence_than_a_pattern(self):
         # "Late dinners cost you deep sleep" does not become more useful by being
         # repeated on Thursday.

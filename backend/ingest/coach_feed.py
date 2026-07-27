@@ -78,6 +78,33 @@ SEVERITY_ESCALATION = 0.2
 # wins; the whole point of this cap is that it cannot then win five times over.
 MAX_FINDINGS_PER_DOMAIN = 1
 
+# How many findings may reach one generation, across every domain.
+#
+# This was 2, and 2 was wrong. A count is a proxy for "don't spam me" that fails in
+# BOTH directions: on a quiet day it still let two mediocre findings through, and on
+# a genuinely eventful day it silently dropped the third real one. Measured on a bad
+# fortnight — a training gap, lean mass falling, suppressed HRV, short sleep and two
+# measured links — six true findings competed for two slots, and "you are losing
+# muscle" lost.
+#
+# So the real gate is MIN_SEVERITY_FOR_CARD below, and this is only a backstop
+# against a pathological day. If several areas of someone's life genuinely need a
+# sentence today, they should get several sentences.
+MAX_FINDINGS_PER_GENERATION = 4
+
+# The actual gate: a finding must be this severe to be worth interrupting someone
+# with. Below it, silence — which is what makes a quiet day quieter than it used to
+# be even though the cap above is higher.
+#
+# Calibrated against real output rather than picked round: observed severities run
+# ~0.3 (a mildly short week of sleep) to 1.0 (eight days without training), and this
+# sits just under the point where a finding stops being worth a card of its own.
+# Note severities are only roughly comparable ACROSS domains — each generator
+# computes its own — which is another reason MAX_FINDINGS_PER_DOMAIN stays at 1:
+# cross-domain ranking then only decides which domains get in, never which finding
+# within a domain, where the scale really is consistent.
+MIN_SEVERITY_FOR_CARD = 0.35
+
 # At most this many cards live in the feed at once — a feed you scroll is a feed you
 # skim, and the whole point is that the top card is worth reading.
 MAX_FEED_CARDS = 8
@@ -134,12 +161,13 @@ def _wants(slot: str) -> Tuple[str, ...]:
 
 
 def eligible_findings(profile: Dict[str, Any], state: Dict[str, Any], *,
-                      today: str, limit: int = 2,
+                      today: str, limit: int = MAX_FINDINGS_PER_GENERATION,
                       extra: Sequence[Dict[str, Any]] = (),
-                      per_domain: int = MAX_FINDINGS_PER_DOMAIN
+                      per_domain: int = MAX_FINDINGS_PER_DOMAIN,
+                      min_severity: float = MIN_SEVERITY_FOR_CARD
                       ) -> List[Dict[str, Any]]:
     """The findings a feed may show today: highest severity first, minus anything
-    still inside its cooldown (unless it has got materially worse).
+    below the bar, still inside its cooldown, or over a budget.
 
     `extra` carries the non-food domains (sleep, activity, body, digestion) and the
     cross-domain links. They are ranked in the SAME list as the food findings rather
@@ -147,13 +175,22 @@ def eligible_findings(profile: Dict[str, Any], state: Dict[str, Any], *,
     mentions sleep at the bottom is one that never really changed — the thing worth
     saying today wins on severity, whatever it is about.
 
-    `per_domain` is what stops one bad week monopolising the feed. A rough fortnight
-    of sleep can easily produce the four highest-severity findings in the list; the
-    budget keeps at most one or two and lets the next domain through, so the user
-    still hears about food on a week they slept badly.
+    Three gates, in the order they matter:
+
+    1. **`min_severity` — the real one.** A day where sleep, training AND food each
+       have something genuinely worth a sentence should produce three sentences;
+       a day where none of them does should produce none. Quality decides that, not
+       a quota, and this is what keeps the higher budget below from becoming spam.
+    2. **The cooldown**, which is what actually prevents repetition: a finding that
+       has been shown cannot return for 8 days (21 for a link) unless it got
+       materially worse. Raising the per-day budget therefore does NOT multiply how
+       often the user hears the same thing — those are independent mechanisms.
+    3. **`per_domain` then `limit`**, as backstops against one rough fortnight
+       filling the feed by itself.
     """
     shown = (state or {}).get("shown") or {}
-    pool = list(profile.get("findings", [])) + list(extra)
+    pool = [f for f in list(profile.get("findings", [])) + list(extra)
+            if float(f.get("severity") or 0) >= min_severity]
     # Food findings carry no `domain` (they predate the concept and there is no
     # reason to rewrite them); absent means nutrition.
     pool.sort(key=lambda f: -float(f.get("severity") or 0))
