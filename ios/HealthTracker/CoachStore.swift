@@ -258,7 +258,13 @@ final class CoachChatStore {
     /// can say so — memory that changes silently is memory the user can't correct.
     var learnedSomething = false
 
+    /// True while a question of ours is queued and unanswered. Drives the "a
+    /// pensar…" bubble, and survives leaving the screen: it is re-derived from the
+    /// backend on every load, not remembered locally.
+    var isAwaitingReply = false
+
     private var threadID: String { card.threadId ?? "" }
+    private var pollTask: Task<Void, Never>?
 
     init(card: CoachCard) {
         self.card = card
@@ -267,18 +273,36 @@ final class CoachChatStore {
 
     var canChat: Bool { !threadID.isEmpty }
 
+    /// Stop watching for an answer — the screen is gone. The question is not
+    /// cancelled by this: it stays queued, gets answered, and is waiting in the
+    /// thread next time the chat is opened.
+    func stopPolling() {
+        pollTask?.cancel()
+        pollTask = nil
+    }
+
     func loadHistory() async {
-        guard canChat, turns.isEmpty else { return }
-        isLoadingHistory = true
+        guard canChat else { return }
+        // Always refresh, even with turns already on screen: an answer may have
+        // landed while the app was closed, which is the normal case now that Sonnet
+        // answers in its own time.
+        isLoadingHistory = turns.isEmpty
         defer { isLoadingHistory = false }
         if let thread = try? await APIClient.shared.coachThread(id: threadID) {
             turns = thread.turns
+            isAwaitingReply = thread.pending
+            if thread.pending { startPolling() }
         }
     }
 
     func send(_ text: String) async {
         let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard canChat, !message.isEmpty, !isSending else { return }
+
+        // One id per message the user composes — NOT per HTTP attempt. The retry
+        // inside APIClient reuses it, so a lost response can never become a second
+        // question. This is the whole fix for the duplicate-message bug.
+        let turnID = UUID().uuidString.replacingOccurrences(of: "-", with: "")
 
         // Optimistic: the user's own words appear immediately. If the send fails the
         // turn is rolled back, so the transcript never lies about what was sent.
@@ -288,15 +312,43 @@ final class CoachChatStore {
         defer { isSending = false }
 
         do {
-            let reply = try await APIClient.shared.coachChat(
-                threadID: threadID, cardID: card.id, message: message)
-            turns = reply.turns.isEmpty
-                ? turns + [CoachTurn(role: "coach", text: reply.reply)]
-                : reply.turns
-            if reply.memoryLearned > 0 { learnedSomething = true }
+            let ack = try await APIClient.shared.coachChat(
+                threadID: threadID, cardID: card.id, message: message,
+                turnID: turnID)
+            // The backend's transcript is authoritative — it has already de-duped.
+            if !ack.turns.isEmpty { turns = ack.turns }
+            isAwaitingReply = ack.pending
+            if ack.pending { startPolling() }
         } catch {
             turns.removeLast()
             errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Watch for the answer while the screen is open.
+    ///
+    /// Sonnet answers when the Mac is awake and inside its usage window, so this can
+    /// be seconds or much longer. Polling backs off and then gives up rather than
+    /// running forever — the answer is safe in the thread either way, and reopening
+    /// the chat picks it up. Nothing here can duplicate anything: it only reads.
+    private func startPolling() {
+        pollTask?.cancel()
+        pollTask = Task { [weak self] in
+            // ~2 minutes of watching, easing off as hope fades.
+            let delays: [UInt64] = [3, 3, 5, 5, 8, 8, 12, 15, 20, 30]
+            for delay in delays {
+                try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
+                if Task.isCancelled { return }
+                guard let self else { return }
+                guard let thread = try? await APIClient.shared.coachThread(
+                    id: self.threadID) else { continue }
+                if Task.isCancelled { return }
+                self.turns = thread.turns
+                self.isAwaitingReply = thread.pending
+                if !thread.pending { return }
+            }
+            // Still nothing: stop the spinner rather than implying it is imminent.
+            self?.isAwaitingReply = false
         }
     }
 }

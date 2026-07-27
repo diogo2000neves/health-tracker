@@ -344,9 +344,13 @@ struct CoachThread: Decodable {
     let cardId: String?
     let title: String?
     let turns: [CoachTurn]
+    /// True while a question is queued and Sonnet hasn't answered it yet. Derived
+    /// server-side from the live job queue, so it can't get stuck on: a job that is
+    /// finished, swept or abandoned simply stops being reported.
+    let pending: Bool
 
     enum CodingKeys: String, CodingKey {
-        case id, title, turns
+        case id, title, turns, pending
         case cardId = "card_id"
     }
 
@@ -356,6 +360,7 @@ struct CoachThread: Decodable {
         cardId = try c.decodeIfPresent(String.self, forKey: .cardId)
         title = try c.decodeIfPresent(String.self, forKey: .title)
         turns = try c.decodeIfPresent([CoachTurn].self, forKey: .turns) ?? []
+        pending = try c.decodeIfPresent(Bool.self, forKey: .pending) ?? false
     }
 }
 
@@ -387,24 +392,32 @@ struct CoachTurn: Decodable, Identifiable, Hashable {
     enum CodingKeys: String, CodingKey { case role, text, at }
 }
 
+/// The acknowledgement of a sent question — NOT an answer.
+///
+/// Chat is queued work: the backend records the question, parks it for Sonnet and
+/// returns immediately. The answer arrives in the thread later, which is why this
+/// carries the transcript-so-far and a `pending` flag instead of a reply.
 struct CoachChatReply: Decodable {
     let threadId: String
-    let reply: String
+    let status: String
     let turns: [CoachTurn]
-    let memoryLearned: Int
+    let pending: Bool
+
+    /// True when the backend recognised this as a question it already has — a
+    /// retried send, a double tap. Nothing was queued twice.
+    var wasDuplicate: Bool { status == "already-asked" || status == "already-queued" }
 
     enum CodingKeys: String, CodingKey {
-        case reply, turns
+        case turns, status, pending
         case threadId = "thread_id"
-        case memoryLearned = "memory_learned"
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         threadId = try c.decodeIfPresent(String.self, forKey: .threadId) ?? ""
-        reply = try c.decodeIfPresent(String.self, forKey: .reply) ?? ""
+        status = try c.decodeIfPresent(String.self, forKey: .status) ?? "queued"
         turns = try c.decodeIfPresent([CoachTurn].self, forKey: .turns) ?? []
-        memoryLearned = try c.decodeIfPresent(Int.self, forKey: .memoryLearned) ?? 0
+        pending = try c.decodeIfPresent(Bool.self, forKey: .pending) ?? true
     }
 }
 

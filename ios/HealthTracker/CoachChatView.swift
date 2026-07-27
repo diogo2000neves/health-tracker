@@ -38,7 +38,10 @@ struct CoachChatView: View {
                                     .id(turn.id)
                             }
 
-                            if store.isSending {
+                            // Shown while the question is in flight AND while it
+                            // sits queued for Sonnet — from the user's side those
+                            // are one state: asked, not yet answered.
+                            if store.isSending || store.isAwaitingReply {
                                 TypingBubble()
                                     .id("typing")
                             }
@@ -57,6 +60,9 @@ struct CoachChatView: View {
                     }
                     .onChange(of: store.isSending) { _, sending in
                         if sending { withAnimation { proxy.scrollTo("typing") } }
+                    }
+                    .onChange(of: store.isAwaitingReply) { _, waiting in
+                        if waiting { withAnimation { proxy.scrollTo("typing") } }
                     }
                 }
 
@@ -77,6 +83,7 @@ struct CoachChatView: View {
         }
         .presentationDetents([.large])
         .task { await store.loadHistory() }
+        .onDisappear { store.stopPolling() }
     }
 
     private var composer: some View {
@@ -104,9 +111,12 @@ struct CoachChatView: View {
         .background(.bar)
     }
 
+    /// One question at a time. Not a correctness guard any more — the backend is
+    /// idempotent per message now — but asking again while the coach is still
+    /// thinking would put two questions in front of it and read as a stuck screen.
     private var canSend: Bool {
         !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !store.isSending && store.canChat
+            && !store.isSending && !store.isAwaitingReply && store.canChat
     }
 
     private func send() {

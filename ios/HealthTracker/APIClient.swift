@@ -87,16 +87,25 @@ struct APIClient {
                             cacheAs: "coach_thread_\(id)")
     }
 
-    /// Send a message about a card. Synchronous by design: the user is waiting for the
-    /// reply, so a couple of seconds is the right trade — with a longer timeout than a
-    /// plain read, because a model is genuinely in the loop here.
-    func coachChat(threadID: String, cardID: String,
-                   message: String) async throws -> CoachChatReply {
+    /// Send a message about a card.
+    ///
+    /// Returns as soon as the question is RECORDED, not answered — no model runs in
+    /// this request, so it is fast and there is nothing for a timeout to interrupt.
+    /// The answer appears in the thread later, once Sonnet has written it.
+    ///
+    /// `turnID` is what makes the send safe to retry: one id per message the user
+    /// composes, so a lost response, a flaky connection or a double tap all land on
+    /// the same id and the backend recognises them as the same question. The previous
+    /// version had neither the id nor the async shape, and a single tap that outran
+    /// the 60 s timeout became three questions with three different answers.
+    func coachChat(threadID: String, cardID: String, message: String,
+                   turnID: String) async throws -> CoachChatReply {
         if useSampleData { return SampleData.coachChatReply(message: message) }
         return try await post("coach/chat",
                               body: ["thread_id": threadID, "card_id": cardID,
-                                     "message": message],
-                              timeout: 60)
+                                     "message": message,
+                                     "client_turn_id": turnID],
+                              timeout: 30)
     }
 
     /// Everything the coach has said, noticed and reviewed. Keeping all of it is the
@@ -226,10 +235,17 @@ struct APIClient {
     }
 
     /// A mutation (/meals/edit, and the coach's refresh + chat).
-    /// Retried the same way as `get`: every one of these is either an absolute
-    /// overwrite or idempotent server-side, so re-applying after a lost response is
-    /// harmless. `timeout` is raised only for the one call that genuinely has a model
-    /// in the loop (chat) — a refresh returns before any model runs.
+    ///
+    /// Retried the same way as `get`, which is only sound because every one of these
+    /// is an absolute overwrite (/meals/edit sets fields to given values), a no-op
+    /// when repeated (/coach/refresh dedups by slot), or explicitly keyed by an
+    /// idempotency token the caller supplies (/coach/chat's `client_turn_id`).
+    ///
+    /// That last one is not decoration. This retry loop is silent and invisible, so
+    /// a POST that is not idempotent gets applied two or three times with nobody
+    /// noticing — which is exactly what happened to chat: three copies of one
+    /// question, three different answers, all written to history. Anything added
+    /// here must be safe to run twice, or carry a key that makes it so.
     private func post<T: Decodable>(_ path: String, body: [String: Any],
                                     timeout: TimeInterval? = nil) async throws -> T {
         var request = URLRequest(url: Config.baseURL.appending(path: path))

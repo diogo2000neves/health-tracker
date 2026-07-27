@@ -59,7 +59,8 @@ the prompt, and parks it as a job:
 
 ```
 POST /coach/generate     ->  writes coach/jobs/<id>.json, returns 202 "waiting_for": "sonnet"
-GET  /coach/work         ->  the Mac worker claims the oldest job (a 15-minute lease)
+GET  /coach/work         ->  the Mac worker claims the next job (a 15-minute lease);
+                             a chat turn jumps the queue — someone is watching it
 POST /coach/work/<id>    ->  {"answer": {...}}  the answer, validated and assembled
                              {"release": "..."} put it back — used for a spent usage window
 POST /coach/sweep        ->  anything older than COACH_SONNET_WAIT_HOURS (5) goes to Gemini
@@ -72,6 +73,24 @@ Sonnet until the sweeper decides the wait has gone on long enough.
 Both paths are given byte-identical prompts and pass through byte-identical
 validation (`coach_feed.assemble`) — Sonnet gets no more benefit of the doubt than
 Gemini. Each card records which model wrote it in `source`.
+
+### Chat is queued work too
+
+Conversation used to be the one synchronous path — the user is waiting, so a couple
+of seconds seemed the right trade. It wasn't. The model call made the request slower
+than the app's 60 s timeout, the app retried (it retries every POST), and the server
+ran the whole turn again for each attempt: **one tap became three questions and three
+different answers, all saved to history.**
+
+So chat is a job like everything else. `POST /coach/chat` records the question,
+parks it, and returns 202; Sonnet answers at **medium** effort (a chat turn needs the
+voice, not the deep reasoning a weekly review gets); the app reads the answer out of
+the thread whenever it next looks. Closing the app loses nothing.
+
+The duplicate guard is the `client_turn_id` the app mints per message — not per HTTP
+attempt — so a retry, a double tap or a background relaunch all collide with the same
+id and are recognised as the same question. Moving the model out of the request path
+alone would not have been enough: a retried POST would simply have queued two jobs.
 
 The worker (`automation/coach/worker.py`) holds no nutrition logic at all: it claims
 a job, runs `claude -p` with **no tools**, and posts the JSON back. The no-tools part
@@ -161,8 +180,8 @@ wins and the weekly review are about habits and always stay.
 | `GET` | `/coach/work` | The Mac worker claims a job, or 204. |
 | `POST` | `/coach/work/<id>` | The answer, or a release. |
 | `POST` | `/coach/sweep` | Gemini takes over anything that waited too long. |
-| `POST` | `/coach/chat` | A turn in the conversation about one card; also folds anything durable into memory. |
-| `GET` | `/coach/thread/<id>` | One conversation. |
+| `POST` | `/coach/chat` | Queues a question about one card for Sonnet. 202 + the transcript so far. **Idempotent on `client_turn_id`.** |
+| `GET` | `/coach/thread/<id>` | One conversation, plus `pending` while an answer is still owed. |
 | `GET`/`POST`/`DELETE` | `/coach/memory[/<id>]` | Read, add to, and correct what the coach remembers. |
 | `GET` | `/coach/patterns` | The deterministic analysis, unnarrated — eyeball this before spending a model call. |
 

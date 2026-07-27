@@ -353,13 +353,20 @@ def list_jobs() -> List[Dict[str, Any]]:
 
 def claim_next_job(worker: str, now_iso: str, *, lease_s: int = 900
                    ) -> Optional[Dict[str, Any]]:
-    """Hand the oldest unclaimed job to a worker, or None if there is nothing to do.
+    """Hand the next unclaimed job to a worker, or None if there is nothing to do.
+
+    Oldest first, EXCEPT that a chat turn jumps the queue. Everything else here is
+    written on the coach's own schedule and nobody is watching it arrive; a chat turn
+    is a person who just asked a question and is looking at the screen. Strict FIFO
+    would park that behind a fifteen-minute weekly report.
 
     The claim is a lease, not a lock: a worker that takes a job and then dies (the
     laptop sleeps mid-run, which is the normal case here, not the exotic one) loses
     the job back to the queue after `lease_s` rather than stranding it forever.
     """
-    for job in list_jobs():
+    queue = sorted(list_jobs(), key=lambda j: (0 if j.get("chat") else 1,
+                                               str(j.get("created_at") or "")))
+    for job in queue:
         if job.get("done_at"):
             continue
         claimed_at = job.get("claimed_at")

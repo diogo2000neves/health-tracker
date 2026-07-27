@@ -30,22 +30,17 @@ enum SampleData {
     static let coachReports: CoachReportsList = decode(CoachReportsList.self,
                                                        from: coachReportsJSON())
 
-    /// A plausible reply, so the chat can be exercised end to end without a backend.
+    /// The acknowledgement of a sent question, so the chat can be exercised end to
+    /// end without a backend. Not an answer — chat is queued work, and the sample
+    /// data models that honestly: the question comes back pending.
     static func coachChatReply(message: String) -> CoachChatReply {
         decode(CoachChatReply.self, from: [
             "thread_id": "t-sample",
-            "reply": "Boa pergunta. O arroz branco não tem nada de mal em si — o que "
-                + "pesa é ser o único acompanhamento cinco dias seguidos. Alterna com "
-                + "batata cozida ou feijão preto duas vezes e já muda a fibra da "
-                + "semana.",
+            "status": "queued",
+            "pending": true,
             "turns": [
                 ["role": "user", "text": message, "at": "2026-07-26T15:32:00"],
-                ["role": "coach",
-                 "text": "Boa pergunta. O arroz branco não tem nada de mal em si — o "
-                    + "que pesa é ser o único acompanhamento cinco dias seguidos.",
-                 "at": "2026-07-26T15:32:04"],
             ],
-            "memory_learned": 0,
         ])
     }
 
@@ -504,6 +499,7 @@ enum SampleData {
         [
             "id": "t-fish", "card_id": "2026-07-26:afternoon:pattern:fish_white",
             "title": "Duas semanas sem peixe",
+            "pending": false,
             "turns": [
                 ["role": "user", "text": "não gosto de peixe cozido",
                  "at": "2026-07-25T21:04:00"],

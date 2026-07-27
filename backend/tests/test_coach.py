@@ -1097,27 +1097,148 @@ class TestCoachEndpoints:
         profile = self.client.get("/coach/patterns", headers=self.auth).get_json()
         assert profile["days_logged"] == 7 and profile["findings"]
 
-    def test_chat_appends_turns_and_remembers(self, monkeypatch):
+    # -- chat ------------------------------------------------------------------
+    # Chat is queued work, like the feed: the question is recorded and parked, and
+    # Sonnet answers it whenever the Mac is awake. See the banner above `coach_chat`
+    # for the production bug that shape exists to make impossible.
+    CHAT_ANSWER = {"reply": "Podes trocar por bacalhau.",
+                   "memory_candidates": [{"type": "dislike",
+                                          "fact": "não gosta de peixe cozido",
+                                          "confidence": 0.9}]}
+
+    def _a_card(self):
         job_id = self._queue_a_job()
         self.client.post(f"/coach/work/{job_id}", json={"answer": self.ANSWER},
                          headers=self.auth)
-        card = self.client.get("/coach/feed",
+        return self.client.get("/coach/feed",
                                headers=self.auth).get_json()["cards"][0]
-        monkeypatch.setattr(ingest._narrator_mod(), "chat_turn", lambda *a, **kw: {
-            "reply": "Podes trocar por bacalhau.",
-            "memory_candidates": [{"type": "dislike",
-                                   "fact": "não gosta de peixe cozido",
-                                   "confidence": 0.9}]})
-        body = self.client.post("/coach/chat", json={
-            "thread_id": card["thread_id"], "card_id": card["id"],
-            "message": "porque é que isto importa?"}, headers=self.auth).get_json()
-        assert body["reply"] == "Podes trocar por bacalhau."
-        assert [t["role"] for t in body["turns"]] == ["user", "coach"]
-        assert body["memory_learned"] == 1
+
+    def _ask(self, card, message="porque é que isto importa?", turn_id="turn-1"):
+        body = {"thread_id": card["thread_id"], "card_id": card["id"],
+                "message": message}
+        if turn_id is not None:
+            body["client_turn_id"] = turn_id
+        return self.client.post("/coach/chat", json=body, headers=self.auth)
+
+    def test_chat_queues_the_question_and_records_it_immediately(self):
+        """The question must be in the transcript before any model has run — the app
+        shows it straight away, and a lost answer must not lose the question too."""
+        card = self._a_card()
+        response = self._ask(card)
+        assert response.status_code == 202
+        body = response.get_json()
+        assert body["status"] == "queued" and body["waiting_for"] == "sonnet"
+        assert [t["role"] for t in body["turns"]] == ["user"]
+        assert body["pending"] is True
+
+    def test_the_chat_job_asks_for_sonnet_at_medium_effort(self):
+        card = self._a_card()
+        job_id = self._ask(card).get_json()["job"]
+        store_mod = ingest._coach("coach_store")
+        job = store_mod.read_json(store_mod.job_path(job_id))
+        assert job["model"] == "claude-sonnet-5" and job["effort"] == "medium"
+        assert job["require_key"] == "reply"
+        # Without its own budget the worker reads "names a model" as "is a report".
+        assert job["timeout_s"] == ingest.COACH_CHAT_TIMEOUT_S
+
+    def test_chat_never_calls_a_model_in_the_request(self, monkeypatch):
+        """The whole cause of the duplicates: a model in the request path made the
+        request slow enough for the client to time out and retry."""
+        def explode(*_args, **_kwargs):
+            raise AssertionError("/coach/chat must not call a model")
+        monkeypatch.setattr(ingest._narrator_mod(), "call_gemini", explode)
+        monkeypatch.setattr(ingest._narrator_mod(), "chat_turn", explode)
+        assert self._ask(self._a_card()).status_code == 202
+
+    def test_the_answer_lands_in_the_thread_and_teaches_the_memory(self):
+        card = self._a_card()
+        job_id = self._ask(card).get_json()["job"]
+        applied = self.client.post(f"/coach/work/{job_id}",
+                                   json={"answer": self.CHAT_ANSWER},
+                                   headers=self.auth).get_json()
+        assert applied["chat"] == 1 and applied["memory_learned"] == 1
+
+        thread = self.client.get(f"/coach/thread/{card['thread_id']}",
+                                 headers=self.auth).get_json()
+        assert [t["role"] for t in thread["turns"]] == ["user", "coach"]
+        assert thread["turns"][1]["text"] == "Podes trocar por bacalhau."
+        assert thread["pending"] is False       # nothing left in flight
 
         remembered = self.client.get("/coach/memory",
                                      headers=self.auth).get_json()["facts"]
         assert remembered[0]["fact"] == "não gosta de peixe cozido"
+
+    def test_a_retried_send_does_not_ask_twice(self):
+        """THE bug: the client retries every POST, so one tap produced three
+        questions and three different answers, all saved to history."""
+        card = self._a_card()
+        first = self._ask(card, turn_id="turn-abc")
+        again = self._ask(card, turn_id="turn-abc")
+        third = self._ask(card, turn_id="turn-abc")
+
+        assert first.status_code == 202
+        # "already-asked" rather than "already-queued": the question is written to
+        # the transcript before the job is created, so the transcript is what a
+        # retry collides with. Both guards exist; this is the one that fires.
+        assert again.get_json()["status"] == "already-asked"
+        assert third.get_json()["status"] == "already-asked"
+
+        store_mod = ingest._coach("coach_store")
+        chat_jobs = [j for j in store_mod.list_jobs() if j.get("chat")]
+        assert len(chat_jobs) == 1
+
+        thread = self.client.get(f"/coach/thread/{card['thread_id']}",
+                                 headers=self.auth).get_json()
+        assert [t["role"] for t in thread["turns"]] == ["user"]
+
+    def test_a_retry_after_the_answer_landed_is_still_not_a_second_question(self):
+        """The retry can arrive late — after the worker already answered. The turn id
+        is in the transcript by then, which is the check that catches it."""
+        card = self._a_card()
+        job_id = self._ask(card, turn_id="turn-xyz").get_json()["job"]
+        self.client.post(f"/coach/work/{job_id}", json={"answer": self.CHAT_ANSWER},
+                         headers=self.auth)
+
+        late = self._ask(card, turn_id="turn-xyz")
+        assert late.get_json()["status"] == "already-asked"
+        thread = self.client.get(f"/coach/thread/{card['thread_id']}",
+                                 headers=self.auth).get_json()
+        assert [t["role"] for t in thread["turns"]] == ["user", "coach"]
+
+    def test_two_genuinely_different_questions_both_get_through(self):
+        """The guard must key on the id, not on the text — asking the same thing
+        twice on purpose is allowed."""
+        card = self._a_card()
+        assert self._ask(card, turn_id="turn-1").status_code == 202
+        second = self._ask(card, turn_id="turn-2")
+        assert second.status_code == 202 and second.get_json()["status"] == "queued"
+        thread = self.client.get(f"/coach/thread/{card['thread_id']}",
+                                 headers=self.auth).get_json()
+        assert [t["role"] for t in thread["turns"]] == ["user", "user"]
+
+    def test_a_waiting_question_is_answered_before_a_scheduled_report(self):
+        """Nobody is watching a weekly report arrive; someone is watching a chat."""
+        card = self._a_card()
+        self._queue_a_job()                      # a feed job, queued first
+        chat_job = self._ask(card).get_json()["job"]
+        store_mod = ingest._coach("coach_store")
+        claimed = store_mod.claim_next_job("mac", "2026-07-26T16:00:00")
+        assert claimed["id"] == chat_job
+
+    def test_the_same_answer_applied_twice_appends_one_reply(self):
+        """Sonnet finishing at the moment the sweeper hands the job to Gemini is the
+        one way a turn can be answered twice."""
+        card = self._a_card()
+        job_id = self._ask(card).get_json()["job"]
+        store_mod = ingest._coach("coach_store")
+        job = store_mod.read_json(store_mod.job_path(job_id))
+        now = datetime(2026, 7, 26, 16, 0)
+        ingest._apply_chat(job, self.CHAT_ANSWER, now, source="sonnet")
+        ingest._apply_chat(job, self.CHAT_ANSWER, now, source="gemini")
+
+        thread = self.client.get(f"/coach/thread/{card['thread_id']}",
+                                 headers=self.auth).get_json()
+        assert [t["role"] for t in thread["turns"]] == ["user", "coach"]
 
     def test_chat_validates_before_it_reads_the_environment(self, monkeypatch):
         monkeypatch.delenv("GEMINI_API_KEY", raising=False)

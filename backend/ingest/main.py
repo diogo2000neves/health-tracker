@@ -89,6 +89,7 @@ import socket
 import ssl
 import time
 import math
+import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
@@ -4373,6 +4374,9 @@ def coach_work():
                     # feed does not. The job carries its own answer to that.
                     "model": job.get("model"),
                     "effort": job.get("effort"),
+                    # A chat turn names a model but is not a report, so it must not
+                    # inherit the report's 15-minute budget.
+                    "timeout_s": job.get("timeout_s"),
                     "created_at": job.get("created_at"),
                     "attempts": job.get("attempts")}), 200
 
@@ -4407,9 +4411,12 @@ def coach_work_result(job_id: str):
         return jsonify({"error": "answer must be an object"}), 400
 
     source = str(body.get("model") or "sonnet")[:60]
-    written = (_apply_report(job, answer, now, source=source)
-               if job.get("report") else
-               _apply_generation(job, answer, now, source=source))
+    if job.get("chat"):
+        written = _apply_chat(job, answer, now, source=source)
+    elif job.get("report"):
+        written = _apply_report(job, answer, now, source=source)
+    else:
+        written = _apply_generation(job, answer, now, source=source)
     store.finish_generation_job(job_id)
     return jsonify({"status": "applied", "job": job_id, **written}), 200
 
@@ -4510,7 +4517,9 @@ def coach_sweep():
         except Exception:
             app.logger.exception("sweep generation failed for %s", job.get("id"))
             continue
-        if job.get("report"):
+        if job.get("chat"):
+            _apply_chat(job, answer, now, source="gemini")
+        elif job.get("report"):
             _apply_report(job, answer, now, source="gemini")
         else:
             _apply_generation(job, answer, now, source="gemini")
@@ -4547,6 +4556,26 @@ def _coach_weekly_facts(profile: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # -- chat ----------------------------------------------------------------------
+#
+# Chat is QUEUED WORK, not a request that waits for a model — the same shape as the
+# feed and the reports, and for a reason the old synchronous version demonstrated in
+# production: a slow model call inside the request meant the app's 60 s timeout fired
+# while the server was still working, the client retried (every POST was retried, on
+# the assumption they were all idempotent), and each retry ran the whole thing again.
+# One question became three questions and three different answers, all saved.
+#
+# So: the question is recorded and parked, Sonnet answers it whenever the Mac is
+# awake and inside its allowance, and the app picks the answer up next time it looks.
+# Nothing is lost if the user closes the app, and the reply is worth the wait rather
+# than whatever could be produced inside an HTTP timeout.
+#
+# Sonnet at MEDIUM effort: a chat turn is a couple of sentences grounded in facts that
+# are already in the prompt — it needs the good voice, not the deep reasoning a weekly
+# review gets, and medium keeps the answer minutes away rather than tens of minutes.
+COACH_CHAT_MODEL = os.environ.get("COACH_CHAT_MODEL", "claude-sonnet-5")
+COACH_CHAT_EFFORT = os.environ.get("COACH_CHAT_EFFORT", "medium")
+COACH_CHAT_TIMEOUT_S = int(os.environ.get("COACH_CHAT_TIMEOUT_S", "300"))
+
 
 def _thread(thread_id: str) -> Dict[str, Any]:
     store = _coach("coach_store")
@@ -4554,25 +4583,54 @@ def _thread(thread_id: str) -> Dict[str, Any]:
                            default={"id": thread_id, "turns": []})
 
 
+def _pending_chat_turn_ids(thread_id: str) -> List[str]:
+    """The client turn ids this thread has questions queued for.
+
+    Read off the job queue rather than stored on the thread, so it can never go stale:
+    a job that is finished, swept or abandoned simply stops appearing here.
+    """
+    store = _coach("coach_store")
+    out: List[str] = []
+    for job in store.list_jobs():
+        chat = job.get("chat")
+        if isinstance(chat, dict) and chat.get("thread_id") == thread_id \
+                and not job.get("done_at"):
+            out.append(str(chat.get("turn_id") or ""))
+    return [t for t in out if t]
+
+
+def _thread_out(thread_id: str) -> Dict[str, Any]:
+    """A thread plus whether it is still waiting on an answer, so the app can show a
+    question as in-flight instead of as unanswered."""
+    thread = dict(_thread(thread_id))
+    pending = _pending_chat_turn_ids(thread_id)
+    thread["pending"] = bool(pending)
+    thread["pending_turn_ids"] = pending
+    return thread
+
+
 @app.get("/coach/thread/<thread_id>")
 def coach_thread(thread_id: str):
-    """One conversation, oldest turn first."""
+    """One conversation, oldest turn first, with its pending state."""
     if not _authorized(request):
         return jsonify({"error": "unauthorized"}), 401
     store = _coach("coach_store")
     if not store.is_safe_id(thread_id):
         return jsonify({"error": "bad thread id"}), 400
-    return jsonify(_thread(thread_id)), 200
+    return jsonify(_thread_out(thread_id)), 200
 
 
 @app.post("/coach/chat")
 def coach_chat():
-    """Talk to the coach about a specific card.
+    """Ask the coach something about a card. Returns as soon as the question is
+    recorded — the answer arrives later, from Sonnet.
 
-    Synchronous, unlike generation: the user is sitting there waiting for a reply, so
-    a couple of seconds is the right trade. The card's own evidence goes into the
-    prompt along with the food profile, today's log and the long-term memory, so the
-    answer is anchored to the same facts the card was.
+    IDEMPOTENT on `client_turn_id`. That is what actually makes the duplicate bug
+    impossible rather than merely unlikely: the app sends one id per message it
+    composes, so a retry — a lost response, a flaky connection, a double tap, a
+    background relaunch — lands on the same id and is recognised as the same
+    question. Without it, moving the model out of the request path would still leave
+    a retried POST queueing two jobs.
     """
     if not _authorized(request):
         return jsonify({"error": "unauthorized"}), 401
@@ -4585,34 +4643,54 @@ def coach_chat():
     message = " ".join(str(body.get("message") or "").split())[:1000]
     thread_id = str(body.get("thread_id") or "").strip()
     card_id = str(body.get("card_id") or "").strip()
-    # The request is validated before the environment, so a malformed call reads as a
-    # 400 whether or not the model happens to be configured.
+    turn_id = str(body.get("client_turn_id") or "").strip()[:64]
+    # The request is validated before anything else, so a malformed call reads as a
+    # 400 rather than as a backend failure.
     if not message:
         return jsonify({"error": "message is required"}), 400
     if not store.is_safe_id(thread_id):
         return jsonify({"error": "bad thread id"}), 400
-    if not _gemini_available():
-        return jsonify({"error": "GEMINI_API_KEY not configured"}), 503
+    if not turn_id:
+        # An older build that doesn't send one still works; it just doesn't get the
+        # duplicate protection, so it is given an id here rather than refused.
+        turn_id = uuid.uuid4().hex
+    elif not store.is_safe_id(turn_id):
+        return jsonify({"error": "bad client_turn_id"}), 400
 
     now = datetime.now(_tz())
-    today_iso = now.date().isoformat()
+    stamp = now.isoformat(timespec="seconds")
     thread = _thread(thread_id)
+
+    # -- the two idempotency checks, cheapest first ----------------------------
+    already_asked = any(str(t.get("turn_id") or "") == turn_id
+                        for t in (thread.get("turns") or [])
+                        if isinstance(t, dict))
+    if already_asked:
+        app.logger.info("chat turn %s already recorded — not queueing again", turn_id)
+        return jsonify({"status": "already-asked", **_thread_out(thread_id)}), 200
+    if turn_id in _pending_chat_turn_ids(thread_id):
+        app.logger.info("chat turn %s already queued", turn_id)
+        return jsonify({"status": "already-queued", **_thread_out(thread_id)}), 202
+
     card = next((c for c in _read_feed_cards(now) if c.get("id") == card_id), None)
 
     try:
         window_meals, today_rows = _coach_window_meals(now)
         consumed = _todays_consumed(today_rows)
         targets, _basis = _resolved_targets_and_basis()
+        taxonomy = _display_taxonomy()
         profile = _coach_profile(now, window_meals)
         memory = store.read_json(store.MEMORY, default=memory_mod.empty())
         context = {
             "card": {"title": card.get("title"), "body": card.get("body"),
                      "kind": card.get("kind"), "evidence": card.get("evidence"),
                      "swap": card.get("swap")} if card else None,
-            "today": _coach_today(now, today_rows, consumed, targets),
+            "today": _coach_today(now, today_rows, consumed, targets,
+                                  taxonomy=taxonomy),
             "nutrients_supporting": _coach_nutrients(consumed, targets),
             "food_patterns": {
-                "groups": {k: {"servings_per_week": v.get("servings_per_week"),
+                "groups": {k: {"label": v.get("label"),
+                               "servings_per_week": v.get("servings_per_week"),
                                "reference_min": v.get("week_min"),
                                "reference_max": v.get("week_max"),
                                "days_since_last": v.get("days_since_last")}
@@ -4621,42 +4699,106 @@ def coach_chat():
                 "findings": [{"fact": f["headline"]}
                              for f in profile.get("findings", [])[:5]],
             },
+            # pt-PT, like every other prompt payload — the chat prompt is Portuguese
+            # and quotes these names straight back to the user.
             "foods_the_user_eats": [
-                {"food": f["food"], "times": f["times"],
+                {"food": f.get("pt") or f["food"], "times": f["times"],
                  "typical_portion_g": f["median_portion_g"]}
                 for f in profile.get("foods", [])[:25]],
             "memory": memory_mod.for_prompt(memory),
         }
-        answer = narrator.chat_turn(context, thread.get("turns") or [], message)
+        prompt = narrator.build_chat_prompt(context, thread.get("turns") or [],
+                                            message)
     except Exception as exc:
-        app.logger.exception("coach chat failed")
-        return jsonify({"error": str(exc)}), 502
+        app.logger.exception("coach chat preparation failed")
+        return jsonify({"status": "error", "error": str(exc)}), 500
 
-    reply = answer.get("reply") or ""
-    if not reply:
-        return jsonify({"error": "empty reply"}), 502
-
-    stamp = now.isoformat(timespec="seconds")
-
-    def append(current: Any) -> Dict[str, Any]:
+    # The question goes into the transcript NOW, before the job exists. If queueing
+    # fails the user still sees what they asked and can ask again; if the order were
+    # reversed, a job could answer a question the thread had no record of.
+    def add_question(current: Any) -> Dict[str, Any]:
         data = current if isinstance(current, dict) else {"id": thread_id,
                                                           "turns": []}
         turns = [t for t in (data.get("turns") or []) if isinstance(t, dict)]
-        turns.append({"role": "user", "text": message, "at": stamp})
-        turns.append({"role": "coach", "text": reply, "at": stamp})
-        # Keep a thread bounded: the prompt only reads the last dozen turns anyway,
-        # and an unbounded blob is a slow read on the app's chat screen.
+        if not any(str(t.get("turn_id") or "") == turn_id for t in turns):
+            turns.append({"role": "user", "text": message, "at": stamp,
+                          "turn_id": turn_id})
         data.update({"id": thread_id, "card_id": card_id or data.get("card_id"),
                      "title": (card or {}).get("title") or data.get("title"),
                      "updated_at": stamp, "turns": turns[-60:]})
         return data
-    thread = store.update_json(store.thread_path(thread_id), append,
-                               default={"id": thread_id, "turns": []})
+    store.update_json(store.thread_path(thread_id), add_question,
+                      default={"id": thread_id, "turns": []})
+
+    job = {
+        "id": f"{now.strftime('%Y%m%dT%H%M%S')}-chat-{turn_id[:8]}",
+        "slot": "chat",
+        "reason": "chat turn",
+        "created_at": stamp,
+        "claimed_at": None,
+        "claimed_by": None,
+        "attempts": 0,
+        "prompt": prompt,
+        "require_key": "reply",
+        "model": COACH_CHAT_MODEL,
+        "effort": COACH_CHAT_EFFORT,
+        # Without this the worker infers "any job naming a model is a report" and
+        # gives a two-sentence answer the 15-minute report budget.
+        "timeout_s": COACH_CHAT_TIMEOUT_S,
+        "chat": {"thread_id": thread_id, "card_id": card_id, "turn_id": turn_id,
+                 "message": message,
+                 "card_title": str((card or {}).get("title") or "")},
+    }
+    store.write_json(store.job_path(job["id"]), job)
+    app.logger.info("chat job %s queued (thread=%s, %d chars)", job["id"],
+                    thread_id, len(prompt))
+
+    return jsonify({"status": "queued", "job": job["id"],
+                    "waiting_for": "sonnet", **_thread_out(thread_id)}), 202
+
+
+def _apply_chat(job: Dict[str, Any], answer: Dict[str, Any], now: datetime, *,
+                source: str) -> Dict[str, Any]:
+    """Fold one answered chat turn back into its thread.
+
+    Everything the old synchronous endpoint did after the model returned — append,
+    archive, harvest memory — lives here now, so Sonnet and the Gemini fallback land
+    in exactly the same place.
+    """
+    store = _coach("coach_store")
+    memory_mod = _coach("coach_memory")
+    chat = job.get("chat") or {}
+    thread_id = str(chat.get("thread_id") or "")
+    turn_id = str(chat.get("turn_id") or "")
+    reply = str(answer.get("reply") or "").strip()
+    if not thread_id or not reply:
+        app.logger.warning("chat job %s produced no usable reply", job.get("id"))
+        return {"chat": 0, "source": source}
+
+    stamp = now.isoformat(timespec="seconds")
+
+    def add_answer(current: Any) -> Dict[str, Any]:
+        data = current if isinstance(current, dict) else {"id": thread_id,
+                                                          "turns": []}
+        turns = [t for t in (data.get("turns") or []) if isinstance(t, dict)]
+        # Answering the same turn twice is possible in one narrow case — the sweeper
+        # falling back to Gemini for a job the worker was already mid-way through —
+        # so the reply is keyed to its question the same way the question is.
+        if any(t.get("role") == "coach" and str(t.get("reply_to") or "") == turn_id
+               for t in turns):
+            return data
+        turns.append({"role": "coach", "text": reply, "at": stamp,
+                      "reply_to": turn_id, "source": source})
+        data.update({"id": thread_id, "updated_at": stamp, "turns": turns[-60:]})
+        return data
+    store.update_json(store.thread_path(thread_id), add_answer,
+                      default={"id": thread_id, "turns": []})
 
     try:
         _coach("coach_archive").record_chat(
-            thread_id, day=today_iso, at=stamp[11:16], question=message,
-            answer=reply, card_title=str((card or {}).get("title") or ""))
+            thread_id, day=now.date().isoformat(), at=stamp[11:16],
+            question=str(chat.get("message") or ""), answer=reply,
+            card_title=str(chat.get("card_title") or ""))
     except Exception:
         app.logger.exception("archiving chat failed (non-fatal)")
 
@@ -4666,18 +4808,18 @@ def coach_chat():
         def remember(current: Any) -> Dict[str, Any]:
             merged, added = memory_mod.merge(
                 current if isinstance(current, dict) else memory_mod.empty(),
-                candidates, today=today_iso, source="chat")
+                candidates, today=now.date().isoformat(), source="chat")
             merged["_added"] = added
             return merged
         stored = store.update_json(store.MEMORY, remember,
                                    default=memory_mod.empty())
         learned = int((stored or {}).pop("_added", 0) or 0)
         if learned:
-            app.logger.info("coach memory: %d new fact(s)", learned)
+            app.logger.info("coach memory: %d new fact(s) from chat", learned)
 
-    return jsonify({"thread_id": thread_id, "reply": reply,
-                    "turns": thread.get("turns", []),
-                    "memory_learned": learned}), 200
+    app.logger.info("chat job %s answered via %s", job.get("id"), source)
+    return {"chat": 1, "source": source, "memory_learned": learned}
+
 
 
 # -- memory --------------------------------------------------------------------

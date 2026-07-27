@@ -104,12 +104,18 @@ def answer(job: Dict[str, Any]) -> Dict[str, Any]:
     The daily feed runs on Sonnet: frequent, fast, and good enough to notice that the
     oats held the morning. A weekly, monthly or yearly review asks for Opus at a
     slower effort, because correlating what was advised against what was eaten across
-    weeks is a genuinely harder problem and happens rarely enough to afford it. The
-    job carries its own choice so this worker never has to know which is which.
+    weeks is a genuinely harder problem and happens rarely enough to afford it. A chat
+    turn is Sonnet again but at medium effort — two grounded sentences, not a week of
+    correlation. The job carries its own choice so this worker never has to know which
+    is which.
     """
     model = job.get("model") or MODEL
     effort = job.get("effort") or EFFORT
-    timeout = REPORT_TIMEOUT_S if job.get("model") else TIMEOUT_S
+    # The job's own budget when it states one. The `model`-implies-report fallback is
+    # kept for jobs queued before that field existed, but it is a guess: chat also
+    # names a model and must not wait fifteen minutes for two sentences.
+    timeout = int(job.get("timeout_s")
+                  or (REPORT_TIMEOUT_S if job.get("model") else TIMEOUT_S))
     log.info("running job %s (%s, %d chars) through %s at %s effort",
              job["id"], job.get("slot"), len(job["prompt"]), model, effort)
     started = time.monotonic()
