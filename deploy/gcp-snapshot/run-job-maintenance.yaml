@@ -1,0 +1,41 @@
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  annotations:
+    run.googleapis.com/creator: diogo2000neves@gmail.com
+    run.googleapis.com/lastModifier: diogo2000neves@gmail.com
+  labels:
+    cloud.googleapis.com/location: europe-west1
+    run.googleapis.com/lastUpdatedTime: '2026-07-16T20:15:36.329603Z'
+  name: health-tracker-maintenance
+  namespace: '785594953316'
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/client-name: gcloud
+        run.googleapis.com/client-version: 575.0.0
+        run.googleapis.com/execution-environment: gen2
+      labels:
+        client.knative.dev/nonce: yuf_hic_voc
+    spec:
+      taskCount: 1
+      template:
+        spec:
+          containers:
+          - args:
+            - -m
+            - src.maintenance
+            command:
+            - python
+            env:
+            - name: HEALTH_SPREADSHEET_ID
+              value: 1JQWYkSgzU3F4mqR7BRE8wfoBif0xLU7uBM0iwHwxNAk
+            image: europe-west1-docker.pkg.dev/health-tracker-501322/cloud-run-source-deploy/health-tracker-daily:cb80bb351f9b4135dfb92efdf22bedbf63c25eeb
+            resources:
+              limits:
+                cpu: 1000m
+                memory: 512Mi
+          maxRetries: 3
+          serviceAccountName: health-tracker-job@health-tracker-501322.iam.gserviceaccount.com
+          timeoutSeconds: '600'

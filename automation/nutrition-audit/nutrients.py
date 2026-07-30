@@ -132,5 +132,5 @@ def meal_totals(items: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def nutrient_key_count(items: List[Dict[str, Any]]) -> int:
     """Total populated nutrient keys across all items — the completeness signal
-    the review log reports (Gemini's sparse ~6-9 vs a grounded ~30+)."""
+    the review log reports (the model's sparse ~6-9 vs a grounded ~30+)."""
     return sum(len(i.get("nutrients", {})) for i in items if isinstance(i, dict))

@@ -49,8 +49,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("coach-worker")
 
-BACKEND = os.environ.get("HEALTH_BACKEND_URL",
-                         "https://health-tracker-ingest-myznjtlyrq-ew.a.run.app")
+# Loopback: the backend now runs on the same machine as this worker
+# (health-tracker-api.service). The old default was the Cloud Run URL, which was
+# deleted on 2026-07-29 — a stale default there is not a harmless fallback, it is
+# silent: the worker polls a dead host, claims nothing, and the coach simply stops
+# producing cards with no error anywhere the user would see.
+BACKEND = os.environ.get("HEALTH_BACKEND_URL", "http://127.0.0.1:8080")
 TOKEN = os.environ.get("INGEST_TOKEN", "")
 MODEL = os.environ.get("COACH_MODEL", "claude-sonnet-5")
 EFFORT = os.environ.get("COACH_EFFORT", "high")

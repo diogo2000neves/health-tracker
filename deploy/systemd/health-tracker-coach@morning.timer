@@ -1,0 +1,13 @@
+[Unit]
+Description=Health Tracker coach morning card (replaces Cloud Scheduler coach-morning)
+
+[Timer]
+# Was 30 7 * * * Europe/Lisbon.
+OnCalendar=*-*-* 07:30:00
+# Persistent: a laptop asleep at 07:30 should still produce the morning card when
+# it wakes, rather than skipping the day entirely.
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

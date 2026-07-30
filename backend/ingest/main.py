@@ -87,6 +87,7 @@ import random
 import re
 import socket
 import ssl
+import subprocess
 import time
 import math
 import uuid
@@ -109,6 +110,10 @@ from schema.registry import (
     BLOCK_LABELS, BLOCKS, CAUSAL_LABELS, DAILY_COLUMNS, daily_headers, names_in,
     ocr_ranges,
 )
+# Flat import, like the coach modules in the image. Safe at module scope because it
+# is pure stdlib and touches nothing at import time — importing main.py must stay
+# possible with no env and no credentials (test_ingest.py asserts it).
+import claude_estimator
 
 app = Flask(__name__)
 # Headroom for a few photos in one meal log while staying under Cloud Run's
@@ -963,6 +968,34 @@ def _authorized(req) -> bool:
     return bool(expected) and hmac.compare_digest(given, expected)
 
 
+def _trigger_daily_sync_local(day: str) -> None:
+    """Kick the daily job on this machine instead of the Cloud Run Jobs API.
+
+    `systemctl start` is a no-op on an already-active unit, so systemd absorbs the
+    common double-trigger without us asking anything first — the equivalent of the
+    executions poll the Cloud Run path does. It is NOT the real guard, though:
+    `src.daily_runner` holds an flock, because the 11:00 timer and a manual run can
+    collide in ways systemd's per-unit check would not catch.
+
+    `--no-block` matters. Without it systemctl waits for the job to finish, and
+    this runs on the queue worker's thread — a 60-second daily sync would hold the
+    /process request open and burn the analysis budget.
+    """
+    unit = os.environ.get("DAILY_JOB_UNIT", "health-tracker-daily.service")
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "start", "--no-block", unit],
+            capture_output=True, text=True, timeout=30,
+            stdin=subprocess.DEVNULL)
+        if result.returncode == 0:
+            app.logger.info("weigh-in for %s woke the daily sync (%s)", day, unit)
+        else:
+            app.logger.warning("daily sync trigger failed (%s): %s",
+                               result.returncode, (result.stderr or "")[:200])
+    except Exception:
+        app.logger.exception("daily sync trigger failed (backstop will cover it)")
+
+
 def _trigger_daily_sync(day: str) -> None:
     """Kick the daily job, because the user has just woken up.
 
@@ -981,6 +1014,10 @@ def _trigger_daily_sync(day: str) -> None:
     a new date and append it TWICE. Cheap to check, and it also absorbs the real
     case of two screenshots sent back to back.
     """
+    if _queue_backend() == "local":
+        _trigger_daily_sync_local(day)
+        return
+
     project = os.environ.get("GCP_PROJECT")
     job = os.environ.get("DAILY_JOB", DEFAULT_DAILY_JOB)
     location = os.environ.get("DAILY_JOB_LOCATION",
@@ -1017,14 +1054,37 @@ def _trigger_daily_sync(day: str) -> None:
         app.logger.exception("daily sync trigger failed (backstop will cover it)")
 
 
+def _queue_backend() -> str:
+    """Which queue implementation to use: "cloudtasks" (default) or "local".
+
+    Selected by env rather than by import availability so that the two can run side
+    by side during the migration off Cloud Run — the same image/checkout serves
+    both, and rolling back is an env change plus a restart, not a redeploy.
+    `localqueue` copies the `meal-ingest` queue's semantics exactly; see its
+    docstring for the table."""
+    return os.environ.get("QUEUE_BACKEND", "cloudtasks").strip().lower()
+
+
 def _enqueue_process(payload: Dict[str, Any]) -> None:
-    """Hand a meal to the background worker via Cloud Tasks. The queue retries the
-    /process call with backoff for its whole window, so a transient Gemini outage
-    can't lose the meal. Raises if the queue isn't configured/reachable, so the
-    caller can fall back to a stub (never worse than the old synchronous path).
+    """Hand a meal to the background worker via the task queue. The queue retries
+    the /process call with backoff for its whole window, so a transient model
+    outage can't lose the meal. Raises if the queue isn't configured/reachable, so
+    the caller can fall back to a stub (never worse than the old synchronous path).
 
     Images can't ride in the task (Cloud Tasks bodies are ~small), so the payload
-    carries their Drive ids and the worker fetches the bytes back."""
+    carries their Drive ids and the worker fetches the bytes back. The local queue
+    inherits that shape rather than growing a second one — the worker's fetch path
+    is the tested one."""
+    body = json.dumps(payload).encode("utf-8")
+    url = os.environ["PROCESS_URL"]
+    headers = {"Content-Type": "application/json",
+               "X-Auth-Token": os.environ.get("INGEST_TOKEN", "")}
+
+    if _queue_backend() == "local":
+        import localqueue  # lazy, mirroring the Cloud Tasks import below
+        localqueue.enqueue(url, body, headers)
+        return
+
     from google.cloud import tasks_v2  # lazy: keeps tests importable without the lib
     client = tasks_v2.CloudTasksClient()
     parent = client.queue_path(
@@ -1034,10 +1094,9 @@ def _enqueue_process(payload: Dict[str, Any]) -> None:
     )
     client.create_task(parent=parent, task={"http_request": {
         "http_method": tasks_v2.HttpMethod.POST,
-        "url": os.environ["PROCESS_URL"],
-        "headers": {"Content-Type": "application/json",
-                    "X-Auth-Token": os.environ.get("INGEST_TOKEN", "")},
-        "body": json.dumps(payload).encode("utf-8"),
+        "url": url,
+        "headers": headers,
+        "body": body,
     }})
 
 
@@ -1452,34 +1511,47 @@ def _run_models(contents: List[Any], *, models: Optional[List[str]] = None,
                     "model %s produced unparseable output, next model: %s",
                     model, perr)
                 break
-            # The router fork. Only a verdict the current path can legitimately
-            # produce is honoured; anything else is a meal — the common case and the
-            # safe default.
-            kind = str(data.get("kind") or "").strip().lower()
-            if allow_body and kind == "body":
-                body = _normalize_body(data.get("body"))
-                app.logger.info("%s read a scale screenshot: %d metric(s)",
-                                model, len(body))
-                return {
-                    "kind": "body", "model": model, "body": body,
-                    "measured_at": str(
-                        (data.get("body") or {}).get("measured_at") or "").strip(),
-                }
-            if allow_bowel and kind == "bowel":
-                app.logger.info("%s classified the note as a bowel-movement log",
-                                model)
-                return {"kind": "bowel", "model": model}
-
-            items = _normalize_items(data.get("items"))
-            meal = _meal_from_items(items, data.get("confidence"), model)
-            meal["kind"] = "meal"
-            meal["meal_time"] = str(data.get("meal_time") or "").strip()
-            meal["template"] = str(data.get("template") or "").strip()
-            meal["template_scale"] = data.get("template_scale")
-            meal["save_template_name"] = str(
-                data.get("save_template_name") or "").strip()
-            return meal
+            return _record_from(data, model, allow_body=allow_body,
+                                allow_bowel=allow_bowel)
     raise RuntimeError(f"all models failed ({models}); last error: {last_err}")
+
+
+def _record_from(data: Dict[str, Any], model: str, *, allow_body: bool = True,
+                 allow_bowel: bool = False) -> Dict[str, Any]:
+    """Turn a model's parsed JSON into the record the callers act on.
+
+    The router fork: only a verdict the current path can legitimately produce is
+    honoured; anything else is a meal — the common case and the safe default.
+
+    Factored out of `_run_models` so the Claude path (see `claude_estimator`)
+    assembles its record through the SAME code rather than a parallel copy.
+    Normalisation is where the safety lives — `_normalize_body`'s plausibility
+    bands are what stop a misread scale screenshot reaching the sheet — so a second
+    implementation of this would be a second place for that to rot.
+    """
+    kind = str(data.get("kind") or "").strip().lower()
+    if allow_body and kind == "body":
+        body = _normalize_body(data.get("body"))
+        app.logger.info("%s read a scale screenshot: %d metric(s)",
+                        model, len(body))
+        return {
+            "kind": "body", "model": model, "body": body,
+            "measured_at": str(
+                (data.get("body") or {}).get("measured_at") or "").strip(),
+        }
+    if allow_bowel and kind == "bowel":
+        app.logger.info("%s classified the note as a bowel-movement log", model)
+        return {"kind": "bowel", "model": model}
+
+    items = _normalize_items(data.get("items"))
+    meal = _meal_from_items(items, data.get("confidence"), model)
+    meal["kind"] = "meal"
+    meal["meal_time"] = str(data.get("meal_time") or "").strip()
+    meal["template"] = str(data.get("template") or "").strip()
+    meal["template_scale"] = data.get("template_scale")
+    meal["save_template_name"] = str(
+        data.get("save_template_name") or "").strip()
+    return meal
 
 
 def _templates_block(templates: Optional[List[Dict[str, Any]]]) -> str:
@@ -1511,6 +1583,40 @@ def _build_prompt(num_images: int, note: str, now: Optional[datetime] = None,
     return prompt + _templates_block(templates) + BODY_SECTION
 
 
+def _try_claude(prompt: str, images: Optional[List[Tuple[bytes, str]]] = None,
+                *, allow_body: bool = True,
+                allow_bowel: bool = False) -> Optional[Dict[str, Any]]:
+    """Estimate with the local Claude CLI, or return None to fall through to Gemini.
+
+    Returns None — never raises — on every failure mode: the estimator not being
+    enabled (the cloud deployment), the CLI being absent, a spent 5-hour usage
+    window, a timeout, an unparseable answer. Gemini stays wired behind it for
+    exactly this reason: a spent window must cost the meal some accuracy, never the
+    row itself.
+
+    The Gemini slice the caller was given (`_worker_kwargs`) is untouched by this,
+    so the escalation still works as documented — Claude is simply tried first on
+    every attempt, and the queue's patience budget then plays out below it.
+    """
+    if not claude_estimator.enabled():
+        return None
+    try:
+        data = claude_estimator.analyze(prompt, images)
+    except Exception as err:
+        # warning, not exception(): a spent usage window is an expected daily event
+        # on a subscription, not a defect, and a stack trace per meal would bury the
+        # real failures.
+        app.logger.warning("claude estimate unavailable, falling back to Gemini: %s",
+                           err)
+        return None
+    try:
+        return _record_from(data, claude_estimator.model(),
+                            allow_body=allow_body, allow_bowel=allow_bowel)
+    except Exception:
+        app.logger.exception("claude answered but the record could not be built")
+        return None
+
+
 def analyze(images: List[Tuple[bytes, str]], note: str = "",
             now: Optional[datetime] = None,
             templates: Optional[List[Dict[str, Any]]] = None,
@@ -1525,9 +1631,15 @@ def analyze(images: List[Tuple[bytes, str]], note: str = "",
     `templates` lets the model recognise a dish the user has weighed and hand back
     its name instead of estimating. `kw` overrides (models/retries/timeout_ms/
     deadline_s) carry the worker's per-attempt patience policy (_worker_kwargs)."""
+    prompt = _build_prompt(len(images), note, now, templates)
+
+    record = _try_claude(prompt, images=images, allow_body=True)
+    if record is not None:
+        return record
+
     parts: List[Any] = [types.Part.from_bytes(data=img, mime_type=mime)
                         for img, mime in images]
-    parts.append(_build_prompt(len(images), note, now, templates))
+    parts.append(prompt)
     return _run_models(parts, **kw)
 
 
@@ -1544,6 +1656,10 @@ def analyze_text(note: str, now: datetime,
               + _templates_block(templates))
     # A text note can be a meal or a bowel log, never a scale reading (no screen to
     # OCR) — so open the bowel fork and close the body one.
+    record = _try_claude(prompt, allow_body=False, allow_bowel=True)
+    if record is not None:
+        return record
+
     return _run_models([prompt], allow_body=False, allow_bowel=True, **kw)
 
 
@@ -4418,6 +4534,23 @@ def _enqueue_coach_generate(slot: str, reason: str, *,
     "nothing has been logged since" condition that makes the delay a *debounce* —
     see `_trigger_coach_refresh`.
     """
+    url = os.environ.get("COACH_GENERATE_URL") or (
+        os.environ["PROCESS_URL"].rsplit("/", 1)[0] + "/coach/generate")
+    payload: Dict[str, Any] = {"slot": slot, "reason": reason}
+    if not_before_meal:
+        payload["only_if_no_meal_since"] = not_before_meal
+
+    if _queue_backend() == "local":
+        import localqueue
+        # `delay_s` is the debounce, so it must survive the switch: the local
+        # queue's `not_before` is the same idea as Cloud Tasks' schedule_time.
+        localqueue.enqueue(
+            url, json.dumps(payload).encode("utf-8"),
+            {"Content-Type": "application/json",
+             "X-Auth-Token": os.environ.get("INGEST_TOKEN", "")},
+            delay_s=float(delay_s))
+        return
+
     from google.cloud import tasks_v2  # lazy: keeps tests importable without the lib
     from google.protobuf import timestamp_pb2
     client = tasks_v2.CloudTasksClient()
@@ -4426,11 +4559,6 @@ def _enqueue_coach_generate(slot: str, reason: str, *,
         os.environ.get("TASKS_LOCATION", "europe-west1"),
         os.environ["TASKS_QUEUE"],
     )
-    url = os.environ.get("COACH_GENERATE_URL") or (
-        os.environ["PROCESS_URL"].rsplit("/", 1)[0] + "/coach/generate")
-    payload: Dict[str, Any] = {"slot": slot, "reason": reason}
-    if not_before_meal:
-        payload["only_if_no_meal_since"] = not_before_meal
     task: Dict[str, Any] = {"http_request": {
         "http_method": tasks_v2.HttpMethod.POST,
         "url": url,

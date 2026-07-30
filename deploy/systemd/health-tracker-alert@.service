@@ -1,0 +1,14 @@
+[Unit]
+Description=Alert that %i failed
+# The local replacement for the GCP log-based alert policies that emailed on any
+# job error, ingest error or failed build. Reuses `agents-notify` (Telegram) so
+# health-tracker alerts arrive in the same place as the machine's own.
+
+[Service]
+Type=oneshot
+# Full path, not `agents-notify`: a systemd unit gets a minimal PATH and does not
+# read the shell profile that puts ~/agent-server/bin on it. The previous
+# generation of these agents failed silently for days on exactly this.
+# No $(...) here — systemd does not do command substitution and would pass it
+# through literally, which is how you end up with an alert that says "$(hostname)".
+ExecStart=%h/agent-server/bin/agents-notify "health-tracker: %i FAILED — journalctl --user -u %i -n 50"

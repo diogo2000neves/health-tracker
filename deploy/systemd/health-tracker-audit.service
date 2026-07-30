@@ -1,0 +1,28 @@
+[Unit]
+Description=Health Tracker nutrition audit — re-estimate today's meals and ground them in FDC
+Documentation=file://%h/projects/health-tracker/automation/nutrition-audit/README.md
+After=network-online.target health-tracker-api.service
+Wants=network-online.target
+OnFailure=health-tracker-alert@%n.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/health-tracker/env
+
+# The second half of the ensemble. Ingest writes a sonnet-5/high estimate; this
+# re-estimates with opus-5/low, adjudicates the two against the photo, and grounds
+# the micronutrients in USDA FDC. Without it every meal keeps its single first-pass
+# estimate and the ~30 grounded nutrient values per item never arrive.
+#
+# Was launchd (com.dneves.nutrition-audit.plist) on the MacBook, at the same three
+# times. It runs from the repo root so `automation/nutrition-audit` resolves its
+# sibling imports (claude_cli, nutrients, fdc) the way it always has.
+ExecStart=%h/projects/health-tracker/backend/venv/bin/python \
+    %h/projects/health-tracker/automation/nutrition-audit/audit.py
+
+WorkingDirectory=%h/projects/health-tracker
+
+# Per meal: an opus-5 estimate + an adjudication (6-9 min each on a complex plate)
+# + a light FDC-matching call, and a day can hold several meals. Generous on
+# purpose — a truncated audit leaves rows half-upgraded.
+TimeoutStartSec=10800

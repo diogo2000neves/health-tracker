@@ -1,0 +1,16 @@
+{
+  "name": "projects/health-tracker-501322/locations/europe-west1/queues/meal-ingest",
+  "rateLimits": {
+    "maxBurstSize": 10,
+    "maxConcurrentDispatches": 1,
+    "maxDispatchesPerSecond": 1.0
+  },
+  "retryConfig": {
+    "maxAttempts": 8,
+    "maxBackoff": "120s",
+    "maxDoublings": 4,
+    "maxRetryDuration": "900s",
+    "minBackoff": "5s"
+  },
+  "state": "RUNNING"
+}

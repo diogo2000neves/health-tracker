@@ -1,0 +1,17 @@
+[Unit]
+Description=Health Tracker coach sweep every 30 min (replaces Cloud Scheduler coach-sweep)
+
+[Timer]
+# Was */30 * * * * Europe/Lisbon. systemd user timers run in local time, which is
+# Europe/Lisbon here, so the schedule carries over unchanged.
+#
+# This is the coach's safety net: it pushes an unanswered generation through Gemini
+# once it has waited COACH_SONNET_WAIT_HOURS. Lose this timer and a job nobody
+# claims waits forever — the card simply never appears, with no error anywhere.
+OnCalendar=*:0/30
+# No Persistent: catching up a missed 30-minute sweep after a reboot is pointless,
+# the next one is never more than half an hour away.
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

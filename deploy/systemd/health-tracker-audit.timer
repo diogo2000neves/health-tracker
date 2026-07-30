@@ -1,0 +1,21 @@
+[Unit]
+Description=Nutrition audit at 11:00, 15:00 and 23:00 (replaces com.dneves.nutrition-audit launchd)
+
+[Timer]
+# The plist's three StartCalendarInterval entries, unchanged. They straddle the
+# day so meals get audited within hours of being logged rather than the next
+# morning: 11:00 catches breakfast, 15:00 lunch, 23:00 dinner.
+OnCalendar=*-*-* 11:00:00
+OnCalendar=*-*-* 15:00:00
+OnCalendar=*-*-* 23:00:00
+
+# Persistent: the plist's launchd equivalent ran a missed job shortly after wake,
+# and that behaviour matters — a laptop asleep at 15:00 should still audit lunch.
+Persistent=true
+
+# Offset from the daily sync (11:00) and the coach timers so three Claude-heavy
+# jobs don't start in the same second and contend for the same usage window.
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

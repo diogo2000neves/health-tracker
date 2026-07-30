@@ -1,9 +1,14 @@
 # Health Tracker
 
 A zero-friction personal health pipeline. Everything enters through **one button
-on the phone**: photograph a meal, or screenshot your smart scale. Gemini works out
+on the phone**: photograph a meal, or screenshot your smart scale. Claude works out
 which of the two it's looking at, extracts the numbers, and files them into a
 Google Sheet you own — one row per day, nutrition against physique.
+
+> **This runs on a laptop, not the cloud.** GCP was decommissioned on 2026-07-29.
+> Where this document says "Cloud Run", read `health-tracker-api.service`; where it
+> says "Cloud Tasks", read `ingest/localqueue.py`. The Sheet and Drive are
+> unchanged. `deploy/README.md` is the authoritative deployment doc.
 
 ```
                       iPhone Shortcut (one button)
@@ -11,7 +16,7 @@ Google Sheet you own — one row per day, nutrition against physique.
                 photo of a meal ─┴─ screenshot of the scale app
                                  │
                                  ▼
-                    health-tracker-ingest (Cloud Run)
+                 health-tracker-api.service (laptop)
                       "is this food, or a scale?"
                           │                │
               per-ingredient          all 10 body
@@ -30,12 +35,9 @@ one Cloud Run **Job** only derives from what's already in the Sheet.
 
 ```
 Health Tracker/
-├── cloudbuild.yaml         # CI/CD: test gate → build → deploy all targets
-├── Dockerfile              # image for the daily + weekly jobs
 ├── requirements.txt
 ├── credentials/            # OAuth client + token — git-ignored
 ├── ingest/
-│   ├── Dockerfile
 │   ├── main.py             # Cloud Run service: POST /ingest, /process, /feel
 │   └── requirements.txt
 ├── src/
@@ -235,14 +237,14 @@ screen.
 
 ## Continuous deployment
 
-Pushing to `main` auto-builds and redeploys all three Cloud Run targets via Cloud
-Build (`cloudbuild.yaml`, trigger `health-tracker-deploy` in `europe-west1`):
+Deployment is local systemd on `lenovo-agents` — no build, no images, no CI.
+`cloudbuild.yaml` and both Dockerfiles were deleted with the rest of GCP.
 
-- `health-tracker-daily` (Job) — built from `./Dockerfile`
-- `health-tracker-ingest` (Service) — built from `./ingest/Dockerfile`
-
-Images are tagged with the commit SHA; deploys swap only the image, so each
-target's env vars and secret bindings are preserved.
+```bash
+git pull
+backend/venv/bin/python -m pytest backend/tests -q   # the only gate that remains
+./deploy/install.sh --start
+```
 
 See `CONTEXT.md` for the full system design, auth model, and the gotchas worth
 not rediscovering.

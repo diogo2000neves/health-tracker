@@ -6,17 +6,25 @@ estimate of each meal into a far more accurate one, by treating meal analysis as
 
 - **Perception** — *what is on the plate and how many grams* (identity, portions,
   hidden fats). Different models genuinely disagree here, and the disagreement is
-  useful, so we **ensemble**: Gemini's estimate (already in the row) + a fresh,
-  independent Claude estimate, **reconciled against the photo** — not one overwriting
-  the other.
+  useful, so we **ensemble**: the estimate already in the row (**Claude Sonnet 5,
+  high**, written by ingest) + a fresh, independent **Claude Opus 5, low** estimate,
+  **reconciled against the photo** — not one overwriting the other.
+
+  ⚠️ **The two must not be the same model at the same effort.** The row's estimate
+  used to be Gemini's, and the pairing was independent for free. Since ingest moved
+  to Claude (see `backend/ingest/claude_estimator.py`) that independence has to be
+  maintained deliberately: a different family (opus vs sonnet) and a different
+  effort. Point both at `claude-sonnet-5`/`high` and the ensemble silently collapses
+  into one model agreeing with itself — the adjudication still runs, still logs, and
+  is worth nothing.
 - **Knowledge** — *the ~30 micronutrient values for a known food × grams*. That's a
   lookup, not a guess, and a model reciting it from memory is noisy. So we **ground**
   it in **USDA FoodData Central (FDC)**: measured, deterministic, comparable across
   days. The model's estimate is kept only for the handful of keys FDC lacks.
 
 ```
-   Gemini(row)  +  Claude estimate   →   adjudicate   →   ground (FDC)   →   write
-   └─ independent perception opinions ─┘   └ reconcile ┘   └ knowledge lookup ┘
+   sonnet-5/high(row) + opus-5/low estimate → adjudicate → ground (FDC) → write
+   └── independent perception opinions ────┘  └ reconcile ┘ └ knowledge lookup ┘
 ```
 
 It lives here (not in `backend/`) because it uses the local `claude` CLI on the
@@ -31,10 +39,11 @@ already share. Runs at **11:00, 15:00, 23:00** daily.
    template** (kitchen-scale ground truth — never overwritten), and **not already
    audited**.
 
-2. **Gather independent estimates** (`estimate.py`). Estimate #1 is Gemini's, already
-   in the row from ingest — free, no API call. Estimate #2 is a fresh Claude pass (sonnet,
-   high effort) that is **never shown any other model's numbers** (see *Why the estimate
-   is independent*). A **disagreement-gated third opinion** (`audit._THIRD_ESTIMATOR`)
+2. **Gather independent estimates** (`estimate.py`). Estimate #1 is the one already
+   in the row from ingest — **Claude Sonnet 5 at high effort**, free here because
+   ingest already paid for it. Estimate #2 is a fresh **Claude Opus 5, low effort**
+   pass that is **never shown any other model's numbers** (see *Why the estimate is
+   independent*). A **disagreement-gated third opinion** (`audit._THIRD_ESTIMATOR`)
    is called **only** when the first two diverge past `AUDIT_THIRD_MODEL_DISAGREEMENT`
    (default 25 %) — spend the extra opinion where the uncertainty is, not on every meal.
    It's the same estimator as #2, at **xhigh** effort instead of high, not a third
@@ -81,9 +90,9 @@ already share. Runs at **11:00, 15:00, 23:00** daily.
    | `datetime` / `foods` | the meal (cross-refs the meals row) and its final food list |
    | `stage` | `adjudicated` / `single-estimate` / `fallback-estimate` / **`skipped`** |
    | `models` | which models took part + the adjudicator, with their ids |
-   | `gemini_said` | **Gemini's own conclusion** (the ingest estimate): kcal, macros, portion, item + nutrient-key counts |
-   | `claude_said` | **the independent Claude estimate's conclusion**, same format |
-   | `third_said` | **the xhigh-effort Sonnet tie-break's conclusion**, or a clear reason it wasn't invoked (agreement below gate) |
+   | `ingest_said` | **the estimate already in the row** (ingest's, sonnet-5/high): kcal, macros, portion, item + nutrient-key counts |
+   | `audit_said` | **this audit's own independent estimate** (opus-5/low), same format |
+   | `third_said` | **the xhigh-effort tie-break's conclusion**, or a clear reason it wasn't invoked (agreement below gate) |
    | `disagreement` | how far the estimates diverged — the ensemble signal |
    | `adjudicator_verdict` | **what the adjudicator decided**, per item: agreed / adjudicated / added, and why |
    | `grounding` | **per-item nutrient source** — which FDC entry backed each item, or that the model estimate was kept (and why) |
@@ -153,20 +162,20 @@ same OAuth client as the rest of the system but its own token with `spreadsheets
 | `AUDIT_CLAUDE_TIMEOUT_S` *(via each stage)* | `900` | Per-call timeout for the heavy image estimate/adjudication calls. |
 | `HEALTH_SPREADSHEET_ID`, `HEALTH_TZ`, `CLAUDE_BIN` | see code | Overrides the backend also honours. |
 
-### The third opinion (more Sonnet, not more vendors)
+### The third opinion (more effort, not more vendors)
 
 `audit._THIRD_ESTIMATOR` calls `estimate.py` again — the identical independent-estimate
-prompt and CLI path as estimate #2 — but at `AUDIT_THIRD_EFFORT` (default `xhigh`)
-instead of `high`. It only runs when Gemini and Claude disagree by more than
-`AUDIT_THIRD_MODEL_DISAGREEMENT`.
+prompt and CLI path as estimate #2, so it inherits `estimate.DEFAULT_MODEL` (opus-5) —
+but at `AUDIT_THIRD_EFFORT` (default `xhigh`) instead of `low`. It only runs when the
+two estimates disagree by more than `AUDIT_THIRD_MODEL_DISAGREEMENT`.
 
-*Why not a second Gemini opinion:* that was the original design — `gemini_estimate.py`
-shelled out to the local `agy` (Antigravity) CLI for a `gemini-3.6-flash-high` tie-break,
-same subscription-backed, no-API-key pattern as `claude_cli.py`. In practice Sonnet is
-simply the stronger food estimator: a second Gemini call wasn't adding a genuinely
-different perspective on a hard meal, it was adding a weaker one. So the tie-break now
-spends the extra opinion as more reasoning effort on the model that's already winning,
-gated on disagreement exactly as before.
+*Why not a second vendor:* a Gemini third opinion was the original design —
+`gemini_estimate.py` (since deleted) shelled out to the local `agy` (Antigravity) CLI
+for a `gemini-3.6-flash-high` tie-break, the same subscription-backed, no-API-key
+pattern as `claude_cli.py`. In practice it wasn't adding a genuinely different
+perspective on a hard meal, it was adding a weaker one. So the tie-break spends the
+extra opinion as more reasoning effort on the stronger model, gated on disagreement
+exactly as before.
 
 Override with `AUDIT_THIRD_MODEL` / `AUDIT_THIRD_EFFORT` if you want a different
 model or effort for the tie-break (e.g. back to a Gemini opinion via a callable wired
@@ -213,11 +222,17 @@ the raw per-meal JSON to `logs/`. Each meal costs ~3 heavy Claude calls, so keep
 
 ## Cost / usage
 
-Per meal: one independent Claude estimate + one adjudication (both **sonnet, high
-effort**, image, ~6–9 min each) + one **light** FDC-matching call + a handful of cached
-FDC HTTP lookups. Roughly **2 heavy calls/meal** (vs 1 before), all background, plus a
-third heavy call (**sonnet, xhigh effort** — slower still) only on meals where Gemini
-and Claude disagree past the gate. FDC is free; the on-disk cache means a repeated food
+Per meal: one independent Claude estimate (**opus-5, low effort**) + one adjudication
+(**sonnet-5, high effort**, image, ~6–9 min) + one **light** FDC-matching call + a
+handful of cached FDC HTTP lookups. Roughly **2 heavy calls/meal** (vs 1 before), all
+background, plus a third heavy call (**opus-5, xhigh effort** — `AUDIT_THIRD_MODEL`
+inherits `estimate.DEFAULT_MODEL`) only on meals where the two estimates disagree past
+the gate.
+
+Note this is now on top of ingest's own Claude call, so a meal costs **3** heavy
+Claude calls end to end rather than 2 plus a free Gemini one. All of it is
+subscription usage rather than billed API, but it is the same 5-hour window the
+coach draws on — if cards start arriving late, this is why. FDC is free; the on-disk cache means a repeated food
 costs nothing.
 
 ## Schedule — disable / re-enable

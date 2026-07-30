@@ -1,0 +1,25 @@
+[Unit]
+Description=Health Tracker weekly insights report (replaces com.dneves.insights-weekly on the MacBook)
+Documentation=file://%h/projects/health-tracker/automation/insights/README.md
+After=network-online.target health-tracker-api.service
+Wants=network-online.target
+OnFailure=health-tracker-alert@%n.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/health-tracker/env
+
+# This one is NOT superseded by the coach: the iOS app calls GET /insights/weekly
+# directly, and that endpoint is read-only — it serves whatever this job last wrote
+# into the `weekly_reports` tab, and reports `status: pending` until it has run.
+# So without this unit that screen stays empty forever.
+#
+# Gemini-narrated, not Claude (see the module docstring — it was migrated to the
+# Gemini API deliberately). It failed on the MacBook for months because
+# GEMINI_API_KEY was never set there; here it comes from the same env file as the
+# rest, sourced from Secret Manager during the migration.
+ExecStart=%h/projects/health-tracker/backend/venv/bin/python \
+    %h/projects/health-tracker/automation/insights/generate.py weekly
+
+WorkingDirectory=%h/projects/health-tracker
+TimeoutStartSec=1800

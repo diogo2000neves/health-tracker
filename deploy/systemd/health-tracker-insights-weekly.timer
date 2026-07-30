@@ -1,0 +1,24 @@
+[Unit]
+Description=Weekly insights on Sunday evening (replaces com.dneves.insights-weekly)
+
+[Timer]
+# Sunday, because the job is Sunday-anchored in code: `_sunday_ref()` resolves the
+# reference week to the most recent Sunday, and the report is keyed on it
+# (`week_start`). Running any other day would still work but would label the row
+# with a week the user has not finished living.
+#
+# 20:00 so the day's meals are in before the week is summarised, and clear of
+# coach@weekly (Monday 10:00) so two model-heavy jobs don't overlap.
+#
+# NOTE: the MacBook's original plist could not be recovered, so this exact time is
+# a considered choice rather than a copy — unlike every other timer here, which was
+# taken verbatim from the job it replaced. Adjust freely; only the DAY matters.
+OnCalendar=Sun *-*-* 20:00:00
+
+# A laptop asleep on Sunday evening should still produce the report when it wakes,
+# rather than leaving the app's weekly screen stale for another seven days.
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

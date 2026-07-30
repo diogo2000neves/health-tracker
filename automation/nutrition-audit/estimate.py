@@ -3,7 +3,7 @@
 
 This is the second opinion the pipeline produces locally with Claude. It is kept
 deliberately BLIND to any other model's numbers — see the long comment below — so
-that when it is later compared/adjudicated against Gemini's estimate, the two are
+that when it is later compared/adjudicated against the ingest estimate, the two are
 genuinely independent and their disagreement is real signal.
 
 It returns a COMPLETE estimate (identity, grams, macros AND all micronutrients),
@@ -27,8 +27,20 @@ log = logging.getLogger("nutrition-audit")
 # claude-sonnet-5 (`--model sonnet` -> modelUsage shows claude-sonnet-4-6; `--model
 # claude-sonnet-5` -> modelUsage shows claude-sonnet-5). An alias silently tracks
 # whatever the CLI considers "latest", which drifted stale here — pin the ID instead.
-DEFAULT_MODEL = "claude-sonnet-5"
-DEFAULT_EFFORT = "high"
+#
+# Opus 5 at LOW effort, and the pairing is the point. Ingest now estimates every
+# meal with Claude Sonnet 5 at high effort (see ingest/claude_estimator.py), so if
+# this stayed sonnet-5/high the two estimates the adjudicator compares would come
+# from the SAME model at the SAME effort — and the ensemble would collapse into one
+# model agreeing with itself. The whole value of stage 2 is that the two opinions
+# are genuinely independent (see the module docstring below).
+#
+# A different family (opus vs sonnet) restores that independence. Low effort is the
+# deliberate counterweight: the estimates are meant to disagree in useful ways, not
+# to be uniformly maximal, and opus/low is a real second opinion rather than a
+# slower re-run of the first.
+DEFAULT_MODEL = "claude-opus-5"
+DEFAULT_EFFORT = "low"
 # A high-effort call that reads image(s) and fills ~30 nutrients across every item
 # is genuinely slow (6.5-9 min on a complex plate). Generous, env-overridable.
 DEFAULT_TIMEOUT_S = 900

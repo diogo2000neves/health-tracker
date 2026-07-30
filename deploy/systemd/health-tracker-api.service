@@ -1,0 +1,53 @@
+[Unit]
+Description=Health Tracker ingest API (replaces the health-tracker-ingest Cloud Run service)
+After=network-online.target
+Wants=network-online.target
+# Lifted so a crash loop during a bad deploy doesn't leave the unit permanently
+# refusing to start — the same reasoning as claude-remote-control.service.
+StartLimitIntervalSec=0
+# [Unit], NOT [Service]. systemd logs "Unknown key name 'OnFailure' in section
+# 'Service', ignoring" and carries on happily — so putting it under [Service]
+# leaves the unit running with no alerting at all, which is exactly how it shipped
+# the first time. Same trap as StartLimitIntervalSec above.
+OnFailure=health-tracker-alert@%n.service
+
+[Service]
+# Both directories go on the path because the container image flattens ingest/*.py
+# into /app while keeping schema/ as a package beside them. Reproducing that layout
+# with PYTHONPATH means main.py needs no import changes at all.
+Environment=PYTHONPATH=%h/projects/health-tracker/backend:%h/projects/health-tracker/backend/ingest
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=%h/projects/health-tracker/backend/ingest
+
+# Secrets and config. Mode 600, outside the repo — this is what Secret Manager
+# injected as env vars on Cloud Run. `-` prefix would let it start without them;
+# deliberately absent, because a service that boots without its token would answer
+# 401 to the phone and look like a network fault.
+EnvironmentFile=%h/.config/health-tracker/env
+
+# --bind 127.0.0.1, NOT 0.0.0.0. `agents-doctor` fails loudly on anything binding
+# a wildcard address, and that rule is worth keeping: the phone reaches this
+# through `tailscale serve` on the Windows host, which proxies to localhost. With
+# networkingMode=mirrored, WSL and Windows share the loopback, so nothing has to
+# listen on a routable interface for this to work.
+#
+# --workers 1 --threads 8 mirrors ingest/Dockerfile. Do not raise workers: the
+# local queue's "1 concurrent dispatch" is enforced by a single worker process.
+#
+# --timeout 1200, not the image's 300: Claude at high effort takes 6.5-9 min on a
+# complex plate (measured, see estimate.DEFAULT_TIMEOUT_S), and the worst case is
+# 900 (claude) + 105 (gemini deadline) + 60 (one gemini call) + ~5 (writes) ~= 1070.
+# At 300 gunicorn would kill the worker mid-analysis and the meal would retry
+# forever against the same wall. Nothing waits on /process, so a long timeout costs
+# nothing.
+ExecStart=%h/projects/health-tracker/backend/venv/bin/gunicorn \
+    --bind 127.0.0.1:8080 \
+    --workers 1 --threads 8 --timeout 1200 \
+    --access-logfile - --error-logfile - \
+    main:app
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

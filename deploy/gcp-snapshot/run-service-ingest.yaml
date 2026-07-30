@@ -1,0 +1,90 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  annotations:
+    run.googleapis.com/build-enable-automatic-updates: 'false'
+    run.googleapis.com/build-id: fac3b6c6-118d-49bd-a287-11b6fe5873ee
+    run.googleapis.com/build-image-uri: europe-west1-docker.pkg.dev/health-tracker-501322/cloud-run-source-deploy/health-tracker-ingest
+    run.googleapis.com/build-name: projects/785594953316/locations/europe-west1/builds/fac3b6c6-118d-49bd-a287-11b6fe5873ee
+    run.googleapis.com/build-source-location: gs://run-sources-health-tracker-501322-europe-west1/services/health-tracker-ingest/1783729217.967262-f03464be305349d38d5e3f1bad6d9012.zip#1783729218236400
+    run.googleapis.com/ingress: all
+    run.googleapis.com/ingress-status: all
+    run.googleapis.com/maxScale: '20'
+    run.googleapis.com/urls: '["https://health-tracker-ingest-785594953316.europe-west1.run.app","https://health-tracker-ingest-myznjtlyrq-ew.a.run.app"]'
+  labels:
+    cloud.googleapis.com/location: europe-west1
+  name: health-tracker-ingest
+  namespace: '785594953316'
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: '3'
+        run.googleapis.com/client-name: gcloud
+        run.googleapis.com/client-version: 577.0.0
+        run.googleapis.com/startup-cpu-boost: 'true'
+      labels:
+        client.knative.dev/nonce: dgtwbyspax
+        run.googleapis.com/startupProbeType: Default
+    spec:
+      containerConcurrency: 80
+      containers:
+      - env:
+        - name: HEALTH_SPREADSHEET_ID
+          value: 1JQWYkSgzU3F4mqR7BRE8wfoBif0xLU7uBM0iwHwxNAk
+        - name: MEALS_FOLDER_ID
+          value: 1i0wYuIzcD7ifs_wVQVdsUpI26vGmJdfP
+        - name: INGEST_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: ingest-token
+        - name: GEMINI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: gemini-api-key
+        - name: GEMINI_RETRIES
+          value: '3'
+        - name: GCP_PROJECT
+          value: health-tracker-501322
+        - name: TASKS_LOCATION
+          value: europe-west1
+        - name: TASKS_QUEUE
+          value: meal-ingest
+        - name: PROCESS_URL
+          value: https://health-tracker-ingest-myznjtlyrq-ew.a.run.app/process
+        - name: TASKS_MAX_ATTEMPTS
+          value: '8'
+        - name: DRIVE_OAUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: drive-oauth-token
+        - name: COACH_BUCKET
+          value: health-tracker-coach
+        - name: GEMINI_NARRATOR_MODEL
+          value: gemini-3-flash-preview
+        - name: GEMINI_CRITIC_MODEL
+          value: gemini-3-flash-preview
+        - name: COACH_REPORT_MODEL
+          value: opus
+        image: europe-west1-docker.pkg.dev/health-tracker-501322/cloud-run-source-deploy/health-tracker-ingest:f360168d3513f04afb6311910e961b032f257aaf
+        ports:
+        - containerPort: 8080
+          name: http1
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 512Mi
+        startupProbe:
+          failureThreshold: 1
+          periodSeconds: 240
+          tcpSocket:
+            port: 8080
+          timeoutSeconds: 240
+      serviceAccountName: health-tracker-job@health-tracker-501322.iam.gserviceaccount.com
+      timeoutSeconds: 180
+  traffic:
+  - latestRevision: true
+    percent: 100

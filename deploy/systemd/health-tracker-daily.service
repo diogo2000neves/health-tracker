@@ -1,0 +1,29 @@
+[Unit]
+Description=Health Tracker daily sync (replaces the health-tracker-daily Cloud Run Job)
+After=network-online.target
+Wants=network-online.target
+# [Unit], not [Service] — see the note in health-tracker-api.service. This is the
+# one that matters most: the daily job is unattended, so a silent failure here is
+# a day of missing biometrics nobody notices.
+OnFailure=health-tracker-alert@%n.service
+
+[Service]
+Type=oneshot
+Environment=PYTHONPATH=%h/projects/health-tracker/backend
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=%h/projects/health-tracker/backend
+EnvironmentFile=%h/.config/health-tracker/env
+
+# src.daily_runner, not src.run_daily: the runner holds the flock that stops two
+# executions overlapping. `upsert_daily` is read-modify-write against a grid
+# snapshot, so a collision appends the same date TWICE.
+#
+# Started from two places — this unit's timer (the 11:00 backstop) and a weigh-in
+# via _trigger_daily_sync_local — plus the occasional manual run. systemd's own
+# "already active" check covers the first two; the flock covers all three.
+ExecStart=%h/projects/health-tracker/backend/venv/bin/python -m src.daily_runner
+
+# The job legitimately runs for a minute or two on a reconcile window; well inside
+# this, but bounded so a hung Google API call can't leave the unit active forever
+# and block every subsequent weigh-in trigger.
+TimeoutStartSec=900

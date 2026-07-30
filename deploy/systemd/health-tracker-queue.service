@@ -1,0 +1,25 @@
+[Unit]
+Description=Health Tracker task queue dispatcher (replaces the Cloud Tasks meal-ingest queue)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+# [Unit], not [Service] — see the note in health-tracker-api.service.
+OnFailure=health-tracker-alert@%n.service
+
+[Service]
+Environment=PYTHONPATH=%h/projects/health-tracker/backend:%h/projects/health-tracker/backend/ingest
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=%h/projects/health-tracker/backend/ingest
+EnvironmentFile=%h/.config/health-tracker/env
+
+# Deliberately NOT ordered After=health-tracker-api: the dispatcher treats a
+# connection refusal as a retryable failure (test_transport_error_is_retryable),
+# so it may start first and simply back off until the API is up. Ordering them
+# would only mean the queue dies whenever the API does.
+ExecStart=%h/projects/health-tracker/backend/venv/bin/python queue_worker.py
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Health Tracker coach monthly review (replaces Cloud Scheduler coach-monthly)
+
+[Timer]
+# Was 0 11 1 * * Europe/Lisbon.
+OnCalendar=*-*-01 11:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

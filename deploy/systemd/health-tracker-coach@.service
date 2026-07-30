@@ -1,0 +1,18 @@
+[Unit]
+Description=Health Tracker coach — %i (replaces Cloud Scheduler job coach-%i)
+After=network-online.target health-tracker-api.service
+Wants=network-online.target
+# [Unit], not [Service] — see health-tracker-api.service for why that matters.
+OnFailure=health-tracker-alert@%n.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/health-tracker/env
+# One templated unit for all five schedules: they differ only in path and body, and
+# `coach-call` owns that mapping. Five near-identical unit files would be five
+# places for the token handling and timeout to drift apart.
+ExecStart=%h/projects/health-tracker/deploy/bin/coach-call %i
+
+# Longer than the script's own --max-time so curl reports the timeout itself (with
+# a useful message) instead of systemd killing it silently.
+TimeoutStartSec=1200

@@ -35,9 +35,17 @@ import nutrients
 
 log = logging.getLogger("nutrition-audit")
 
-# Pinned to the model ID, not the "sonnet" alias — see estimate.py's DEFAULT_MODEL
-# comment: the alias resolves to a stale claude-sonnet-4-6 on this machine's CLI.
-DEFAULT_MODEL = "claude-sonnet-5"
+# Pinned to the model ID, not an alias — see estimate.py's DEFAULT_MODEL comment:
+# the alias resolves to a stale claude-sonnet-4-6 on this machine's CLI.
+#
+# Opus 5, deliberately NOT the sonnet-5 that ingest uses. The adjudicator's whole
+# job is to resolve a disagreement between two estimates on the evidence, and one of
+# those estimates is now written by sonnet-5/high. Judging with the same model that
+# produced one side invites it to recognise and favour its own answer — the
+# estimates are shown blind (labelled A/B, identity stripped, order shuffled)
+# precisely to stop that, and reusing the model would undercut the blinding for free.
+# High effort because reconciliation is the step that decides the final numbers.
+DEFAULT_MODEL = "claude-opus-5"
 DEFAULT_EFFORT = "high"
 DEFAULT_TIMEOUT_S = 900
 

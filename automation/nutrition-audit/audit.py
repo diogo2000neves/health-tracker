@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
-"""Daily multi-model nutrition audit (runs locally on the MacBook).
+"""Daily multi-model nutrition audit (runs locally).
 
-The cloud ingest service analyses each meal photo ONCE with Gemini and writes the
-result to the `meals` tab. This job upgrades that estimate with a local pipeline that
-treats meal analysis as TWO problems:
+The ingest service analyses each meal photo ONCE — with Claude Sonnet 5 at high
+effort — and writes the result to the `meals` tab. This job upgrades that estimate
+with a local pipeline that treats meal analysis as TWO problems:
 
   * PERCEPTION (what is on the plate, how many grams, hidden fats) — where different
-    models genuinely disagree, so we ENSEMBLE: take Gemini's estimate (already in the
-    row) plus a fresh, independent Claude estimate, and RECONCILE them against the
-    image (adjudicate.py) instead of letting one overwrite the other. Disagreement is
-    kept as signal, not discarded. When Gemini and Claude still diverge past
-    THIRD_MODEL_DISAGREEMENT, a THIRD opinion breaks the tie — Claude again, at xhigh
-    effort instead of high (see _THIRD_ESTIMATOR). A second Gemini opinion was tried
-    here first (via the `agy` Antigravity CLI); Sonnet is simply the stronger food
-    estimator in practice, so the extra opinion is more thinking on the model that's
-    already winning, not another vendor.
+    models genuinely disagree, so we ENSEMBLE: take the estimate already in the row
+    plus a fresh, independent one, and RECONCILE them against the image
+    (adjudicate.py) instead of letting one overwrite the other. Disagreement is kept
+    as signal, not discarded. When the two still diverge past
+    THIRD_MODEL_DISAGREEMENT, a THIRD opinion breaks the tie at xhigh effort (see
+    _THIRD_ESTIMATOR).
+
+    ⚠️ The two estimates MUST come from different models. The row used to be
+    Gemini's, so independence was free; now that ingest is also Claude it is
+    maintained deliberately — row = sonnet-5/high, this audit = opus-5/low,
+    adjudicator = opus-5/high. Point any two of those at the same model+effort and
+    the ensemble becomes one model agreeing with itself while still logging as
+    though it had been checked.
   * KNOWLEDGE (the ~30 micronutrient values for a known food × grams) — a lookup, not
     a guess, so we GROUND it in USDA FoodData Central (ground.py): measured, consistent,
     comparable across days; the model's estimate is kept only for the few keys FDC lacks.
 
-Pipeline per meal:  Gemini(row) + Claude(high) [+ Claude(xhigh) if disagreement]  ->
-adjudicate  ->  ground  ->  write.
+Pipeline per meal:  row(sonnet-5/high) + audit(opus-5/low) [+ third(opus-5/xhigh) if
+disagreement]  ->  adjudicate(opus-5/high)  ->  ground  ->  write.
 
 Design invariants carried over from the original single-model job:
   * LOCAL, not cloud — the subscription-backed `claude` CLI only exists on this Mac.
@@ -105,14 +109,14 @@ REVIEWS_HEADERS = [
     "foods",                # the final food list
     "stage",                # adjudicated / single-estimate / fallback-estimate
     "models",               # which models took part + the adjudicator
-    "gemini_said",          # Gemini's own conclusion (the ingest estimate in the row)
-    "claude_said",          # the independent Claude estimate's conclusion
-    "third_said",           # the xhigh-effort Sonnet tie-break's conclusion, or why not
+    "ingest_said",          # the estimate already in the row, written by ingest
+    "audit_said",           # this audit's own independent estimate's conclusion
+    "third_said",           # the xhigh-effort tie-break's conclusion, or why not
     "disagreement",         # how far the estimates diverged — the ensemble signal
     "adjudicator_verdict",  # per-item: agreed / adjudicated / added, and why
     "grounding",            # per-item nutrient source: FDC entry vs kept-from-model
     "final",                # the final verdict: totals + confidence that got written
-    "delta",                # before(Gemini)->after: calories, protein, nutrient-keys
+    "delta",                # before(ingest)->after: calories, protein, nutrient-keys
     "review_notes",         # the adjudicator's own reasoning
     "image_sha",            # upsert key
 ]
@@ -120,17 +124,17 @@ REVIEWS_LAST_COL = chr(ord("A") + len(REVIEWS_HEADERS) - 1)
 
 # ---- Phase 3: a disagreement-gated third opinion ------------------------------
 # A callable (note: str, img_paths: List[Path]) -> estimate dict (same shape as
-# estimate_mod.estimate). Called ONLY when Gemini and Claude diverge by more than
+# estimate_mod.estimate). Called ONLY when the two estimates diverge by more than
 # THIRD_MODEL_DISAGREEMENT — spend the extra opinion where uncertainty actually is,
 # not on every meal.
 THIRD_MODEL_DISAGREEMENT = float(
     os.environ.get("AUDIT_THIRD_MODEL_DISAGREEMENT", "0.25"))
-# Deliberately the SAME estimator as the second opinion (Claude, same prompt) at a
-# HIGHER reasoning effort, not a second vendor. A Gemini third opinion (via the `agy`
-# Antigravity CLI) was tried here first, but Sonnet is simply the stronger food
-# estimator in practice — a second Gemini call wasn't adding a genuinely different
-# perspective, just a weaker one. Spending more thinking budget on the strong model,
-# gated on disagreement, is the tie-break that actually helps.
+# Deliberately the SAME estimator as the second opinion (it inherits
+# estimate_mod.DEFAULT_MODEL, so opus-5) at a HIGHER reasoning effort, not a third
+# vendor. A Gemini third opinion (via the `agy` Antigravity CLI) was tried here
+# first, but it wasn't adding a genuinely different perspective, just a weaker one.
+# Spending more thinking budget on the strong model, gated on disagreement, is the
+# tie-break that actually helps.
 THIRD_MODEL = os.environ.get("AUDIT_THIRD_MODEL", estimate_mod.DEFAULT_MODEL)
 THIRD_EFFORT = os.environ.get("AUDIT_THIRD_EFFORT", "xhigh")
 
@@ -154,10 +158,14 @@ log = logging.getLogger("nutrition-audit")
 
 # -- auth & clients ------------------------------------------------------------
 def get_credentials() -> Credentials:
+    """The legacy combined token (Sheets + drive.file) minted by authorize.py.
+
+    Still supported, but no longer the primary path — see `sheets_credentials` /
+    `drive_credentials`. Returns None when the file is absent so the caller can use
+    the split credentials instead of dying.
+    """
     if not TOKEN_FILE.exists():
-        raise SystemExit(
-            f"No audit token at {TOKEN_FILE}.\n"
-            f"Run: backend/venv/bin/python {HERE / 'authorize.py'}")
+        return None
     # No explicit scopes: use the ones stored in the token file (the scopes actually
     # granted). Forcing a wider list here makes refresh request an ungranted scope and
     # fail with `invalid_scope` once the ~1h access token expires.
@@ -171,6 +179,43 @@ def get_credentials() -> Credentials:
         return creds
     raise SystemExit(
         "Audit token invalid/expired and cannot refresh. Re-run authorize.py.")
+
+
+# The audit used to hold ONE user token carrying both Sheets and drive.file. That
+# token was minted interactively by authorize.py and lived only on the machine that
+# ran the consent flow, which made it the single credential a move between machines
+# could not carry — and the one that silently broke the audit after the migration.
+#
+# It is now split along the SAME lines CONTEXT.md §4 already documents for the rest
+# of the system, so nothing new is introduced and nothing needs re-consenting:
+#
+#   write the Sheet  -> the SERVICE ACCOUNT (the Sheet is shared with it as Editor)
+#   read the photos  -> the USER's drive token (a service account has ZERO Drive
+#                       storage quota, which is the whole reason that token exists)
+#
+# drive.file grants access to files the app itself created, and the meal photos were
+# uploaded by this same OAuth client — verified by listing and downloading one.
+def sheets_credentials():
+    """Service-account credentials for the Sheet, via GOOGLE_APPLICATION_CREDENTIALS."""
+    import google.auth  # noqa: PLC0415 — only needed on this path
+    creds, _ = google.auth.default(
+        scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    return creds
+
+
+def drive_credentials() -> Credentials:
+    """User OAuth (drive.file) from DRIVE_OAUTH_TOKEN — the same token the ingest
+    service uploads the photos with."""
+    raw = os.environ.get("DRIVE_OAUTH_TOKEN", "").strip()
+    if not raw:
+        raise SystemExit(
+            "DRIVE_OAUTH_TOKEN is not set and there is no legacy audit token.\n"
+            "Set it in ~/.config/health-tracker/env (see deploy/env.example), or "
+            f"run: backend/venv/bin/python {HERE / 'authorize.py'}")
+    creds = Credentials.from_authorized_user_info(json.loads(raw))
+    if not creds.valid:
+        creds.refresh(Request())
+    return creds
 
 
 # -- meals tab -----------------------------------------------------------------
@@ -366,9 +411,9 @@ def download_photos(drive, file_ids: List[str], stem: str) -> List[Path]:
 
 # -- the ensemble --------------------------------------------------------------
 def _estimate_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Wrap the estimate ALREADY in the meal row (Gemini's ingest output, pre-audit)
-    as the first independent opinion — free, no API call. On a re-audit the row may
-    hold a previous audit instead; either way it is a valid prior to reconcile."""
+    """Wrap the estimate ALREADY in the meal row (ingest's output, pre-audit) as the
+    first independent opinion — free, no API call. On a re-audit the row may hold a
+    previous audit instead; either way it is a valid prior to reconcile."""
     try:
         items = normalize_items(json.loads(row.get("items") or "[]"))
     except (json.JSONDecodeError, TypeError):
@@ -376,7 +421,10 @@ def _estimate_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "items": items,
         "confidence": nutrients._round_num(row.get("confidence"), 2),
-        "_model_id": str(row.get("model") or "gemini").strip() or "gemini",
+        # No "gemini" default any more: ingest writes Claude Sonnet 5, and guessing
+        # a vendor when the column is blank would put a false model id in the audit
+        # log — the one place whose job is to record which model said what.
+        "_model_id": str(row.get("model") or "unknown").strip() or "unknown",
         "_source": "row",
     }
 
@@ -400,14 +448,14 @@ def _disagreement(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
 
 def gather_estimates(row: Dict[str, Any], note: str, img_paths: List[Path]
                      ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Build the independent estimates for one meal: Gemini (from the row) + a fresh
-    Claude estimate, plus a disagreement-gated third estimator if one is wired in.
-    Raises claude_cli.ClaudeError if the Claude estimate itself fails."""
-    gemini = _estimate_from_row(row)
-    claude = estimate_mod.estimate(note, img_paths)
-    claude["_source"] = "claude"
-    estimates = [gemini, claude]
-    dis = _disagreement(gemini, claude) if gemini["items"] else {"max_rel": 0.0}
+    """Build the independent estimates for one meal: the ingest estimate (from the
+    row) + a fresh audit estimate, plus a disagreement-gated third estimator if one
+    is wired in. Raises claude_cli.ClaudeError if the audit estimate itself fails."""
+    ingest = _estimate_from_row(row)
+    audit = estimate_mod.estimate(note, img_paths)
+    audit["_source"] = "audit"
+    estimates = [ingest, audit]
+    dis = _disagreement(ingest, audit) if ingest["items"] else {"max_rel": 0.0}
 
     if dis.get("max_rel", 0.0) >= THIRD_MODEL_DISAGREEMENT:
         try:
@@ -459,7 +507,7 @@ def audit_meal(sheets, drive, row: Dict[str, Any], *, dry_run: bool) -> Optional
         return None
 
     note = str(row.get("note") or "")
-    gemini_est = _estimate_from_row(row)   # for the before/after delta (pre-audit)
+    ingest_est = _estimate_from_row(row)   # for the before/after delta (pre-audit)
     try:
         estimates, dis = gather_estimates(row, note, img_paths)
     except claude_cli.ClaudeError as exc:
@@ -472,7 +520,7 @@ def audit_meal(sheets, drive, row: Dict[str, Any], *, dry_run: bool) -> Optional
         return None
 
     # STAGE 1 — adjudicate the independent estimates against the image. With only one
-    # usable estimate (e.g. no Gemini row items), skip straight to grounding it.
+    # usable estimate (e.g. no items on the ingest row), skip straight to grounding it.
     nonempty = [e for e in estimates if e.get("items")]
     adj_reasoning = ""
     resolutions: List[str] = []
@@ -481,14 +529,14 @@ def audit_meal(sheets, drive, row: Dict[str, Any], *, dry_run: bool) -> Optional
             adjudicated = adjudicate.adjudicate(note, img_paths, nonempty)
             final_items = adjudicated["items"]
             base_conf = adjudicated["confidence"]
-            adj_model = adjudicated.get("_model_id", "claude")
+            adj_model = adjudicated.get("_model_id", "unknown")
             adj_reasoning = adjudicated.get("reasoning", "")
             stage = "adjudicated"
             resolutions = _resolution_summary(final_items)
         elif len(nonempty) == 1:
             final_items = nonempty[0]["items"]
             base_conf = nonempty[0].get("confidence", 0.5)
-            adj_model = nonempty[0].get("_model_id", "claude")
+            adj_model = nonempty[0].get("_model_id", "unknown")
             stage = "single-estimate"
         else:
             log.warning("  skip %s: no usable estimate", dt)
@@ -496,10 +544,10 @@ def audit_meal(sheets, drive, row: Dict[str, Any], *, dry_run: bool) -> Optional
                                reason="no usable estimate from any model", dry_run=dry_run)
             return None
     except claude_cli.ClaudeError as exc:
-        # Adjudication failed — fall back to the independent Claude estimate, i.e. the
-        # original single-model behaviour. Grounding still runs on it.
-        claude_est = next((e for e in estimates if e.get("_source") == "claude"), None)
-        if not claude_est or not claude_est.get("items"):
+        # Adjudication failed — fall back to this audit's own independent estimate,
+        # i.e. the original single-model behaviour. Grounding still runs on it.
+        audit_est = _by_source(estimates, "audit")
+        if not audit_est or not audit_est.get("items"):
             log.warning("  skip %s: adjudication failed and no fallback estimate: %s",
                         dt, exc)
             _write_skip_review(sheets, row, t_start=t_start,
@@ -507,9 +555,9 @@ def audit_meal(sheets, drive, row: Dict[str, Any], *, dry_run: bool) -> Optional
                                dry_run=dry_run)
             return None
         log.warning("  %s: adjudication failed (%s) — using independent estimate", dt, exc)
-        final_items = claude_est["items"]
-        base_conf = claude_est.get("confidence", 0.5)
-        adj_model = claude_est.get("_model_id", "claude")
+        final_items = audit_est["items"]
+        base_conf = audit_est.get("confidence", 0.5)
+        adj_model = audit_est.get("_model_id", "unknown")
         stage = "fallback-estimate"
     finally:
         for p in img_paths:                # done with images — don't leave photos on disk
@@ -532,17 +580,17 @@ def audit_meal(sheets, drive, row: Dict[str, Any], *, dry_run: bool) -> Optional
     orig_model = str(row.get("model") or "").strip() or "unknown"
     new_model = f"{AUDIT_TAG}:{adj_model} | was:{orig_model}"
 
-    # before/after against the pre-audit (Gemini) row.
+    # before/after against the pre-audit (ingest) row.
     old_kcal = nutrients._round_num(row.get("calories"))
     old_prot = nutrients._round_num(row.get("protein_g"))
-    old_nkeys = nutrient_key_count(gemini_est["items"])
+    old_nkeys = nutrient_key_count(ingest_est["items"])
     new_nkeys = nutrient_key_count(final_items)
     dis_str = _disagreement_str(dis)
 
     # The full per-model story for the meal_reviews row (and the dry-run log).
     models_str = _models_line(estimates, adj_model, stage)
-    gemini_said = _estimate_summary(_by_source(estimates, "row"))
-    claude_said = _estimate_summary(_by_source(estimates, "claude"))
+    ingest_said = _estimate_summary(_by_source(estimates, "row"))
+    audit_said = _estimate_summary(_by_source(estimates, "audit"))
     third_said = _third_said(estimates, dis)
     ground_detail = _grounding_detail(ground_report)
     if stage == "adjudicated":
@@ -550,7 +598,7 @@ def audit_meal(sheets, drive, row: Dict[str, Any], *, dry_run: bool) -> Optional
     elif stage == "single-estimate":
         adj_verdict = "single estimate — no reconciliation (only one usable estimate)"
     else:  # fallback-estimate
-        adj_verdict = "adjudication FAILED → used the independent Claude estimate"
+        adj_verdict = "adjudication FAILED → used this audit's independent estimate"
     final_str = (f"{totals['calories']:.0f} kcal | P{totals['protein_g']:.0f} "
                  f"C{totals['carbs_g']:.0f} F{totals['fat_g']:.0f} | "
                  f"{totals['portion_g']:.0f}g | {len(final_items)} items | "
@@ -568,8 +616,8 @@ def audit_meal(sheets, drive, row: Dict[str, Any], *, dry_run: bool) -> Optional
     if dry_run:
         log.info("  [dry-run] would update %s", summary)
         log.info("    models     : %s", models_str)
-        log.info("    gemini said: %s", gemini_said)
-        log.info("    claude said: %s", claude_said)
+        log.info("    ingest said: %s", ingest_said)
+        log.info("    audit  said: %s", audit_said)
         log.info("    third  said: %s", third_said)
         log.info("    adjudicator: %s", adj_verdict)
         log.info("    grounding  : %s", ground_detail)
@@ -609,8 +657,8 @@ def audit_meal(sheets, drive, row: Dict[str, Any], *, dry_run: bool) -> Optional
             "foods": totals["foods"],
             "stage": stage,
             "models": models_str,
-            "gemini_said": gemini_said,
-            "claude_said": claude_said,
+            "ingest_said": ingest_said,
+            "audit_said": audit_said,
             "third_said": third_said,
             "disagreement": dis_str,
             "adjudicator_verdict": adj_verdict[:900],
@@ -662,7 +710,7 @@ def _estimate_summary(est: Optional[Dict[str, Any]]) -> str:
 
 def _models_line(estimates: List[Dict[str, Any]], adj_model: str, stage: str) -> str:
     parts = []
-    for src, label in (("row", "gemini(row)"), ("claude", "claude"), ("third", "third")):
+    for src, label in (("row", "ingest(row)"), ("audit", "audit"), ("third", "third")):
         e = _by_source(estimates, src)
         if e:
             parts.append(f"{label}={e.get('_model_id', '?')}")
@@ -673,7 +721,7 @@ def _models_line(estimates: List[Dict[str, Any]], adj_model: str, stage: str) ->
 
 def _third_said(estimates: List[Dict[str, Any]], dis: Dict[str, Any]) -> str:
     """The third opinion's conclusion, or a clear reason it didn't run — so a test can
-    always tell whether the xhigh-effort Sonnet tie-break was consulted and why."""
+    always tell whether the xhigh-effort tie-break was consulted and why."""
     third = _by_source(estimates, "third")
     if third:
         return _estimate_summary(third)
@@ -706,7 +754,7 @@ def _write_skip_review(sheets, row: Dict[str, Any], *, t_start: float,
     prior review intact)."""
     if dry_run or is_audited(row):
         return
-    gem = _estimate_from_row(row)
+    original = _estimate_from_row(row)
     try:
         write_review(sheets, {
             "reviewed_at": datetime.now(TZ).isoformat(timespec="seconds"),
@@ -714,14 +762,14 @@ def _write_skip_review(sheets, row: Dict[str, Any], *, t_start: float,
             "datetime": str(row.get("datetime") or ""),
             "foods": str(row.get("foods") or ""),
             "stage": "skipped",
-            "models": f"gemini(row)={gem['_model_id']} | audit not run",
-            "gemini_said": _estimate_summary(gem),
-            "claude_said": "—",
+            "models": f"ingest(row)={original['_model_id']} | audit not run",
+            "ingest_said": _estimate_summary(original),
+            "audit_said": "—",
             "third_said": "—",
             "disagreement": "n/a",
             "adjudicator_verdict": "—",
             "grounding": "not grounded",
-            "final": "KEPT ORIGINAL Gemini estimate — not audited",
+            "final": "KEPT ORIGINAL ingest estimate — not audited",
             "delta": "unchanged",
             "review_notes": reason[:500],
             "image_sha": str(row.get("image_sha") or "").strip(),
@@ -810,9 +858,18 @@ def main() -> int:
                   logging.FileHandler(LOG_DIR / "audit.log")],
     )
 
-    creds = get_credentials()
-    sheets = build("sheets", "v4", credentials=creds, cache_discovery=False)
-    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+    # Prefer the legacy combined token when it exists, so a machine that already has
+    # one (the MacBook) keeps behaving exactly as before; otherwise use the split
+    # credentials, which need no interactive consent and therefore migrate.
+    legacy = get_credentials()
+    if legacy is not None:
+        log.info("auth: legacy combined audit token")
+        sheets_creds = drive_creds = legacy
+    else:
+        log.info("auth: service account for Sheets + DRIVE_OAUTH_TOKEN for Drive")
+        sheets_creds, drive_creds = sheets_credentials(), drive_credentials()
+    sheets = build("sheets", "v4", credentials=sheets_creds, cache_discovery=False)
+    drive = build("drive", "v3", credentials=drive_creds, cache_discovery=False)
 
     if args.check:
         return run_check(sheets, drive)

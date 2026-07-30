@@ -1,0 +1,98 @@
+[
+  {
+    "alertStrategy": {
+      "autoClose": "86400s",
+      "notificationRateLimit": {
+        "period": "3600s"
+      }
+    },
+    "combiner": "OR",
+    "conditions": [
+      {
+        "conditionMatchedLog": {
+          "filter": "resource.type=\"cloud_run_job\" AND severity>=ERROR"
+        },
+        "displayName": "Health Tracker — job error",
+        "name": "projects/health-tracker-501322/alertPolicies/17590018080644246585/conditions/17590018080644246712"
+      }
+    ],
+    "creationRecord": {
+      "mutateTime": "2026-07-11T01:22:55.364223767Z",
+      "mutatedBy": "diogo2000neves@gmail.com"
+    },
+    "displayName": "Health Tracker — job error",
+    "enabled": true,
+    "mutationRecord": {
+      "mutateTime": "2026-07-11T01:22:55.364223767Z",
+      "mutatedBy": "diogo2000neves@gmail.com"
+    },
+    "name": "projects/health-tracker-501322/alertPolicies/17590018080644246585",
+    "notificationChannels": [
+      "projects/health-tracker-501322/notificationChannels/13910920764215379775"
+    ]
+  },
+  {
+    "alertStrategy": {
+      "autoClose": "86400s",
+      "notificationRateLimit": {
+        "period": "3600s"
+      }
+    },
+    "combiner": "OR",
+    "conditions": [
+      {
+        "conditionMatchedLog": {
+          "filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"health-tracker-ingest\" AND severity>=ERROR"
+        },
+        "displayName": "Health Tracker — ingest error",
+        "name": "projects/health-tracker-501322/alertPolicies/8019908405768483266/conditions/8019908405768484563"
+      }
+    ],
+    "creationRecord": {
+      "mutateTime": "2026-07-11T01:22:57.721273731Z",
+      "mutatedBy": "diogo2000neves@gmail.com"
+    },
+    "displayName": "Health Tracker — ingest error",
+    "enabled": true,
+    "mutationRecord": {
+      "mutateTime": "2026-07-11T01:22:57.721273731Z",
+      "mutatedBy": "diogo2000neves@gmail.com"
+    },
+    "name": "projects/health-tracker-501322/alertPolicies/8019908405768483266",
+    "notificationChannels": [
+      "projects/health-tracker-501322/notificationChannels/13910920764215379775"
+    ]
+  },
+  {
+    "alertStrategy": {
+      "autoClose": "86400s",
+      "notificationRateLimit": {
+        "period": "3600s"
+      }
+    },
+    "combiner": "OR",
+    "conditions": [
+      {
+        "conditionMatchedLog": {
+          "filter": "resource.type=\"build\" AND textPayload:\"ERROR: build step\""
+        },
+        "displayName": "Health Tracker — build failed",
+        "name": "projects/health-tracker-501322/alertPolicies/9806488636180312925/conditions/9806488636180312404"
+      }
+    ],
+    "creationRecord": {
+      "mutateTime": "2026-07-11T01:22:59.898998999Z",
+      "mutatedBy": "diogo2000neves@gmail.com"
+    },
+    "displayName": "Health Tracker — build failed",
+    "enabled": true,
+    "mutationRecord": {
+      "mutateTime": "2026-07-11T01:22:59.898998999Z",
+      "mutatedBy": "diogo2000neves@gmail.com"
+    },
+    "name": "projects/health-tracker-501322/alertPolicies/9806488636180312925",
+    "notificationChannels": [
+      "projects/health-tracker-501322/notificationChannels/13910920764215379775"
+    ]
+  }
+]

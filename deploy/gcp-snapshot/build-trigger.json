@@ -1,0 +1,15 @@
+{
+  "createTime": "2026-07-11T00:44:03.527497665Z",
+  "filename": "cloudbuild.yaml",
+  "id": "28220658-dd31-4db5-bef7-2d9a717c7753",
+  "name": "health-tracker-deploy",
+  "repositoryEventConfig": {
+    "push": {
+      "branch": "^main$"
+    },
+    "repository": "projects/health-tracker-501322/locations/europe-west1/connections/health-tracker-gh/repositories/health-tracker",
+    "repositoryType": "GITHUB"
+  },
+  "resourceName": "projects/health-tracker-501322/locations/europe-west1/triggers/28220658-dd31-4db5-bef7-2d9a717c7753",
+  "serviceAccount": "projects/health-tracker-501322/serviceAccounts/785594953316-compute@developer.gserviceaccount.com"
+}

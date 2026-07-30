@@ -1,0 +1,20 @@
+[Unit]
+Description=Poll for parked coach jobs every 5 minutes (replaces com.dneves.coach-worker launchd StartInterval=300)
+
+[Timer]
+# Every 5 minutes, matching the plist's StartInterval=300 exactly. Almost every run
+# is a 204 and exits in under a second, so the polling is genuinely cheap — the
+# worker's own docstring makes this point.
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+# AccuracySec matters here. systemd's default is 1 minute of slack, which it uses
+# to batch timers for power saving; on a 5-minute poll that is up to 20% jitter on
+# the one loop the user actually perceives as "the coach responding".
+AccuracySec=10s
+
+# Persistent is deliberately OFF: this is a poll, not a scheduled task. Catching up
+# a missed poll after a reboot is meaningless — the next one is 5 minutes away and
+# the jobs are still parked waiting.
+[Install]
+WantedBy=timers.target

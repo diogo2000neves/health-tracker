@@ -1,0 +1,24 @@
+[Unit]
+Description=Health Tracker daily sync backstop (replaces Cloud Scheduler health-tracker-daily-trigger)
+
+[Timer]
+# 11:00 Europe/Lisbon, matching the Cloud Scheduler cron it replaces. This is a
+# BACKSTOP, not the real trigger — the weigh-in is (see _trigger_daily_sync).
+#
+# It sits far from wake-up on purpose. The job is read-modify-write against a grid
+# snapshot, so a run overlapping the morning's weigh-in-triggered run could append
+# a date twice. The flock in src.daily_runner makes that safe rather than merely
+# unlikely, but the wide separation is still the first line of defence.
+#
+# The 07:00 cron this ultimately replaces fired while the user was still asleep,
+# which silently put every night's sleep on the wrong day. Don't move it earlier.
+OnCalendar=*-*-* 11:00:00
+Persistent=true
+
+# The machine is a laptop. If it was down at 11:00, Persistent=true runs the job on
+# the next boot — and this jitter keeps that catch-up from firing at the same
+# instant as every other timer resuming after the same outage.
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

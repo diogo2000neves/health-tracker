@@ -1,0 +1,33 @@
+[Unit]
+Description=Health Tracker coach worker — answers parked coach jobs with Claude
+Documentation=file://%h/projects/health-tracker/automation/coach/worker.py
+After=network-online.target health-tracker-api.service
+Wants=network-online.target
+OnFailure=health-tracker-alert@%n.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/health-tracker/env
+
+# THIS IS THE PIECE THAT MAKES CARDS APPEAR.
+#
+# The backend never calls a model for the coach. It does the arithmetic, builds the
+# prompt and PARKS it as a job; this worker claims the job, answers it with the
+# local `claude` CLI, and posts the JSON back for the backend to validate. If
+# nothing runs this, generations queue up silently forever — the app keeps serving
+# the last feed it had, so it looks like the coach has nothing to say rather than
+# like a failure. That is exactly what happened between decommissioning Cloud Run
+# and this unit existing: the worker was still on the MacBook (launchd), pointed at
+# the deleted Cloud Run URL.
+#
+# --drain, not --once: a laptop that was asleep wakes to several parked jobs (the
+# morning card, a meal-triggered refresh), and draining clears the backlog in one
+# run instead of one job per five minutes.
+ExecStart=%h/projects/health-tracker/backend/venv/bin/python \
+    %h/projects/health-tracker/automation/coach/worker.py --drain
+
+WorkingDirectory=%h/projects/health-tracker
+
+# A report can legitimately think for 15 min (COACH_REPORT_TIMEOUT_S 900), and a
+# drain may answer several jobs back to back.
+TimeoutStartSec=3600

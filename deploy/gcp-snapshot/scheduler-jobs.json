@@ -1,0 +1,168 @@
+[
+  {
+    "attemptDeadline": "300s",
+    "httpTarget": {
+      "body": "e30=",
+      "headers": {
+        "Content-Type": "application/json",
+        "User-Agent": "Google-Cloud-Scheduler",
+        "X-Auth-Token": "<redacted \u2014 see ~/.config/health-tracker/env>"
+      },
+      "httpMethod": "POST",
+      "uri": "https://health-tracker-ingest-myznjtlyrq-ew.a.run.app/coach/sweep"
+    },
+    "lastAttemptTime": "2026-07-29T14:30:04.027105Z",
+    "name": "projects/health-tracker-501322/locations/europe-west1/jobs/coach-sweep",
+    "retryConfig": {
+      "maxBackoffDuration": "3600s",
+      "maxDoublings": 5,
+      "maxRetryDuration": "0s",
+      "minBackoffDuration": "5s"
+    },
+    "schedule": "*/30 * * * *",
+    "scheduleTime": "2026-07-29T15:00:03.353277Z",
+    "state": "ENABLED",
+    "status": {},
+    "timeZone": "Europe/Lisbon",
+    "userUpdateTime": "2026-07-26T20:14:17.826351Z"
+  },
+  {
+    "attemptDeadline": "180s",
+    "httpTarget": {
+      "headers": {
+        "User-Agent": "Google-Cloud-Scheduler"
+      },
+      "httpMethod": "POST",
+      "oauthToken": {
+        "scope": "https://www.googleapis.com/auth/cloud-platform",
+        "serviceAccountEmail": "health-tracker-job@health-tracker-501322.iam.gserviceaccount.com"
+      },
+      "uri": "https://run.googleapis.com/v2/projects/health-tracker-501322/locations/europe-west1/jobs/health-tracker-daily:run"
+    },
+    "lastAttemptTime": "2026-07-29T10:00:03.146308Z",
+    "name": "projects/health-tracker-501322/locations/europe-west1/jobs/health-tracker-daily-trigger",
+    "retryConfig": {
+      "maxBackoffDuration": "3600s",
+      "maxDoublings": 5,
+      "maxRetryDuration": "0s",
+      "minBackoffDuration": "5s"
+    },
+    "schedule": "0 11 * * *",
+    "scheduleTime": "2026-07-30T10:00:02.256928Z",
+    "state": "ENABLED",
+    "status": {},
+    "timeZone": "Europe/Lisbon",
+    "userUpdateTime": "2026-07-17T10:30:30.113685Z"
+  },
+  {
+    "attemptDeadline": "300s",
+    "httpTarget": {
+      "body": "eyJwZXJpb2QiOiJ5ZWFybHkifQ==",
+      "headers": {
+        "Content-Type": "application/json",
+        "User-Agent": "Google-Cloud-Scheduler",
+        "X-Auth-Token": "<redacted \u2014 see ~/.config/health-tracker/env>"
+      },
+      "httpMethod": "POST",
+      "uri": "https://health-tracker-ingest-myznjtlyrq-ew.a.run.app/coach/report"
+    },
+    "name": "projects/health-tracker-501322/locations/europe-west1/jobs/coach-yearly",
+    "retryConfig": {
+      "maxBackoffDuration": "3600s",
+      "maxDoublings": 5,
+      "maxRetryDuration": "0s",
+      "minBackoffDuration": "5s"
+    },
+    "schedule": "0 12 1 1 *",
+    "scheduleTime": "2027-01-01T12:00:00Z",
+    "state": "ENABLED",
+    "status": {
+      "code": -1
+    },
+    "timeZone": "Europe/Lisbon",
+    "userUpdateTime": "2026-07-26T23:09:18.723583Z"
+  },
+  {
+    "attemptDeadline": "300s",
+    "httpTarget": {
+      "body": "eyJzbG90IjoibW9ybmluZyIsInJlYXNvbiI6InNjaGVkdWxlIn0=",
+      "headers": {
+        "Content-Type": "application/json",
+        "User-Agent": "Google-Cloud-Scheduler",
+        "X-Auth-Token": "<redacted \u2014 see ~/.config/health-tracker/env>"
+      },
+      "httpMethod": "POST",
+      "uri": "https://health-tracker-ingest-myznjtlyrq-ew.a.run.app/coach/generate"
+    },
+    "lastAttemptTime": "2026-07-29T06:30:04.530702Z",
+    "name": "projects/health-tracker-501322/locations/europe-west1/jobs/coach-morning",
+    "retryConfig": {
+      "maxBackoffDuration": "3600s",
+      "maxDoublings": 5,
+      "maxRetryDuration": "0s",
+      "minBackoffDuration": "60s",
+      "retryCount": 3
+    },
+    "schedule": "30 7 * * *",
+    "scheduleTime": "2026-07-30T06:30:02.518775Z",
+    "state": "ENABLED",
+    "status": {},
+    "timeZone": "Europe/Lisbon",
+    "userUpdateTime": "2026-07-26T17:13:31.162035Z"
+  },
+  {
+    "attemptDeadline": "300s",
+    "httpTarget": {
+      "body": "eyJwZXJpb2QiOiJ3ZWVrbHkifQ==",
+      "headers": {
+        "Content-Type": "application/json",
+        "User-Agent": "Google-Cloud-Scheduler",
+        "X-Auth-Token": "<redacted \u2014 see ~/.config/health-tracker/env>"
+      },
+      "httpMethod": "POST",
+      "uri": "https://health-tracker-ingest-myznjtlyrq-ew.a.run.app/coach/report"
+    },
+    "lastAttemptTime": "2026-07-27T09:00:01.203746Z",
+    "name": "projects/health-tracker-501322/locations/europe-west1/jobs/coach-weekly",
+    "retryConfig": {
+      "maxBackoffDuration": "3600s",
+      "maxDoublings": 5,
+      "maxRetryDuration": "0s",
+      "minBackoffDuration": "5s"
+    },
+    "schedule": "0 10 * * MON",
+    "scheduleTime": "2026-08-03T09:00:03.472802Z",
+    "state": "ENABLED",
+    "status": {},
+    "timeZone": "Europe/Lisbon",
+    "userUpdateTime": "2026-07-26T23:09:15.822481Z"
+  },
+  {
+    "attemptDeadline": "300s",
+    "httpTarget": {
+      "body": "eyJwZXJpb2QiOiJtb250aGx5In0=",
+      "headers": {
+        "Content-Type": "application/json",
+        "User-Agent": "Google-Cloud-Scheduler",
+        "X-Auth-Token": "<redacted \u2014 see ~/.config/health-tracker/env>"
+      },
+      "httpMethod": "POST",
+      "uri": "https://health-tracker-ingest-myznjtlyrq-ew.a.run.app/coach/report"
+    },
+    "name": "projects/health-tracker-501322/locations/europe-west1/jobs/coach-monthly",
+    "retryConfig": {
+      "maxBackoffDuration": "3600s",
+      "maxDoublings": 5,
+      "maxRetryDuration": "0s",
+      "minBackoffDuration": "5s"
+    },
+    "schedule": "0 11 1 * *",
+    "scheduleTime": "2026-08-01T10:00:00Z",
+    "state": "ENABLED",
+    "status": {
+      "code": -1
+    },
+    "timeZone": "Europe/Lisbon",
+    "userUpdateTime": "2026-07-26T23:09:17.351677Z"
+  }
+]

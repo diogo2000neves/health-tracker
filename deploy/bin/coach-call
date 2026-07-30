@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# coach-call <slot> — POST one coach endpoint on the local API.
+#
+# The local replacement for the five Cloud Scheduler jobs that drove the coach.
+# Each was an authenticated POST to the ingest service with a fixed body; the only
+# thing that changed is the host, so the mapping below is copied verbatim from
+# `gcloud scheduler jobs describe` rather than reinvented:
+#
+#   sweep    */30 * * * *     /coach/sweep     {}
+#   morning  30 7 * * *       /coach/generate  {"slot":"morning","reason":"schedule"}
+#   weekly   0 10 * * MON     /coach/report    {"period":"weekly"}
+#   monthly  0 11 1 * *       /coach/report    {"period":"monthly"}
+#   yearly   0 12 1 1 *       /coach/report    {"period":"yearly"}
+#
+# `sweep` is the one that matters most and is easiest to overlook: it is the
+# backstop that runs an unanswered coach generation through Gemini after
+# COACH_SONNET_WAIT_HOURS. Without it, a job nothing picks up simply waits forever
+# and the card never appears.
+#
+# Exit codes matter — systemd's OnFailure alerting keys off them. A 2xx is success;
+# anything else fails the unit so it turns into a Telegram message rather than a
+# silent gap in the feed.
+
+set -uo pipefail
+
+SLOT="${1:-}"
+BASE="${COACH_LOCAL_BASE_URL:-http://127.0.0.1:8080}"
+
+case "$SLOT" in
+  sweep)   PATH_="/coach/sweep";    BODY='{}' ;;
+  morning) PATH_="/coach/generate"; BODY='{"slot":"morning","reason":"schedule"}' ;;
+  weekly)  PATH_="/coach/report";   BODY='{"period":"weekly"}' ;;
+  monthly) PATH_="/coach/report";   BODY='{"period":"monthly"}' ;;
+  yearly)  PATH_="/coach/report";   BODY='{"period":"yearly"}' ;;
+  *) echo "usage: coach-call {sweep|morning|weekly|monthly|yearly}" >&2; exit 2 ;;
+esac
+
+if [ -z "${INGEST_TOKEN:-}" ]; then
+  echo "coach-call: INGEST_TOKEN is not set (EnvironmentFile missing?)" >&2
+  exit 3
+fi
+
+# --max-time is generous because /coach/report can legitimately think for a while:
+# a weekly review carries every finding plus the week's rows, and on this
+# deployment it may be answered by Claude.
+resp="$(curl -sS -o /tmp/coach-call-$$.out -w '%{http_code}' \
+        --max-time "${COACH_CALL_TIMEOUT_S:-900}" \
+        -X POST "${BASE}${PATH_}" \
+        -H 'Content-Type: application/json' \
+        -H "X-Auth-Token: ${INGEST_TOKEN}" \
+        -d "${BODY}" 2>&1)"
+rc=$?
+body="$(head -c 400 /tmp/coach-call-$$.out 2>/dev/null)"
+rm -f /tmp/coach-call-$$.out
+
+if [ $rc -ne 0 ]; then
+  echo "coach-call ${SLOT}: transport failure (curl ${rc}): ${resp}" >&2
+  exit 1
+fi
+case "$resp" in
+  2*) echo "coach-call ${SLOT}: HTTP ${resp} ${body}"; exit 0 ;;
+  *)  echo "coach-call ${SLOT}: HTTP ${resp} ${body}" >&2; exit 1 ;;
+esac

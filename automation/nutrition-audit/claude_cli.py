@@ -25,14 +25,19 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 log = logging.getLogger("nutrition-audit")
 
-CLAUDE_BIN = os.environ.get(
-    "CLAUDE_BIN", "/Users/dneves/.nvm/versions/node/v22.12.0/bin/claude")
+# Falls back to whatever `claude` is on PATH. The old default was a hard-coded
+# MacBook nvm path; on the laptop that resolves to nothing and every call fails
+# identically ("claude exited 127"). systemd units set CLAUDE_BIN explicitly
+# because a unit has no login shell and fnm's shim is per-shell — see
+# deploy/env.example.
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN") or shutil.which("claude") or "claude"
 
 # Where a parse failure dumps the raw model answer for inspection. Set by the
 # orchestrator (audit.py) at startup; defaults next to this file so imports work.

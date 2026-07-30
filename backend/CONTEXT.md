@@ -3,6 +3,28 @@
 > Paste this into a new chat as background before asking for new features.
 > No secrets are included here; all live in Google Secret Manager.
 
+> ## ⚠️ Read this first: it runs on a laptop now
+>
+> **GCP was decommissioned on 2026-07-29.** The compute moved to an always-on
+> laptop (`lenovo-agents`); the Google Sheet and Drive did not move and are still
+> the source of truth. `deploy/README.md` is the authoritative deployment doc.
+>
+> Much of what follows still describes the *behaviour* accurately while naming the
+> cloud service that used to implement it. Read it with this map:
+>
+> | when it says | it now means |
+> |---|---|
+> | Cloud Run service / `health-tracker-ingest` | `health-tracker-api.service` (gunicorn, 127.0.0.1:8080) |
+> | Cloud Run Job / `health-tracker-daily` | `health-tracker-daily.service` via `src/daily_runner.py` |
+> | Cloud Tasks / the `meal-ingest` queue | `ingest/localqueue.py` + `health-tracker-queue.service` |
+> | Cloud Scheduler | systemd timers (`health-tracker-daily.timer`, `health-tracker-coach@*.timer`) |
+> | Cloud Storage / `COACH_BUCKET` | `COACH_LOCAL_DIR` on disk |
+> | Gemini analyses the photo | **Claude Sonnet 5** does; Gemini is the fallback (§6) |
+>
+> The retry semantics, the day grain, the causal rule and every gotcha below are
+> unchanged — that was the point of copying the contracts rather than redesigning
+> them.
+
 ## 1. Goal & philosophy
 
 A **zero-friction personal health dashboard**. The golden rule: I only perform the
@@ -20,9 +42,17 @@ pipeline around it.
 The end goal is to **correlate nutrition against physique on a per-day basis**:
 what I ate vs what my body did.
 
-Constraints: 100% cloud (no laptop needed), near-zero ongoing cost, simple enough
-for an AI agent to maintain, and **sovereign storage** — final data lives in a
-Google Sheet + Google Drive that I own and can download anytime.
+Constraints: near-zero ongoing cost, simple enough for an AI agent to maintain, and
+**sovereign storage** — final data lives in a Google Sheet + Google Drive that I own
+and can download anytime.
+
+⚠️ **"100% cloud (no laptop needed)" was a founding constraint and is no longer
+true.** The compute moved to an always-on laptop (`lenovo-agents`) in July 2026 —
+see `deploy/README.md`. The reason it was dropped is not cost (the cloud bill was
+~€0.10/month): the laptop runs 24/7 for other work anyway, and being on it is what
+allows every meal to be estimated by Claude on the personal subscription instead of
+by Gemini. **Storage did not move** — the Sheet and Drive are unchanged, so the
+sovereignty half of this constraint still holds exactly as written.
 
 ## 2. The three data sources
 
@@ -369,10 +399,12 @@ field (`causal_inputs()` / `causal_outcomes()`).
   (read those from the sheet / iOS app), and scale screenshots now land unused in
   the Drive meals folder — `/ingest` must archive every image before Gemini has
   classified it.
-- **CI/CD:** pushing to `main` on GitHub runs `cloudbuild.yaml` — unit tests
-  gate the build, then all three targets are rebuilt and redeployed (images
-  tagged with the commit SHA; env vars/secrets preserved). Trigger:
-  `health-tracker-deploy` (europe-west1).
+- **CI/CD: there isn't any, deliberately.** `cloudbuild.yaml`, both Dockerfiles and
+  the `health-tracker-deploy` trigger were deleted with the rest of GCP
+  (2026-07-29). There is no image to build: systemd runs the working tree directly.
+  Deploying is `git pull && ./deploy/install.sh --start`, and **running
+  `backend/tests` is now the only gate between an edit and production** — the same
+  suite Cloud Build used to run, with nothing enforcing it but you.
 - **Day grain:** every `date` is the **local civil day** (Europe/Lisbon / the
   device's own utcOffset) — never the UTC day. **Nutrition** uses a **waking-day**
   grain instead (`NUTRITION_DAY_CUTOFF_HOUR`, 05:00): a meal before the cutoff
@@ -480,12 +512,17 @@ token is read-only across `sleep`, `health_metrics_and_measurements` and
 | Thing | Value |
 |---|---|
 | GCP project | `health-tracker-501322` (billing enabled) |
-| Cloud Run Job | `health-tracker-daily` (europe-west1) |
-| Cloud Run Service | `health-tracker-ingest` (europe-west1, public URL, gated by `X-Auth-Token` header) |
-| Scheduler | `health-tracker-daily-trigger` — `0 11 * * *` Europe/Lisbon. **Backstop only**: the real trigger is the weigh-in (`_trigger_daily_sync`). Was `0 7 * * *`, which fired while the user was still asleep |
-| Job trigger IAM | ingest + job share SA `health-tracker-job@…`, which already holds `roles/run.invoker` on the job (grants `run.jobs.run`) — no IAM change was needed |
-| Cloud Tasks queue | `meal-ingest` (europe-west1) — **all** meal analysis. 8 attempts, 5s→120s backoff, 900s maxRetryDuration, 1 concurrent dispatch; SA has `cloudtasks.enqueuer`. Raising patience = raise `maxAttempts` here **first**, then `TASKS_MAX_ATTEMPTS` |
-| Ingest request timeout | 180s (Cloud Run). Budget: `GEMINI_DEADLINE_S` 105 + one `GEMINI_TIMEOUT_MS` 60s call + ~5s of sheet writes ≈ 170s |
+| Host | **the laptop** `lenovo-agents`, WSL2/Ubuntu-24.04, systemd user units. See `deploy/README.md` |
+| URL | `https://lenovo-agents.tail68e120.ts.net` — **tailnet only**, via `tailscale serve` on the Windows host. Still gated by `X-Auth-Token` |
+| API | `health-tracker-api.service` — gunicorn on 127.0.0.1:8080 (nothing binds a routable interface) |
+| Task queue | `health-tracker-queue.service` + `ingest/localqueue.py` (SQLite). Same contract as the Cloud Tasks queue it replaced: 8 attempts, 5s→120s backoff, 1 concurrent dispatch. **`maxRetryDuration` is 4 h here, not 900 s** — a Claude call alone can take 9 min |
+| Daily sync | `health-tracker-daily.service` + `.timer` (11:00 backstop). Concurrency guard is an flock in `src/daily_runner.py`, not the Jobs API |
+| Coach schedules | `health-tracker-coach@{sweep,morning,weekly,monthly,yearly}.timer` → `deploy/bin/coach-call`. **`sweep` every 30 min is the one to protect**: it is the backstop that pushes an unanswered generation through Gemini |
+| Maintenance | was a Cloud Run Job; now just `cd backend && venv/bin/python -m src.maintenance` |
+| Alerting | `health-tracker-alert@.service` → `agents-notify` (Telegram). ⚠️ `OnFailure=` must be in `[Unit]`; in `[Service]` systemd ignores it and alerting is silently dead |
+| Request timeout | 1200s (gunicorn). Budget: 900 (Claude) + 105 (`GEMINI_DEADLINE_S`) + 60 (one Gemini call) + ~5s of sheet writes ≈ 1070s |
+| **Decommissioned** | 2026-07-29: Cloud Run service + both Jobs, all 6 Scheduler jobs, the `meal-ingest` queue, the Build trigger, all 3 buckets, Artifact Registry, and every alert policy + notification channel. Config snapshot in `deploy/gcp-snapshot/` |
+| **Still on GCP** | the service account (writes the Sheet), the 4 Secret Manager secrets (credential backup), the OAuth client (token refresh), and the Gemini key on `gen-lang-client-0757945342`. **Deleting any of these breaks the laptop.** |
 | Sheet ID | `1JQWYkSgzU3F4mqR7BRE8wfoBif0xLU7uBM0iwHwxNAk` |
 | Drive photo folder | `1i0wYuIzcD7ifs_wVQVdsUpI26vGmJdfP` ("Health Tracker Meals", owned by user) |
 | Secrets (Secret Manager) | `health-oauth-token` (health scopes only), `drive-oauth-token` (drive.file only), `ingest-token`, `gemini-api-key` |
@@ -593,7 +630,35 @@ token is read-only across `sleep`, `health_metrics_and_measurements` and
   `python -m src.maintenance` (inserts the column in place so history stays
   aligned). Never reorder or rename existing columns.
 
-## 6. Gemini setup (important cost nuances)
+## 6. Models: Claude first, Gemini behind it
+
+**Every meal is estimated by Claude Sonnet 5 at high effort**
+(`ingest/claude_estimator.py`), through the local `claude` CLI on the personal
+subscription. Gemini is the **fallback**, reached whenever Claude cannot answer — a
+spent 5-hour usage window, a timeout, an unparseable reply. That ordering is a
+deliberate accuracy choice, not a cost one; the whole Gemini section below still
+applies verbatim to the fallback path.
+
+Three consequences worth holding on to:
+
+* **It only works on the laptop.** There is no `claude` binary on Cloud Run and the
+  subscription is not an API key, so the path is gated on `MEAL_ESTIMATOR=claude`.
+  Unset, the service behaves exactly as it did on Cloud Run — which is what makes a
+  parallel run and an instant rollback possible.
+* **The CLI has no `response_schema`.** Gemini's typed schema is what pinned the item
+  shape; Claude is given the same contract in prose (`JSON_INSTRUCTIONS`). The first
+  live run omitted `portion_g` entirely and every item came back 0 g, so that block
+  is load-bearing — if you add a field to `RESPONSE_SCHEMA`, add it there too, and
+  `test_required_item_keys_match_the_gemini_schema` will fail if you don't.
+* **The audit's ensemble had to be re-independent.** It used to be Gemini(row) vs
+  Claude; both being Claude would make it one model agreeing with itself. The row is
+  now sonnet-5/high and the audit's own estimate is **opus-5/low**. See
+  `automation/nutrition-audit/README.md`.
+* **Timeouts are much longer**: a high-effort vision call runs 6.5–9 min, so gunicorn
+  and the queue are configured at 1200 s rather than the image's 300 s. Nothing waits
+  on `/process`, so this costs only latency.
+
+### The Gemini fallback
 
 - Uses the **Gemini Developer API** (AI Studio key), **not** Vertex AI.
 - ⚠️ **Google AI Pro subscription does NOT grant API access.** It only provides the
@@ -629,9 +694,16 @@ token is read-only across `sleep`, `health_metrics_and_measurements` and
 
 ## 7. Cost
 
-Effectively **~€0.10/month** (container storage). Cloud Run / Scheduler / Secret
-Manager are within free tiers; Gemini is free tier; photos use the user's own 5 TB
-Google One storage (from AI Pro).
+Effectively **€0** since the move off Cloud Run (`deploy/README.md`). It was already
+only ~€0.10/month — Cloud Run, Scheduler and Secret Manager sat inside free tiers and
+Gemini was free tier — so cost was never the reason to move; the laptop is on for
+other work regardless, and it makes Claude the estimator.
+
+What remains free rather than absent: Sheets and Drive (the user's own 5 TB from AI
+Pro), the Gemini key on the billing-free project (now a fallback, still free tier),
+and the Claude usage, which comes out of an already-paid personal subscription. The
+marginal electricity of a laptop that would be running anyway is the only real cost,
+and it is not attributable to this project.
 
 ## 8. Gotchas learned (don't rediscover these)
 
