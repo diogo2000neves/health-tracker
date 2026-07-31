@@ -349,7 +349,6 @@ DAILY_COLUMNS: List[Column] = [
     _nutrient("magnesium_mg", "mg", "magnesium"),
     _nutrient("zinc_mg", "mg", "zinc"),
     _nutrient("vitamin_c_mg", "mg", "vitamin C"),
-    _nutrient("vitamin_d_ug", "ug", "vitamin D"),
     _nutrient("vitamin_b12_ug", "ug", "vitamin B12"),
     _nutrient("vitamin_a_ug", "ug", "vitamin A"),
     _nutrient("folate_ug", "ug", "folate"),

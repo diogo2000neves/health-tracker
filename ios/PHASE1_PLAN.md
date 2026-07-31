@@ -111,8 +111,11 @@ Every column carries metadata an agent should use for display: `unit`, `tier`
 Tier-1 micro rollups already in `daily_summary` (source = summed from meals):
 `total_fiber_g, total_sugar_g, total_saturated_fat_g, total_sodium_mg,
 total_potassium_mg, total_calcium_mg, total_iron_mg, total_magnesium_mg,
-total_zinc_mg, total_vitamin_c_mg, total_vitamin_d_ug, total_vitamin_b12_ug,
+total_zinc_mg, total_vitamin_c_mg, total_vitamin_b12_ug,
 total_vitamin_a_ug, total_folate_ug, total_omega3_g`.
+
+`total_vitamin_d_ug` was removed from the schema and the sheet on 2026-07-31
+(see CONTEXT.md §2d).
 
 ### 2.2 `meals` — one row per meal
 
@@ -121,17 +124,19 @@ Columns: `datetime` (ISO local, e.g. `2026-07-18T13:45:30+01:00`), `foods`,
 `model`, `photo_url`, `portion_g`, `image_sha`, `note`, `template`.
 
 Each entry in `items` is `{name, portion_g, calories, protein_g, carbs_g, fat_g,
-cooking_method?, nutrients{…}}`. The `nutrients` map is the **full 37-key set**
+cooking_method?, nutrients{…}}`. The `nutrients` map is the **full 32-key set**
 (`NUTRIENT_KEYS` in `ingest/main.py`):
 
 - grams: fiber_g, sugar_g, added_sugar_g, saturated_fat_g, monounsaturated_fat_g,
   polyunsaturated_fat_g, trans_fat_g, omega3_g, omega6_g
 - mg: sodium_mg, potassium_mg, calcium_mg, iron_mg, magnesium_mg, zinc_mg,
-  phosphorus_mg, copper_mg, manganese_mg, chloride_mg, cholesterol_mg, choline_mg,
+  phosphorus_mg, copper_mg, manganese_mg, cholesterol_mg, choline_mg,
   vitamin_c_mg, vitamin_e_mg, vitamin_b1_mg, vitamin_b2_mg, vitamin_b3_mg,
   vitamin_b5_mg, vitamin_b6_mg
-- µg: vitamin_a_ug, vitamin_d_ug, vitamin_k_ug, vitamin_b12_ug, folate_ug,
-  biotin_ug, selenium_ug, iodine_ug
+- µg: vitamin_a_ug, vitamin_b12_ug, folate_ug, selenium_ug, iodine_ug
+
+Vitamin D, vitamin K, biotin and chloride are deliberately **not** in the set —
+food is not their dominant source (CONTEXT.md §2d).
 
 Rows whose `foods` is `"not food"` or `"analysis failed"` are **stubs**, excluded
 from all totals (`NON_MEALS`).

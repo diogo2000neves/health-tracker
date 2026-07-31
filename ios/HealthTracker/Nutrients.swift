@@ -79,13 +79,19 @@ struct NutrientDef: Identifiable, Hashable {
 enum NutrientCatalog {
     /// Every catalogued nutrient in display order (vitamins, then minerals, then fats
     /// & fibre & the dietary limits). The section filters below preserve this order.
+    ///
+    /// Vitamin D, vitamin K, biotin and chloride are deliberately absent (2026-07-31).
+    /// This app's only sensor is a photo of a plate, and for those four the plate is
+    /// not the main source — sunlight, gut bacteria and salt are. Showing an amber
+    /// "abaixo do alvo" gauge for a nutrient whose real supply route we cannot see
+    /// isn't an honest low reading, it's a false alarm. Don't re-add them here without
+    /// re-adding them to the backend's NUTRIENT_KEYS first, or they will render as
+    /// permanently-zero rows.
     static let all: [NutrientDef] = [
         // vitamins
         NutrientDef(key: "vitamin_a_ug", label: "Vitamina A"),
         NutrientDef(key: "vitamin_c_mg", label: "Vitamina C"),
-        NutrientDef(key: "vitamin_d_ug", label: "Vitamina D"),
         NutrientDef(key: "vitamin_e_mg", label: "Vitamina E"),
-        NutrientDef(key: "vitamin_k_ug", label: "Vitamina K"),
         NutrientDef(key: "vitamin_b1_mg", label: "B1 · Tiamina"),
         NutrientDef(key: "vitamin_b2_mg", label: "B2 · Riboflavina"),
         NutrientDef(key: "vitamin_b3_mg", label: "B3 · Niacina"),
@@ -93,7 +99,6 @@ enum NutrientCatalog {
         NutrientDef(key: "vitamin_b6_mg", label: "Vitamina B6"),
         NutrientDef(key: "vitamin_b12_ug", label: "Vitamina B12"),
         NutrientDef(key: "folate_ug", label: "Folato"),
-        NutrientDef(key: "biotin_ug", label: "Biotina"),
         // minerals
         NutrientDef(key: "calcium_mg", label: "Cálcio"),
         NutrientDef(key: "iron_mg", label: "Ferro"),
@@ -106,7 +111,6 @@ enum NutrientCatalog {
         NutrientDef(key: "selenium_ug", label: "Selénio"),
         NutrientDef(key: "iodine_ug", label: "Iodo"),
         NutrientDef(key: "choline_mg", label: "Colina"),
-        NutrientDef(key: "chloride_mg", label: "Cloreto"),
         // fats, fibre & the dietary limits
         NutrientDef(key: "fiber_g", label: "Fibra"),
         NutrientDef(key: "omega3_g", label: "Ómega-3"),

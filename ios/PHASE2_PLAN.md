@@ -64,13 +64,16 @@ nutrients) · `focus_key` · `plates_json` (3 ranked plates) · `model` · `stat
 A JSON keyed by nutrient. A raw deficit only becomes a *genuine issue* after passing
 this gauntlet, so the model is never handed a false alarm.
 
-- **`goal_weight`** (0–1) — importance for the recomp goal. Protein `1.0`, biotin
-  `0.15`. Ranks which issue leads the week.
+- **`goal_weight`** (0–1) — importance for the recomp goal. Protein `1.0`, manganese
+  `0.2`. Ranks which issue leads the week.
 - **`excess_posture`** — `none | note | flag | hard_flag`. Cholesterol `none`
   (track-only; dietary cholesterol is a weak LDL predictor for most people), saturated
   fat `flag`, trans fat `hard_flag`. Stops the "you spiked cholesterol!" false alarm.
-- **`deficit_from_food`** — `strong | weak`. Vitamin D `weak` (skin/sun is the real
-  source, so a low food figure is a *note*, not a deficiency), most others `strong`.
+- ~~**`deficit_from_food`**~~ — **removed 2026-07-31.** It marked a deficit as a
+  *note* rather than an alarm for nutrients food doesn't really supply, and existed
+  only for vitamin D and biotin. Those nutrients are no longer measured at all, so
+  the hedge had nothing left to apply to. Every tracked nutrient is now genuinely
+  food-sourced and a deficit in one is always real. See CONTEXT.md §2d.
 - **`coverage_floor`** — minimum fraction of the window's meals that must carry data
   for the nutrient before we say anything. Below it → `unknown`, never `deficit`. This
   is the missing-data guard: a gap in extraction must not read as a gap in the diet.

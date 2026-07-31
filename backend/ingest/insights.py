@@ -224,12 +224,18 @@ def _trend(mean_now: float, mean_prev: float, kind: str) -> Optional[str]:
 # -- the per-nutrient verdict --------------------------------------------------
 def _judge_nutrient(key: str, mean: float, coverage: float,
                     target: Dict[str, Any], pol: Dict[str, Any]
-                    ) -> Tuple[str, Any, Optional[float]]:
+                    ) -> Tuple[str, bool, Optional[float]]:
     """(status, genuine_issue, pct) for one nutrient, after the policy gauntlet.
 
     status ∈ deficit | adequate | over | over_benign | near | approaching_ul | unknown
-    genuine_issue ∈ True | False | "weak"   (weak = worth a note, not an alarm)
+    genuine_issue ∈ True | False
     pct = mean / the relevant target (floor for reach, ceiling for limit), or None.
+
+    There used to be a third `"weak"` verdict — a deficit worth a note but not an
+    alarm — for nutrients the plate doesn't actually supply (vitamin D from sun,
+    biotin from gut bacteria). Those nutrients are no longer measured at all, so
+    every remaining one is genuinely food-sourced and a deficit here is a real
+    signal. Don't reintroduce a hedge; remove the nutrient instead.
     """
     kind = target.get("kind", "reach")
     floor = target.get("floor")
@@ -260,8 +266,7 @@ def _judge_nutrient(key: str, mean: float, coverage: float,
         return "adequate", False, None
     pct = mean / floor
     if pct < DEFICIT_RATIO:
-        weak = pol.get("deficit_from_food") == "weak"
-        return "deficit", ("weak" if weak else True), pct
+        return "deficit", True, pct
     return "adequate", False, pct
 
 
@@ -399,12 +404,10 @@ def _adherence(days: Sequence[Dict[str, Any]], targets: Dict[str, Dict[str, Any]
 def _rank_issues(nutrients: Sequence[Dict[str, Any]]) -> List[str]:
     """The prioritised shortlist: genuine issues only, scored goal_weight × severity so
     the week leads with the one change that matters most (protein for recomp before a
-    trace vitamin). `weak` issues are notes, not headline problems, so they rank below
-    any real one."""
+    trace vitamin)."""
     scored: List[Tuple[float, str]] = []
     for n in nutrients:
-        genuine = n.get("genuine_issue")
-        if not genuine:
+        if not n.get("genuine_issue"):
             continue
         sev = _severity(n["status"], n.get("pct"))
         weight = n.get("goal_weight", 0.4)
@@ -412,8 +415,6 @@ def _rank_issues(nutrients: Sequence[Dict[str, Any]]) -> List[str]:
         # protein gap must lead over a deep gap in a trace nutrient); severity is the
         # tiebreaker within a weight band.
         score = weight * (0.5 + 0.5 * sev)
-        if genuine == "weak":
-            score *= 0.35                                # a note ranks below any alarm
         scored.append((score, n["key"]))
     scored.sort(reverse=True)
     return [key for _, key in scored]

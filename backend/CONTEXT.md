@@ -297,6 +297,47 @@ The causal alignment described above isn't a materialised tab — pair day N's
 inputs against day N+1's outcomes yourself using `schema/registry.py`'s `causal`
 field (`causal_inputs()` / `causal_outcomes()`).
 
+## 2d. We only track what the plate can tell us (read before adding a nutrient)
+
+This system has exactly **one** nutrition sensor: a photo of food. So a nutrient
+earns a place in `NUTRIENT_KEYS` only if **food is its dominant source**. Where it
+isn't, a food-only figure is not a low reading — it is a *wrong* one, and it drives a
+red gauge, a coach finding and a weekly "deficiency" for a supply route we cannot
+see. We would be measuring our own blind spot and calling it a result.
+
+Four nutrients were removed on **2026-07-31** for failing that test, and must not
+come back without a second measurement source:
+
+| dropped | its real vector |
+|---|---|
+| `vitamin_d_ug` | UVB on skin — one sun exposure outweighs any plausible day of eating |
+| `vitamin_k_ug` | menaquinones (K2) synthesised by colonic bacteria |
+| `biotin_ug` | colonic bacteria + SMVT; a dietary requirement was never established |
+| `chloride_mg` | rides along with every mg of sodium; intake is universally sufficient |
+
+Two consequences worth holding on to:
+
+* **The hedge went with them.** `insights._judge_nutrient` used to return a third
+  verdict, `"weak"` — a deficit worth a note but not an alarm — configured by a
+  `deficit_from_food` key in `nutrient_policy.json`. It existed *only* for vitamin D
+  and biotin. With them gone the mechanism was dead code, and it is deleted. Every
+  nutrient now measured is genuinely food-sourced, so **a deficit is always a real
+  signal**. If a nutrient ever seems to need hedging again, that is evidence it
+  should not be measured — remove it, don't soften its alarm.
+* **The column is gone, not just unwritten.** `total_vitamin_d_ug` was the only one
+  of the four with a `daily_summary` column; it was dropped outright on 2026-07-31,
+  history included. The table holds only what is actually measured — a column that
+  can never fill again is noise in every CSV export and every AI read of the sheet.
+  Dropping it took two steps, because `src.maintenance._sync_daily_columns`
+  deliberately **refuses to drop a column that still holds data**: clear the values
+  first, then remove it from the registry and migrate.
+
+Educational copy in `nutrient_info.json` still *mentions* these nutrients where the
+science demands it ("vitamin D3 is required to absorb calcium") — that is correct and
+deliberate. Naming a nutrient as context is not the same as scoring the user against
+it, and here it reads as the honest instruction: get this one somewhere other than
+your plate.
+
 ## 3. Architecture
 
 ```
@@ -544,11 +585,13 @@ token is read-only across `sleep`, `health_metrics_and_measurements` and
     hr_min_bpm/hr_avg_bpm/hr_max_bpm, mins_hr_light/moderate/vigorous/peak,
     swim_strokes`
   - **nutrition** (meals roll-up): `total_cals_in, total_protein_g,
-    total_carbs_g, total_fat_g` + **15 Tier-1 micronutrient totals**
+    total_carbs_g, total_fat_g` + **14 Tier-1 micronutrient totals**
     (`total_fiber_g, total_sugar_g, total_saturated_fat_g, total_sodium_mg,
     total_potassium_mg, total_calcium_mg, total_iron_mg, total_magnesium_mg,
-    total_zinc_mg, total_vitamin_c_mg, total_vitamin_d_ug, total_vitamin_b12_ug,
+    total_zinc_mg, total_vitamin_c_mg, total_vitamin_b12_ug,
     total_vitamin_a_ug, total_folate_ug, total_omega3_g`)
+    - `total_vitamin_d_ug` was dropped from the schema **and** the sheet on
+      2026-07-31 (history included) — see §2d.
   - **body** (scale screenshot): `weight_kg, bmi, body_fat_pct,
     subcutaneous_fat_pct, visceral_fat, body_water_pct, muscle_mass_kg,
     bone_mass_kg, bmr_kcal, metabolic_age, lean_mass_kg, body_measured_at`
@@ -603,7 +646,7 @@ token is read-only across `sleep`, `health_metrics_and_measurements` and
     records every application for audit; the note always wins (it can suppress a
     match or scale it), and a corrected note re-analyses and replaces the row.
   - `items` = JSON array, one object per ingredient with its portion, macros,
-    `cooking_method` and a `nutrients` map (~36 possible nutrients, only the
+    `cooking_method` and a `nutrients` map (32 possible nutrients, only the
     non-negligible ones stored). The flat columns are the row totals; the daily
     job sums the Tier-1 nutrients from `items` into `daily_summary`.
   - **Two names per item.** `name` is lowercase singular **English** — the key FDC

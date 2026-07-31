@@ -2,7 +2,7 @@
 
 Pure functions over meal rows + resolved targets + policy — no sheet, no model, no
 credentials. This is the "deep, careful analysis" the coach promises; it must be
-falsifiable, so every judgment (coverage gating, deficit vs weak-note, excess posture,
+falsifiable, so every judgment (coverage gating, deficit detection, excess posture,
 attribution, portion math) is pinned here.
 """
 import importlib.util
@@ -17,15 +17,14 @@ _spec.loader.exec_module(insights)
 # -- fixtures ------------------------------------------------------------------
 POLICY = {
     "defaults": {"goal_weight": 0.4, "excess_posture": "none",
-                 "deficit_from_food": "strong", "coverage_floor": 0.55},
+                 "coverage_floor": 0.55},
     "nutrients": {
         "protein_g": {"goal_weight": 1.0},
         "fiber_g": {"goal_weight": 0.75},
         "omega3_g": {"goal_weight": 0.7, "coverage_floor": 0.45},
         "saturated_fat_g": {"goal_weight": 0.7, "excess_posture": "flag"},
         "sodium_mg": {"goal_weight": 0.55, "excess_posture": "flag"},
-        "vitamin_d_ug": {"goal_weight": 0.6, "deficit_from_food": "weak",
-                         "coverage_floor": 0.4, "note": "sun is the real source"},
+        "vitamin_c_mg": {"goal_weight": 0.4, "coverage_floor": 0.4},
         "iron_mg": {"goal_weight": 0.6, "excess_posture": "flag"},
     },
 }
@@ -40,7 +39,7 @@ TARGETS = {
               "horizon": "daily"},
     "fiber_g": {"kind": "reach", "floor": 30, "unit": "g", "horizon": "daily"},
     "omega3_g": {"kind": "reach", "floor": 1.6, "unit": "g", "horizon": "rolling"},
-    "vitamin_d_ug": {"kind": "reach", "floor": 15, "unit": "ug", "horizon": "rolling"},
+    "vitamin_c_mg": {"kind": "reach", "floor": 90, "unit": "mg", "horizon": "daily"},
     "iron_mg": {"kind": "reach", "floor": 8, "ceiling": 45, "unit": "mg",
                 "horizon": "rolling"},
     "saturated_fat_g": {"kind": "limit", "ceiling": 20, "unit": "g", "horizon": "daily"},
@@ -113,20 +112,28 @@ def test_grounded_zero_counts_as_known():
 
 
 # -- deficit strength ----------------------------------------------------------
-def test_weak_source_deficit_is_a_note_not_an_alarm():
-    """Vitamin D low from food is a note (sun is the real source), ranked below any
-    real deficit."""
+def test_every_deficit_is_a_real_alarm_now():
+    """There is no longer a hedged, "weak" deficit — and there must not be one again.
+
+    The old third verdict existed for vitamin D and biotin, whose real sources are
+    sunlight and gut bacteria rather than the plate. Those nutrients are no longer
+    measured at all, so every nutrient still in the policy IS food-sourced and a
+    deficit in it is a genuine signal. If a nutrient ever needs hedging again, the
+    honest fix is to stop measuring it, not to soften its alarm.
+    """
     meals = [meal(f"2026-07-1{i} 13:00", "salada", 200, 300, 200, grounded())
              for i in range(1, 8)]
-    days = [day(f"2026-07-1{i}", calories=300, protein_g=200, vitamin_d_ug=1.0)
+    days = [day(f"2026-07-1{i}", calories=300, protein_g=200, vitamin_c_mg=4.0)
             for i in range(1, 8)]
     diag = insights.build_diagnosis(
         ref_day="2026-07-19", window_days=7, days=days, prev_days=[],
         window_meals=meals, targets=TARGETS, basis=BASIS, policy=POLICY)
-    vd = next(n for n in diag["nutrients"] if n["key"] == "vitamin_d_ug")
-    assert vd["status"] == "deficit"
-    assert vd["genuine_issue"] == "weak"
-    assert vd.get("note")                          # the sun caveat travels with it
+    vc = next(n for n in diag["nutrients"] if n["key"] == "vitamin_c_mg")
+    assert vc["status"] == "deficit"
+    assert vc["genuine_issue"] is True
+    # no nutrient anywhere may come back with the retired hedge
+    assert all(n.get("genuine_issue") in (True, False)
+               for n in diag["nutrients"])
 
 
 def test_protein_deficit_outranks_a_trace_vitamin():
@@ -222,17 +229,17 @@ def test_portion_range_none_without_density():
 # -- food profile --------------------------------------------------------------
 def test_food_profile_aggregates_and_categorises():
     meals = [
-        meal("2026-07-11 08:00", "ovos", 100, 150, 13, grounded(vitamin_d_ug=2.0)),
-        meal("2026-07-12 08:00", "ovos", 120, 180, 15, grounded(vitamin_d_ug=2.4)),
+        meal("2026-07-11 08:00", "ovos", 100, 150, 13, grounded(vitamin_b12_ug=2.0)),
+        meal("2026-07-12 08:00", "ovos", 120, 180, 15, grounded(vitamin_b12_ug=2.4)),
         meal("2026-07-12 13:00", "brócolos", 150, 50, 4, grounded()),
     ]
-    profile = insights.build_food_profile(meals, ["vitamin_d_ug"])
+    profile = insights.build_food_profile(meals, ["vitamin_b12_ug"])
     eggs = next(f for f in profile if f["food"] == "ovos")
     assert eggs["times_eaten"] == 2
     assert eggs["category"] == "protein_animal"
     assert eggs["top_slot"] == "breakfast"
     assert eggs["median_portion_g"] == 110
-    assert eggs["density_per_g"]["vitamin_d_ug"] > 0     # (2.0+2.4)/(100+120)
+    assert eggs["density_per_g"]["vitamin_b12_ug"] > 0     # (2.0+2.4)/(100+120)
     veg = next(f for f in profile if f["food"] == "brócolos")
     assert veg["category"] == "vegetable"
 

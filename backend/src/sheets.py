@@ -45,9 +45,9 @@ DAILY_HEADERS: List[str] = daily_headers()
 # can no longer drift apart the way the old hand-mirrored copies could.
 BODY_METRICS: List[str] = [n for n in ocr_ranges()]
 
-# Micronutrients that get a daily total column (`total_<key>`). The full ~36
-# nutrient set lives per-ingredient in the meals `items` JSON; this is the
-# high-value subset that additionally rolls up.
+# Micronutrients that get a daily total column (`total_<key>`). The full 32-nutrient
+# set lives per-ingredient in the meals `items` JSON; this is the high-value subset
+# that additionally rolls up.
 TIER1_NUTRIENTS: List[str] = [
     n[len("total_"):] for n in names_in("nutrition")
     if n.startswith("total_") and n not in

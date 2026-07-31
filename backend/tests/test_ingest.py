@@ -1325,8 +1325,12 @@ def test_micro_targets_are_adult_male_references():
     assert micro["sodium_mg"]["kind"] == "limit"
     assert micro["sodium_mg"]["ceiling"] == 2300.0 and "floor" not in micro["sodium_mg"]
     assert micro["vitamin_c_mg"]["floor"] == 90.0
-    assert micro["vitamin_d_ug"]["floor"] == 15.0
     assert micro["potassium_mg"]["floor"] == 3400.0
+    # nutrients food is not the main source of carry NO floor — they aren't measured
+    # at all (sun / gut bacteria / salt are their real vectors), so there is nothing
+    # honest to score a plate against. See ingest.NUTRIENT_KEYS.
+    for key in ("vitamin_d_ug", "vitamin_k_ug", "biotin_ug", "chloride_mg"):
+        assert key not in micro
     # added sugar / saturated fat scale with energy -> DERIVED, not in this table
     assert "added_sugar_g" not in micro and "saturated_fat_g" not in micro
     assert len(micro) == len(ingest._MICRO_TARGETS)
@@ -1433,11 +1437,42 @@ def test_target_seed_rows_only_adds_missing_metrics():
     assert len(rows_some) == len(rows_all) - 2
 
 
+def test_unreadable_targets_tab_never_reseeds(monkeypatch):
+    """An unreadable tab must NOT be treated as an empty one.
+
+    Regression test for the bug that grew the live `targets` tab to 386 rows:
+    `_read_targets_grid` swallowed every exception into `[]`, `_seed_targets` read
+    that as "nothing seeded yet" and appended the whole ~36-metric set. Ten transient
+    Sheets errors left 11 duplicate copies of every metric. It hid for months because
+    `_targets_from_grid` is last-wins, so the app kept reading the newest copy.
+    """
+    derived, _ = ingest._derive_targets([])
+
+    # a failing read yields None (the "unknown" signal), never []
+    monkeypatch.setattr(ingest, "_read_tab",
+                        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("503")))
+    assert ingest._read_targets_grid() is None
+
+    # and None must append nothing at all
+    appended = []
+    monkeypatch.setattr(ingest, "_ensure_targets_tab", lambda: None)
+    monkeypatch.setattr(ingest, "_execute", lambda fn: appended.append(fn))
+    ingest._seed_targets(None, derived)
+    assert appended == [], "an unreadable tab must never trigger a re-seed"
+
+    # a genuinely empty tab still seeds — the first-run path must keep working
+    ingest._seed_targets([], derived)
+    assert appended, "an empty tab is the first-run case and must still seed"
+
+    # and None degrades to defaults rather than exploding
+    assert ingest._targets_from_grid(None) == {}
+
+
 # -- kinetics: the biology stamped onto each target -----------------------------
 def test_with_kinetics_stamps_horizon_and_only_reachable_ceilings():
     base = {
         "vitamin_c_mg": {"kind": "reach", "floor": 90.0, "unit": "mg", "source": "rda"},
-        "vitamin_d_ug": {"kind": "reach", "floor": 15.0, "unit": "ug", "source": "rda"},
+        "vitamin_a_ug": {"kind": "reach", "floor": 900.0, "unit": "ug", "source": "rda"},
         "iron_mg":      {"kind": "reach", "floor": 8.0, "unit": "mg", "source": "rda"},
         "zinc_mg":      {"kind": "reach", "floor": 11.0, "unit": "mg", "source": "rda"},
         "protein_g":    {"kind": "reach", "floor": 140.0, "unit": "g", "source": "measured"},
@@ -1448,7 +1483,7 @@ def test_with_kinetics_stamps_horizon_and_only_reachable_ceilings():
     assert out["vitamin_c_mg"]["horizon"] == "daily"
     assert "ceiling" not in out["vitamin_c_mg"]
     # stored in body fat/liver -> rolling, WITH a reachable toxicity ceiling
-    assert out["vitamin_d_ug"]["horizon"] == "rolling" and out["vitamin_d_ug"]["ceiling"] == 100.0
+    assert out["vitamin_a_ug"]["horizon"] == "rolling" and out["vitamin_a_ug"]["ceiling"] == 3000.0
     assert out["iron_mg"]["horizon"] == "rolling" and out["iron_mg"]["ceiling"] == 45.0
     # the one non-cumulative nutrient that still carries a reachable ceiling
     assert out["zinc_mg"]["horizon"] == "daily" and out["zinc_mg"]["ceiling"] == 40.0
@@ -1593,7 +1628,7 @@ def test_today_stamps_horizon_and_returns_the_rolling_history(monkeypatch):
     t = body["targets"]
     # every micro carries its kinetics horizon
     assert t["vitamin_c_mg"]["horizon"] == "daily"       # non-cumulative
-    assert t["vitamin_d_ug"]["horizon"] == "rolling"     # body-banked
+    assert t["vitamin_b12_ug"]["horizon"] == "rolling"   # body-banked (liver, years)
     # a reachable toxicity ceiling is stamped on the stored nutrients, not the safe ones
     assert t["iron_mg"]["ceiling"] == 45.0 and t["iron_mg"]["horizon"] == "rolling"
     assert "ceiling" not in t["vitamin_c_mg"]            # a surplus of C is safe

@@ -18,11 +18,16 @@ our 36 keys. The mapping was verified against live API responses:
     deliberately excluding the undifferentiated "18:2"/"18:3" totals so nothing is
     double-counted;
   * where FDC ships the same nutrient in several forms we pick the one matching our
-    unit/definition: Vitamin A as RAE µg (320, not the IU 318), Vitamin D as µg
-    (328, not IU 324), folate as DFE (435) falling back to total (417).
-Nutrients FDC genuinely lacks for a food (added sugar, chloride, iodine, biotin are
-often blank even in Foundation foods) are simply absent from the returned map; the
-grounding step keeps the model's estimate for those keys.
+    unit/definition: Vitamin A as RAE µg (320, not the IU 318), folate as DFE (435)
+    falling back to total (417).
+Nutrients FDC genuinely lacks for a food (added sugar and iodine are often blank
+even in Foundation foods) are simply absent from the returned map; the grounding
+step keeps the model's estimate for those keys.
+
+Vitamin D (328), vitamin K (430), biotin (416) and chloride (1088) are no longer
+mapped: the app stopped tracking them because food is not their dominant source
+(see nutrients.py). Chloride and biotin were, tellingly, two of the keys FDC could
+almost never fill anyway.
 """
 from __future__ import annotations
 
@@ -66,11 +71,11 @@ _BY_NUMBER: Dict[str, str] = {
     "307": "sodium_mg", "306": "potassium_mg", "301": "calcium_mg",
     "303": "iron_mg", "304": "magnesium_mg", "309": "zinc_mg",
     "305": "phosphorus_mg", "312": "copper_mg", "315": "manganese_mg",
-    "1088": "chloride_mg", "601": "cholesterol_mg", "421": "choline_mg",
+    "601": "cholesterol_mg", "421": "choline_mg",
     "401": "vitamin_c_mg", "323": "vitamin_e_mg", "404": "vitamin_b1_mg",
     "405": "vitamin_b2_mg", "406": "vitamin_b3_mg", "410": "vitamin_b5_mg",
-    "415": "vitamin_b6_mg", "320": "vitamin_a_ug", "328": "vitamin_d_ug",
-    "418": "vitamin_b12_ug", "416": "biotin_ug", "317": "selenium_ug",
+    "415": "vitamin_b6_mg", "320": "vitamin_a_ug",
+    "418": "vitamin_b12_ug", "317": "selenium_ug",
     "314": "iodine_ug",
 }
 # Macros, extracted for QA only (the pipeline keeps the vision macro estimate; FDC
@@ -165,7 +170,6 @@ def _map_food(raw: Dict[str, Any]) -> Dict[str, Any]:
     macros: Dict[str, float] = {}
     omega3 = 0.0
     omega6 = 0.0
-    vit_k = 0.0
     folate_dfe: Optional[float] = None
     folate_total: Optional[float] = None
 
@@ -194,9 +198,6 @@ def _map_food(raw: Dict[str, Any]) -> Dict[str, Any]:
             omega3 += amount
         elif "n-6" in name:
             omega6 += amount
-        # Vitamin K forms (phylloquinone + menaquinones) sum to total vitamin K.
-        if name.startswith("vitamin k"):
-            vit_k += amount
         # Folate: prefer DFE, fall back to total.
         if number == "435":
             folate_dfe = amount
@@ -207,8 +208,6 @@ def _map_food(raw: Dict[str, Any]) -> Dict[str, Any]:
         nutrients["omega3_g"] = omega3
     if omega6 > 0:
         nutrients["omega6_g"] = omega6
-    if vit_k > 0:
-        nutrients["vitamin_k_ug"] = vit_k
     folate = folate_dfe if folate_dfe is not None else folate_total
     if folate is not None:
         nutrients["folate_ug"] = folate

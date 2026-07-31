@@ -9,6 +9,13 @@ once so a single edit keeps ingest, the audit, and the eval in lockstep.
 
 The key set is ported verbatim from backend/ingest/main.py (NUTRIENT_KEYS). If the
 backend adds a nutrient column, add it here too and the whole pipeline follows.
+
+⚠️ Vitamin D, vitamin K, biotin and chloride are deliberately absent (2026-07-31).
+Food is not their dominant source — sun, gut bacteria and salt are — so a food-only
+figure for them is wrong rather than merely low. Two of them (chloride, biotin) were
+also the ones FDC could never ground anyway; see fdc.py. Don't re-add them here
+without re-adding them to the backend first, or the audit will write keys the
+roll-up throws away.
 """
 from __future__ import annotations
 
@@ -22,14 +29,13 @@ NUTRIENTS_G = [
 ]
 NUTRIENTS_MG = [
     "sodium_mg", "potassium_mg", "calcium_mg", "iron_mg", "magnesium_mg",
-    "zinc_mg", "phosphorus_mg", "copper_mg", "manganese_mg", "chloride_mg",
+    "zinc_mg", "phosphorus_mg", "copper_mg", "manganese_mg",
     "cholesterol_mg", "choline_mg", "vitamin_c_mg", "vitamin_e_mg",
     "vitamin_b1_mg", "vitamin_b2_mg", "vitamin_b3_mg", "vitamin_b5_mg",
     "vitamin_b6_mg",
 ]
 NUTRIENTS_UG = [
-    "vitamin_a_ug", "vitamin_d_ug", "vitamin_k_ug", "vitamin_b12_ug",
-    "folate_ug", "biotin_ug", "selenium_ug", "iodine_ug",
+    "vitamin_a_ug", "vitamin_b12_ug", "folate_ug", "selenium_ug", "iodine_ug",
 ]
 NUTRIENT_KEYS = NUTRIENTS_G + NUTRIENTS_MG + NUTRIENTS_UG
 

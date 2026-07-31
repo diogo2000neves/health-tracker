@@ -272,9 +272,6 @@ struct Nutrition: Codable, Hashable {
     /// Total vitamin C eaten across the waking day, summed from the per-ingredient breakdown in the meals tab.
     /// measures: food eaten 05:00 this day -> 05:00 next day [mg]
     var totalVitaminCMg: Double?
-    /// Total vitamin D eaten across the waking day, summed from the per-ingredient breakdown in the meals tab.
-    /// measures: food eaten 05:00 this day -> 05:00 next day [ug]
-    var totalVitaminDUg: Double?
     /// Total vitamin B12 eaten across the waking day, summed from the per-ingredient breakdown in the meals tab.
     /// measures: food eaten 05:00 this day -> 05:00 next day [ug]
     var totalVitaminB12Ug: Double?
@@ -304,7 +301,6 @@ struct Nutrition: Codable, Hashable {
         case totalMagnesiumMg = "total_magnesium_mg"
         case totalZincMg = "total_zinc_mg"
         case totalVitaminCMg = "total_vitamin_c_mg"
-        case totalVitaminDUg = "total_vitamin_d_ug"
         case totalVitaminB12Ug = "total_vitamin_b12_ug"
         case totalVitaminAUg = "total_vitamin_a_ug"
         case totalFolateUg = "total_folate_ug"

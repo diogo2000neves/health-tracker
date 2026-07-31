@@ -67,9 +67,9 @@ already share. Runs at **11:00, 15:00, 23:00** daily.
 4. **Ground** (`ground.py` + `fdc.py`) — for each reconciled item: search FDC, let a
    **light** model call pick the best-matching entry (or decline — a wrong match is
    worse than none), pull its measured **per-100 g** panel, scale to the grams, and
-   **merge over the model estimate**: FDC wins for every key it supplies (~30 / 36 for
+   **merge over the model estimate**: FDC wins for every key it supplies (~28 / 32 for
    a whole food); the model's value is kept for the keys FDC omits (added sugar,
-   chloride, iodine, biotin). **Macros stay the vision estimate** (how much protein/fat
+   iodine). **Macros stay the vision estimate** (how much protein/fat
    is on *this* plate is perception), but the **fat-composition split** (sat/mono/poly/
    omega) is taken from FDC's ratios and **rescaled to the vision total fat** — "what
    kind of fat" from the database, "how much" from the eyes.

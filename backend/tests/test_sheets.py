@@ -59,13 +59,24 @@ def test_read_range_covers_the_whole_schema_with_headroom():
 
 
 def test_tier1_nutrients_have_daily_columns():
-    assert len(TIER1_NUTRIENTS) == 15
+    assert len(TIER1_NUTRIENTS) == 14
     for n in TIER1_NUTRIENTS:
         assert f"total_{n}" in DAILY_HEADERS
     # nutrient totals sit inside the nutrition block: after the macros they extend,
     # and before the body-composition block
     i = DAILY_HEADERS.index
     assert i("total_fat_g") < i("total_fiber_g") < i("weight_kg")
+
+
+def test_untracked_nutrients_have_no_column_at_all():
+    """Nutrients food isn't the main source of are gone from the schema entirely.
+
+    No `total_*` column, no roll-up, no empty column left behind: the table holds
+    only what we actually measure. See CONTEXT.md §2d for why these four went.
+    """
+    for n in ("vitamin_d_ug", "vitamin_k_ug", "biotin_ug", "chloride_mg"):
+        assert f"total_{n}" not in DAILY_HEADERS
+        assert n not in TIER1_NUTRIENTS
 
 
 def test_every_scale_metric_has_a_column():

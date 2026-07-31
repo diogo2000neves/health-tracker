@@ -270,6 +270,23 @@ DEFAULT_DAILY_JOB = "health-tracker-daily"
 # Grouped by unit (suffix _g/_mg/_ug) so values map cleanly to a future relational
 # nutrients table. The Tier-1 subset (src/sheets.py TIER1_NUTRIENTS) also rolls up
 # into daily_summary. Keep this in sync with the key list in the prompt below.
+#
+# ⚠️ Four nutrients were deliberately REMOVED from this set (2026-07-31) and must
+# not be re-added: `vitamin_d_ug`, `vitamin_k_ug`, `biotin_ug`, `chloride_mg`.
+# This app has exactly one measurement vector — the food on the plate — and for
+# these four the plate is not where the nutrient mostly comes from, so a food-only
+# figure isn't a low reading, it's a wrong one:
+#   * vitamin D  — cutaneous synthesis from UVB is the dominant source; a single
+#                  sun exposure outweighs any plausible day of eating.
+#   * vitamin K  — menaquinones (K2) from colonic bacteria, absorbed in the colon.
+#   * biotin     — colonic bacteria + the SMVT transporter; a true dietary
+#                  requirement has never been established (frank deficiency
+#                  essentially requires raw egg white's avidin).
+#   * chloride   — co-supplied with every milligram of sodium; intake is
+#                  universally sufficient, so a "deficit" here can never be real.
+# Measuring these would mean showing a red gauge for a vector we cannot see. The
+# nutrition audit's own FDC grounding could not fill chloride or biotin either
+# (see automation/nutrition-audit/fdc.py) — the data was never there to begin with.
 NUTRIENTS_G = [
     "fiber_g", "sugar_g", "added_sugar_g", "saturated_fat_g",
     "monounsaturated_fat_g", "polyunsaturated_fat_g", "trans_fat_g",
@@ -277,14 +294,14 @@ NUTRIENTS_G = [
 ]
 NUTRIENTS_MG = [
     "sodium_mg", "potassium_mg", "calcium_mg", "iron_mg", "magnesium_mg",
-    "zinc_mg", "phosphorus_mg", "copper_mg", "manganese_mg", "chloride_mg",
+    "zinc_mg", "phosphorus_mg", "copper_mg", "manganese_mg",
     "cholesterol_mg", "choline_mg", "vitamin_c_mg", "vitamin_e_mg",
     "vitamin_b1_mg", "vitamin_b2_mg", "vitamin_b3_mg", "vitamin_b5_mg",
     "vitamin_b6_mg",
 ]
 NUTRIENTS_UG = [
-    "vitamin_a_ug", "vitamin_d_ug", "vitamin_k_ug", "vitamin_b12_ug",
-    "folate_ug", "biotin_ug", "selenium_ug", "iodine_ug",
+    "vitamin_a_ug", "vitamin_b12_ug",
+    "folate_ug", "selenium_ug", "iodine_ug",
 ]
 NUTRIENT_KEYS = NUTRIENTS_G + NUTRIENTS_MG + NUTRIENTS_UG
 
@@ -347,15 +364,16 @@ HORIZON_DAILY, HORIZON_ROLLING = "daily", "rolling"
 # people (serum LDL is set mainly by hepatic LDL-receptor activity, which responds
 # far more to saturated fat than to cholesterol intake) — so it's tracked and shown
 # (NUTRIENT_KEYS, NutrientCatalog's context section) but carries no target/ceiling.
+# Vitamin D, vitamin K, biotin and chloride are absent for a different reason: they
+# are not measured at all any more (see NUTRIENT_KEYS) because food is not their
+# main vector. Don't re-add a floor for them.
 # Values verified 2026-07 against the U.S. National Academies DRI tables and the
 # 2025-2030 Dietary Guidelines for Americans.
 # Each entry: key -> (kind, floor, ceiling, unit).
 _MICRO_TARGETS: Dict[str, Tuple[str, Optional[float], Optional[float], str]] = {
     # fat-soluble vitamins
     "vitamin_a_ug":   (TARGET_REACH, 900,  None, "ug"),   # RDA (µg RAE)
-    "vitamin_d_ug":   (TARGET_REACH, 15,   None, "ug"),   # RDA (600 IU)
     "vitamin_e_mg":   (TARGET_REACH, 15,   None, "mg"),   # RDA (mg α-tocopherol)
-    "vitamin_k_ug":   (TARGET_REACH, 120,  None, "ug"),   # AI
     # water-soluble vitamins
     "vitamin_c_mg":   (TARGET_REACH, 90,   None, "mg"),   # RDA
     "vitamin_b1_mg":  (TARGET_REACH, 1.2,  None, "mg"),   # thiamin RDA
@@ -365,7 +383,6 @@ _MICRO_TARGETS: Dict[str, Tuple[str, Optional[float], Optional[float], str]] = {
     "vitamin_b6_mg":  (TARGET_REACH, 1.3,  None, "mg"),   # RDA
     "vitamin_b12_ug": (TARGET_REACH, 2.4,  None, "ug"),   # RDA
     "folate_ug":      (TARGET_REACH, 400,  None, "ug"),   # RDA (µg DFE)
-    "biotin_ug":      (TARGET_REACH, 30,   None, "ug"),   # AI
     "choline_mg":     (TARGET_REACH, 550,  None, "mg"),   # AI (male)
     # minerals
     "calcium_mg":     (TARGET_REACH, 1000, None, "mg"),   # RDA
@@ -378,7 +395,6 @@ _MICRO_TARGETS: Dict[str, Tuple[str, Optional[float], Optional[float], str]] = {
     "manganese_mg":   (TARGET_REACH, 2.3,  None, "mg"),   # AI (male)
     "selenium_ug":    (TARGET_REACH, 55,   None, "ug"),   # RDA
     "iodine_ug":      (TARGET_REACH, 150,  None, "ug"),   # RDA
-    "chloride_mg":    (TARGET_REACH, 2300, None, "mg"),   # AI (19-50)
     "omega3_g":       (TARGET_REACH, 1.6,  None, "g"),    # ALA AI (male)
     # things to stay under
     "sodium_mg":      (TARGET_LIMIT, None, 2300, "mg"),   # CDRR
@@ -405,8 +421,8 @@ _MICRO_TARGETS: Dict[str, Tuple[str, Optional[float], Optional[float], str]] = {
 #
 # Anything absent from this map defaults to (daily, no ceiling). Only the `rolling`
 # nutrients and the one `daily` nutrient with a reachable ceiling (zinc) are listed;
-# the remaining daily-with-no-ceiling nutrients (vitamin C, B1/B2/B3/B5/B6, biotin,
-# choline, magnesium, potassium, chloride, fibre, cholesterol) fall through to the
+# the remaining daily-with-no-ceiling nutrients (vitamin C, B1/B2/B3/B5/B6, choline,
+# magnesium, potassium, fibre, cholesterol) fall through to the
 # default. The pure `limit` metrics (sodium, added sugar, sat/trans fat) already carry
 # their ceiling from _MICRO_TARGETS/_derive_targets and just take the daily default.
 # Cholesterol has neither a target ceiling nor a UL here (see the note above
@@ -415,9 +431,7 @@ _MICRO_TARGETS: Dict[str, Tuple[str, Optional[float], Optional[float], str]] = {
 _NUTRIENT_KINETICS: Dict[str, Tuple[str, Optional[float]]] = {
     # fat-soluble vitamins — stored in liver and fat for weeks to months.
     "vitamin_a_ug":   (HORIZON_ROLLING, 3000.0),   # preformed retinol is hepatotoxic
-    "vitamin_d_ug":   (HORIZON_ROLLING, 100.0),    # 4000 IU; hypercalcaemia above
     "vitamin_e_mg":   (HORIZON_ROLLING, 1000.0),   # anticoagulant at megadoses
-    "vitamin_k_ug":   (HORIZON_ROLLING, None),     # no toxicity from K1/K2
     # water-soluble but body-banked, so read as reserves, not day-to-day.
     "vitamin_b12_ug": (HORIZON_ROLLING, None),     # liver holds 3-5 years
     "folate_ug":      (HORIZON_ROLLING, None),     # UL is synthetic-only; food exempt
@@ -564,15 +578,18 @@ these keys and units:
   grams (g):  fiber_g, sugar_g, added_sugar_g, saturated_fat_g,
     monounsaturated_fat_g, polyunsaturated_fat_g, trans_fat_g, omega3_g, omega6_g
   milligrams (mg):  sodium_mg, potassium_mg, calcium_mg, iron_mg, magnesium_mg,
-    zinc_mg, phosphorus_mg, copper_mg, manganese_mg, chloride_mg, cholesterol_mg,
+    zinc_mg, phosphorus_mg, copper_mg, manganese_mg, cholesterol_mg,
     choline_mg, vitamin_c_mg, vitamin_e_mg, vitamin_b1_mg, vitamin_b2_mg,
     vitamin_b3_mg, vitamin_b5_mg, vitamin_b6_mg
-  micrograms (ug):  vitamin_a_ug, vitamin_d_ug, vitamin_k_ug, vitamin_b12_ug,
-    folate_ug, biotin_ug, selenium_ug, iodine_ug
+  micrograms (ug):  vitamin_a_ug, vitamin_b12_ug, folate_ug, selenium_ug,
+    iodine_ug
+Do NOT report vitamin D, vitamin K, biotin or chloride — they are deliberately
+not tracked (sun, gut bacteria and salt are their real sources, not the plate),
+and any value for them is discarded.
 Report EVERY nutrient key this food is a genuine dietary source of, however
 small — a food doesn't need to be famous for a nutrient to contribute a
 meaningful amount of it (even ~5% of a daily reference intake is worth
-reporting). Most whole foods register on 10+ of these 26 keys; if you're
+reporting). Most whole foods register on 10+ of these 32 keys; if you're
 listing only 2-3, you're almost certainly under-reporting — go back through
 the full list and check each one. OMIT a key only when the food is not a
 plausible source of it at all (e.g. no B12/iodine from an all-plant item with
@@ -809,11 +826,14 @@ profile scaled to the grams, using EXACTLY these keys and units:
   grams (g):  fiber_g, sugar_g, added_sugar_g, saturated_fat_g,
     monounsaturated_fat_g, polyunsaturated_fat_g, trans_fat_g, omega3_g, omega6_g
   milligrams (mg):  sodium_mg, potassium_mg, calcium_mg, iron_mg, magnesium_mg,
-    zinc_mg, phosphorus_mg, copper_mg, manganese_mg, chloride_mg, cholesterol_mg,
+    zinc_mg, phosphorus_mg, copper_mg, manganese_mg, cholesterol_mg,
     choline_mg, vitamin_c_mg, vitamin_e_mg, vitamin_b1_mg, vitamin_b2_mg,
     vitamin_b3_mg, vitamin_b5_mg, vitamin_b6_mg
-  micrograms (ug):  vitamin_a_ug, vitamin_d_ug, vitamin_k_ug, vitamin_b12_ug,
-    folate_ug, biotin_ug, selenium_ug, iodine_ug
+  micrograms (ug):  vitamin_a_ug, vitamin_b12_ug, folate_ug, selenium_ug,
+    iodine_ug
+Do NOT report vitamin D, vitamin K, biotin or chloride — they are deliberately
+not tracked (sun, gut bacteria and salt are their real sources, not the plate),
+and any value for them is discarded.
 Report every key this food is a genuine dietary source of, however small — a
 food doesn't need to be famous for a nutrient to contribute a meaningful
 amount of it (even ~5% of a daily reference intake is worth reporting). Omit a
@@ -2360,11 +2380,19 @@ def _micro_target_dict() -> Dict[str, Dict[str, Any]]:
     return out
 
 
-def _targets_from_grid(values: List[List[Any]]) -> Dict[str, Dict[str, Any]]:
+def _targets_from_grid(values: Optional[List[List[Any]]]
+                       ) -> Dict[str, Dict[str, Any]]:
     """Parse the `targets` tab into metric -> target dict. These are the rows the
-    user can see and edit; a blank floor/ceiling is simply omitted."""
+    user can see and edit; a blank floor/ceiling is simply omitted.
+
+    `None` (the tab could not be read) yields {}, so `_resolve_targets` falls back to
+    the RDA defaults plus the live measured macros — complete and correct, just
+    without the user's own edits for that one request. Note this is last-wins on
+    duplicate metric rows, which is what kept the app behaving correctly while the
+    live tab silently accumulated 11 copies of everything.
+    """
     out: Dict[str, Dict[str, Any]] = {}
-    for row in _rows_as_dicts(values):
+    for row in _rows_as_dicts(values or []):
         metric = str(row.get("metric") or "").strip()
         if not metric:
             continue
@@ -2664,12 +2692,28 @@ def _capabilities() -> "caps_mod.Capabilities":
     return caps
 
 
-def _read_targets_grid() -> List[List[Any]]:
-    """The raw `targets` tab, or [] if it hasn't been created yet."""
+def _read_targets_grid() -> Optional[List[List[Any]]]:
+    """The raw `targets` tab, or **None if it could not be read**.
+
+    None and [] must stay distinguishable, and this is not a style point — conflating
+    them is what corrupted the tab once already. `_seed_targets` treats "no rows" as
+    "nothing is seeded yet" and appends the ENTIRE metric set. So when a transient
+    Sheets error (a 429, a 503, a network blip) was swallowed into `[]`, the next
+    read re-seeded all ~36 metrics on top of the ones already there. Ten such blips
+    left the live tab with 11 duplicate copies of every metric and 386 rows.
+
+    It stayed invisible because `_targets_from_grid` does `out[metric] = ...` in row
+    order — last-wins — so the app kept reading the newest copy and behaved
+    correctly while the tab silently grew.
+
+    Callers must treat None as "unknown, change nothing"; only [] may be seeded.
+    """
     try:
         return _read_tab(TARGETS_TAB)
     except Exception:
-        return []
+        app.logger.warning("targets tab unreadable — skipping seed this run",
+                           exc_info=True)
+        return None
 
 
 def _ensure_targets_tab() -> None:
@@ -2706,10 +2750,18 @@ def _target_seed_rows(existing: set,
     return rows
 
 
-def _seed_targets(grid: List[List[Any]],
+def _seed_targets(grid: Optional[List[List[Any]]],
                   derived: Dict[str, Dict[str, Any]]) -> None:
     """Materialise any missing metric rows into the sheet. Idempotent: once every
-    metric has a row this appends nothing, so it's cheap to call on each read."""
+    metric has a row this appends nothing, so it's cheap to call on each read.
+
+    A `grid` of None means the tab could not be read (see `_read_targets_grid`). That
+    is NOT an empty tab, and seeding on it would append a full duplicate set of every
+    metric — the exact bug that grew the live tab to 11 copies. Do nothing instead:
+    a missed seed is fixed by the next successful read, a spurious one is permanent.
+    """
+    if grid is None:
+        return
     existing = {str(r.get("metric") or "").strip() for r in _rows_as_dicts(grid)}
     rows = _target_seed_rows(existing, derived)
     if not rows:

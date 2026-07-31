@@ -9,9 +9,9 @@ problem), the micronutrient values are a lookup, not a guess. For each item we:
      decline, because a WRONG match yields confidently-wrong micros, so "no match,
      keep the estimate" beats a bad match,
   3. pull that entry's measured per-100 g panel, scale it to the grams, and MERGE it
-     over the model estimate: FDC wins for every key it supplies (~30 of 36 for a
-     whole food); the model's value is kept only for keys FDC lacks (added sugar,
-     chloride, iodine, biotin are routinely blank even in Foundation foods).
+     over the model estimate: FDC wins for every key it supplies (~28 of 32 for a
+     whole food); the model's value is kept only for keys FDC lacks (added sugar and
+     iodine are routinely blank even in Foundation foods).
 
 Macros stay as the vision estimate — how much protein/fat is on THIS plate is
 perception, the model's strong suit — but the fat-composition split (sat/mono/poly/

@@ -118,11 +118,12 @@ genuine source of, however small. Use EXACTLY these keys and units:
   grams (g): fiber_g, sugar_g, added_sugar_g, saturated_fat_g, \
 monounsaturated_fat_g, polyunsaturated_fat_g, trans_fat_g, omega3_g, omega6_g
   milligrams (mg): sodium_mg, potassium_mg, calcium_mg, iron_mg, magnesium_mg, \
-zinc_mg, phosphorus_mg, copper_mg, manganese_mg, chloride_mg, cholesterol_mg, \
+zinc_mg, phosphorus_mg, copper_mg, manganese_mg, cholesterol_mg, \
 choline_mg, vitamin_c_mg, vitamin_e_mg, vitamin_b1_mg, vitamin_b2_mg, vitamin_b3_mg, \
 vitamin_b5_mg, vitamin_b6_mg
-  micrograms (ug): vitamin_a_ug, vitamin_d_ug, vitamin_k_ug, vitamin_b12_ug, \
-folate_ug, biotin_ug, selenium_ug, iodine_ug
+  micrograms (ug): vitamin_a_ug, vitamin_b12_ug, folate_ug, selenium_ug, iodine_ug
+Do NOT emit vitamin_d_ug, vitamin_k_ug, biotin_ug or chloride_mg — they are not \
+tracked (sun, gut bacteria and salt are their real sources) and are discarded.
 
 For EACH reconciled item, record how it was resolved:
   "resolution": one of "agreed" (estimates matched), "adjudicated" (they disagreed and \

@@ -119,12 +119,13 @@ enum SampleData {
     }
 
     /// Seven completed days of intake, tuned so each biological lens has a clear story
-    /// to tell offline: Vitamin D low today but a healthy 7-day average (don't panic),
-    /// Vitamin C consistent (6/7 days on target), magnésio inconsistent (3/7), and iron
-    /// whose reserves sit right up against the 45 mg toxicity ceiling. Every other
-    /// nutrient is a realistic full-day scaling of today's partial intake.
+    /// to tell offline: B12 low on some days but a healthy 7-day average (don't panic —
+    /// the liver banks it for years), Vitamin C consistent (6/7 days on target),
+    /// magnésio inconsistent (3/7), and iron whose reserves sit right up against the
+    /// 45 mg toxicity ceiling. Every other nutrient is a realistic full-day scaling of
+    /// today's partial intake.
     private static func sampleHistory(today: [String: Double]) -> [[String: Any]] {
-        let vitD: [Double]      = [18, 20, 16, 22, 14, 19, 17]        // reserves fine
+        let b12: [Double]       = [3.1, 4.0, 1.8, 5.2, 1.2, 3.4, 2.9] // reserves fine (avg ~3.1)
         let vitC: [Double]      = [140, 110, 70, 160, 180, 130, 120]  // consistent (6/7 ≥ 90)
         let magnesium: [Double] = [420, 300, 260, 450, 380, 500, 280] // inconsistent (3/7 ≥ 400)
         let iron: [Double]      = [42, 38, 45, 30, 44, 40, 41]        // avg ~40, near the 45 UL
@@ -133,7 +134,7 @@ enum SampleData {
             let ago = 7 - i                                            // oldest (7) -> yesterday (1)
             let factor = 1.3 + wave(i, 4.4) * 0.25                     // a fuller day than today so far
             var consumed = today.mapValues { round1($0 * factor) }
-            consumed["vitamin_d_ug"] = vitD[i]
+            consumed["vitamin_b12_ug"] = b12[i]
             consumed["vitamin_c_mg"] = vitC[i]
             consumed["magnesium_mg"] = magnesium[i]
             consumed["iron_mg"] = iron[i]
@@ -152,7 +153,7 @@ enum SampleData {
                       "phosphorus_mg": 210, "potassium_mg": 210, "vitamin_b1_mg": 0.3]),
                 item("leite meio-gordo", 200, 100, 7, 10, 3.4,
                      ["calcium_mg": 240, "vitamin_b12_ug": 0.9, "vitamin_b2_mg": 0.4,
-                      "potassium_mg": 300, "vitamin_d_ug": 1.1, "saturated_fat_g": 2.1,
+                      "potassium_mg": 300, "saturated_fat_g": 2.1,
                       "sugar_g": 10, "iodine_ug": 30, "phosphorus_mg": 190]),
                 item("banana", 120, 107, 1.3, 27, 0.4,
                      ["fiber_g": 3.1, "potassium_mg": 430, "vitamin_b6_mg": 0.4,
@@ -171,12 +172,10 @@ enum SampleData {
                      ["fiber_g": 1.2, "magnesium_mg": 24, "iron_mg": 1.4,
                       "folate_ug": 60, "potassium_mg": 55, "selenium_ug": 15]),
                 item("brócolos", 150, 51, 4.2, 10, 0.6,
-                     ["fiber_g": 3.9, "vitamin_c_mg": 132, "vitamin_k_ug": 155,
-                      "folate_ug": 96, "potassium_mg": 468, "calcium_mg": 71,
+                     ["fiber_g": 3.9, "vitamin_c_mg": 132, "folate_ug": 96, "potassium_mg": 468, "calcium_mg": 71,
                       "vitamin_a_ug": 46]),
                 item("azeite", 10, 88, 0, 0, 10,
-                     ["vitamin_e_mg": 1.9, "vitamin_k_ug": 6,
-                      "monounsaturated_fat_g": 7.3, "saturated_fat_g": 1.4]),
+                     ["vitamin_e_mg": 1.9, "monounsaturated_fat_g": 7.3, "saturated_fat_g": 1.4]),
             ]),
             meal("16:40", "Iogurte grego com mirtilos e amêndoas", note: "", items: [
                 item("iogurte grego", 170, 100, 17, 6, 0.7,
@@ -184,8 +183,7 @@ enum SampleData {
                       "phosphorus_mg": 230, "potassium_mg": 240, "sugar_g": 6,
                       "iodine_ug": 50, "zinc_mg": 1.1]),
                 item("mirtilos", 80, 46, 0.6, 12, 0.3,
-                     ["fiber_g": 1.9, "vitamin_c_mg": 8, "vitamin_k_ug": 15,
-                      "manganese_mg": 0.3, "sugar_g": 8]),
+                     ["fiber_g": 1.9, "vitamin_c_mg": 8, "manganese_mg": 0.3, "sugar_g": 8]),
                 item("amêndoas", 25, 145, 5.3, 5.4, 12.5,
                      ["fiber_g": 3.1, "vitamin_e_mg": 6.5, "magnesium_mg": 68,
                       "calcium_mg": 66, "manganese_mg": 0.5, "copper_mg": 0.3,
@@ -227,18 +225,18 @@ enum SampleData {
         // _MICRO_TARGETS + _NUTRIENT_KINETICS: (key, floor, unit, horizon, UL?).
         let reach: [(String, Double, String, String, Double?)] = [
             ("vitamin_a_ug", 900, "ug", "rolling", 3000), ("vitamin_c_mg", 90, "mg", "daily", nil),
-            ("vitamin_d_ug", 15, "ug", "rolling", 100), ("vitamin_e_mg", 15, "mg", "rolling", 1000),
-            ("vitamin_k_ug", 120, "ug", "rolling", nil), ("vitamin_b1_mg", 1.2, "mg", "daily", nil),
+            ("vitamin_e_mg", 15, "mg", "rolling", 1000),
+            ("vitamin_b1_mg", 1.2, "mg", "daily", nil),
             ("vitamin_b2_mg", 1.3, "mg", "daily", nil), ("vitamin_b3_mg", 16, "mg", "daily", nil),
             ("vitamin_b5_mg", 5, "mg", "daily", nil), ("vitamin_b6_mg", 1.3, "mg", "daily", nil),
             ("vitamin_b12_ug", 2.4, "ug", "rolling", nil), ("folate_ug", 400, "ug", "rolling", nil),
-            ("biotin_ug", 30, "ug", "daily", nil), ("choline_mg", 550, "mg", "daily", nil),
+            ("choline_mg", 550, "mg", "daily", nil),
             ("calcium_mg", 1000, "mg", "rolling", 2500), ("iron_mg", 8, "mg", "rolling", 45),
             ("magnesium_mg", 400, "mg", "daily", nil), ("zinc_mg", 11, "mg", "daily", 40),
             ("potassium_mg", 3400, "mg", "daily", nil), ("phosphorus_mg", 700, "mg", "rolling", 4000),
             ("copper_mg", 0.9, "mg", "rolling", 10), ("manganese_mg", 2.3, "mg", "rolling", 11),
             ("selenium_ug", 55, "ug", "rolling", 400), ("iodine_ug", 150, "ug", "rolling", 1100),
-            ("chloride_mg", 2300, "mg", "daily", nil), ("omega3_g", 1.6, "g", "rolling", nil),
+            ("omega3_g", 1.6, "g", "rolling", nil),
         ]
         for (k, f, u, h, ul) in reach {
             t[k] = target("reach", floor: f, ceiling: ul, unit: u, source: "rda", horizon: h)
