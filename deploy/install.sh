@@ -40,6 +40,7 @@ UNITS=(
   # a model itself.
   health-tracker-coach-worker.service
   health-tracker-coach-worker.timer
+  # Symlinked but not enabled below (see ENABLE) — the audit is currently OFF.
   health-tracker-audit.service
   health-tracker-audit.timer
   # The app calls GET /insights/weekly directly and that endpoint only ever SERVES
@@ -73,7 +74,15 @@ ENABLE=(
   # makes cards appear at all — the backend only PARKS coach jobs, it never calls
   # a model itself.
   health-tracker-coach-worker.timer
-  health-tracker-audit.timer
+  # health-tracker-audit.timer is DELIBERATELY absent (turned off 2026-08-02 to
+  # cut Claude usage — it re-estimates every meal with a second model, adjudicates
+  # the two, then grounds micronutrients in FDC, i.e. 3+ extra Claude calls per
+  # meal on top of the one ingest already made). The unit stays symlinked above
+  # (UNITS) so it's a one-line change to bring back: add the timer here and
+  # re-run this script, or just `systemctl --user enable --now
+  # health-tracker-audit.timer` directly. Without it, each meal gets exactly the
+  # one estimate ingest already made — no re-analysis, no adjudication, no FDC
+  # grounding pass.
   health-tracker-insights-weekly.timer
   health-tracker-calls-sync.timer
 )
