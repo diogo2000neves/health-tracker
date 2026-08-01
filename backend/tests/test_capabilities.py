@@ -83,28 +83,6 @@ class TestWhatFollowsFromBlocks:
         assert caps.FULL.can_link("nutrition", "sleep", "body")
 
 
-class TestTheDeclaredBody:
-    def test_mifflin_st_jeor_for_a_declared_profile(self):
-        friend = caps.from_preset(
-            "nutrition", sex="male", age=30, height_cm=180.0,
-            declared_weight_kg=80.0, activity_level="moderate")
-        # 10*80 + 6.25*180 - 5*30 + 5 = 1780
-        assert friend.basal_metabolic_rate() == pytest.approx(1780.0)
-        assert friend.declared_tdee() == pytest.approx(1780.0 * 1.55)
-
-    def test_an_incomplete_profile_declares_nothing(self):
-        # Half a profile must not produce a confident number; the caller falls
-        # through to its own constant instead.
-        assert caps.from_preset("nutrition", sex="male", age=30).declared_tdee() is None
-        assert caps.FULL.basal_metabolic_rate() is None
-
-    def test_sex_changes_the_constant(self):
-        common = dict(age=30, height_cm=170.0, declared_weight_kg=65.0)
-        male = caps.Capabilities(sex="male", **common).basal_metabolic_rate()
-        female = caps.Capabilities(sex="female", **common).basal_metabolic_rate()
-        assert male - female == pytest.approx(166.0)   # +5 vs -161
-
-
 class TestReadingTheConfigTab:
     def test_a_preset_name(self):
         got = caps.from_config([{"key": "blocks", "value": "nutrition"}])
@@ -123,15 +101,8 @@ class TestReadingTheConfigTab:
         # Hand-edited spreadsheet: every bad value falls back rather than raising.
         got = caps.from_config([
             {"key": "blocks", "value": "nutrition, slep, activty"},
-            {"key": "goal", "value": "become a wizard"},
-            {"key": "sex", "value": "yes"},
-            {"key": "age", "value": "old"},
-            {"key": "activity_level", "value": "very sporty indeed"},
         ])
         assert set(got.blocks) == {"nutrition"}    # the one real name survives
-        assert got.goal == caps.DEFAULT_GOAL
-        assert got.sex is None and got.age is None
-        assert got.activity_level == caps.DEFAULT_ACTIVITY_LEVEL
 
     def test_a_list_that_matches_nothing_falls_back_to_nutrition(self):
         # Not to "everything off": a user with no blocks at all has no app, and a
@@ -139,16 +110,10 @@ class TestReadingTheConfigTab:
         got = caps.from_config([{"key": "blocks", "value": "slep, activty"}])
         assert set(got.blocks) == set(caps.PRESETS["nutrition"])
 
-    def test_european_decimals_survive(self):
-        # The sheet's locale renders decimals with commas (gotcha 10).
-        got = caps.from_config([{"key": "height_cm", "value": "178,5"}])
-        assert got.height_cm == pytest.approx(178.5)
-
     def test_the_seed_covers_every_key_the_reader_understands(self):
         # A key the reader supports but never seeds is one a user can't discover.
         seeded = {row[0] for row in caps.CONFIG_SEED}
-        assert seeded == {"blocks", "goal", "sex", "age", "height_cm",
-                          "weight_kg", "activity_level"}
+        assert seeded == {"blocks"}
 
     def test_the_api_shape_carries_what_the_app_draws_from(self):
         payload = caps.from_preset("nutrition").to_api()
@@ -158,4 +123,3 @@ class TestReadingTheConfigTab:
         assert payload["blocks"] == [b for b in caps.TOGGLEABLE_BLOCKS
                                      if b in set(payload["blocks"])]
         assert "sleep" in payload["blind_spots"]
-        assert payload["goal_label_pt"]

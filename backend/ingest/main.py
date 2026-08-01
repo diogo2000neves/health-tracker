@@ -123,9 +123,7 @@ app.config["MAX_CONTENT_LENGTH"] = 30 * 1024 * 1024
 MEALS_TAB = "meals"
 DAILY_TAB = "daily_summary"
 TEMPLATES_TAB = "templates"
-TARGETS_TAB = "targets"
-# What this user measures, what they are aiming at, and the body they declared.
-# One row per setting; see schema/capabilities.py.
+# What this user measures. One row per setting; see schema/capabilities.py.
 CONFIG_TAB = "config"
 
 # One row per meal. `items` is a JSON array breaking the plate into ingredients,
@@ -321,27 +319,12 @@ NUTRIENT_HISTORY_DAYS = 7
 #                    under is amber, met is green.
 #           limit  = stay under a ceiling (sodium, added sugar, sat/trans fat):
 #                    under is green, over is red.
-#           window = stay near a value with a floor and a ceiling (calories, the
-#                    fill macro carbs).
-#   source  measured = computed by the backend from the user's own data
-#                      (calories/protein/… — recomputed live on every /today read,
-#                      see _derive_targets), so a new weigh-in or a shifting TDEE
-#                      moves them without a redeploy;
-#           rda      = a static reference default (the micronutrient table below),
-#                      seeded once and then owned by the user — editing the cell in
-#                      the sheet is respected and never overwritten;
-#           manual   = a user override of any metric; it always wins, even over a
-#                      `measured` row the backend would otherwise recompute.
-TARGETS_TAB_HEADERS = ["metric", "kind", "floor", "ceiling", "unit", "source"]
-TARGETS_LAST_COL = chr(ord("A") + len(TARGETS_TAB_HEADERS) - 1)  # "F"
-
+#           window = stay near a value with a floor and a ceiling (calories).
+#   source  fixed = the daily plan (see _fixed_targets) — the same numbers every
+#                   day, by design;
+#           rda   = a static reference default (the micronutrient table below).
 TARGET_REACH, TARGET_LIMIT, TARGET_WINDOW = "reach", "limit", "window"
-SRC_MEASURED, SRC_RDA, SRC_MANUAL = "measured", "rda", "manual"
-# A number derived from what the user TOLD us (the `config` tab) rather than from
-# anything measured — the only layer available to someone with no scale and no
-# tracker. Ranks below `measured` and above the built-in constants, and is labelled
-# separately so the app never calls a declared number a measured one.
-SRC_DECLARED, SRC_DEFAULT = "declared", "default"
+SRC_FIXED, SRC_RDA = "fixed", "rda"
 
 # A nutrient's kinetics `horizon` — how a deficit should be read (see _with_kinetics
 # and _NUTRIENT_KINETICS). This is intrinsic biology, not a per-user setting, so it is
@@ -357,7 +340,7 @@ HORIZON_DAILY, HORIZON_ROLLING = "daily", "rolling"
 # are the tolerable/chronic-disease-risk guidance. These are the standard, most
 # complete set of references and are seeded as `source=rda` — edit any cell in the
 # sheet to personalise it. `added_sugar_g`/`saturated_fat_g` are NOT here: they
-# scale with the calorie target, so they are derived in _derive_targets instead.
+# scale with the calorie target, so they are derived in _fixed_targets instead.
 # `cholesterol_mg` is NOT here either: the fixed 300 mg/day cap was dropped by the
 # 2015-2020 Dietary Guidelines for Americans once the evidence showed dietary
 # cholesterol is a weak, individually-variable predictor of serum LDL-C for most
@@ -424,7 +407,7 @@ _MICRO_TARGETS: Dict[str, Tuple[str, Optional[float], Optional[float], str]] = {
 # the remaining daily-with-no-ceiling nutrients (vitamin C, B1/B2/B3/B5/B6, choline,
 # magnesium, potassium, fibre, cholesterol) fall through to the
 # default. The pure `limit` metrics (sodium, added sugar, sat/trans fat) already carry
-# their ceiling from _MICRO_TARGETS/_derive_targets and just take the daily default.
+# their ceiling from _MICRO_TARGETS/_fixed_targets and just take the daily default.
 # Cholesterol has neither a target ceiling nor a UL here (see the note above
 # _MICRO_TARGETS) — it's tracked but never colours as a risk.
 # Each entry: key -> (horizon, upper_limit | None).
@@ -448,40 +431,17 @@ _NUTRIENT_KINETICS: Dict[str, Tuple[str, Optional[float]]] = {
     "zinc_mg":        (HORIZON_DAILY,   40.0),     # excess depletes copper
 }
 
-# Recomposition parameters (the user's chosen goal: lose fat, hold muscle). All
-# derive from the user's OWN measured data so the targets track the real body, not
-# a guess. Tunable here; a per-metric `source=manual` row in the sheet overrides
-# any of them.
-TDEE_WINDOW_DAYS = 14          # rolling average of measured total_cals_out
-RECOMP_DEFICIT = 0.125         # calorie target centre: 12.5% below measured TDEE
-CALORIE_WINDOW_HALF = 0.075    # window is centre ±7.5% of TDEE => a 5%-20% deficit
-PROTEIN_G_PER_KG = 2.0         # hero metric: 2.0 g per kg body weight (~140 g)
-
-# Per-goal energy and protein parameters. The goal is a SEPARATE axis from what the
-# user measures (see schema/capabilities.py): owning a scale doesn't say what you
-# are aiming at, and aiming at muscle gain doesn't require one. A negative deficit
-# is a surplus.
-#
-# Protein rises as the deficit deepens, which is not arbitrary: protein is what
-# decides whether the weight lost is fat or muscle, so the harder the cut the more
-# of it is needed. `health` has no body-composition goal at all and just takes the
-# adequacy figure.
-_GOAL_PARAMS: Dict[str, Dict[str, float]] = {
-    "recomposition": {"deficit": RECOMP_DEFICIT, "protein_g_per_kg": PROTEIN_G_PER_KG},
-    "fat_loss":      {"deficit": 0.20,           "protein_g_per_kg": 2.2},
-    "muscle_gain":   {"deficit": -0.10,          "protein_g_per_kg": 1.8},
-    "maintenance":   {"deficit": 0.0,            "protein_g_per_kg": 1.6},
-    "health":        {"deficit": 0.0,            "protein_g_per_kg": 1.2},
-}
-FAT_G_PER_KG = 0.8             # floor for hormonal health
-FAT_CEILING_MULTIPLIER = 1.25  # ceiling = floor × 1.25 (~1.0 g/kg)
+# The daily plan: 2000 kcal at a ~700 kcal deficit, protein-forward to hold muscle
+# through the cut. Fixed every day by design (see _fixed_targets) — this replaced
+# a system that recomputed calories/macros live from a rolling TDEE average, which
+# made the goal move day to day for no reason the app could explain to the user.
+FIXED_CALORIES_KCAL = 2000.0
+FIXED_PROTEIN_G = 165.0
+FIXED_FAT_G = 55.0
+FIXED_CARBS_G = 210.0
+CALORIE_WINDOW_KCAL = 75.0     # a fixed cushion around the target, not derived
 FIBER_G_PER_1000KCAL = 14.0    # standard fibre recommendation
 LIMIT_ENERGY_FRACTION = 0.10   # added sugar & saturated fat ceilings: 10% of energy
-# Fallbacks when the sheet has no measured history yet, so day one still has sane
-# targets instead of zeros.
-DEFAULT_TDEE = 2200.0
-DEFAULT_WEIGHT_KG = 70.0
-BMR_TO_TDEE = 1.45             # if only a scale BMR exists, lightly-active multiplier
 
 # Prepended to every prompt that carries images. One button on the phone sends
 # both meal photos and scale screenshots, so the model's first job is to say which
@@ -2249,15 +2209,6 @@ def _to_float(value: Any) -> Optional[float]:
     return number if math.isfinite(number) else None
 
 
-def _recent_average(rows: List[Dict[str, Any]], key: str, n: int) -> Optional[float]:
-    """Mean of the last `n` positive values of `key`. Rows arrive in sheet order
-    (ascending date), so the tail is the most recent — this is the rolling TDEE."""
-    values = [v for v in (_to_float(r.get(key)) for r in rows)
-              if v is not None and v > 0]
-    values = values[-n:]
-    return sum(values) / len(values) if values else None
-
-
 def _latest(rows: List[Dict[str, Any]], key: str) -> Optional[float]:
     """The most recent positive value of `key` (e.g. the last weigh-in)."""
     for row in reversed(rows):
@@ -2267,104 +2218,33 @@ def _latest(rows: List[Dict[str, Any]], key: str) -> Optional[float]:
     return None
 
 
-def _derive_targets(daily_rows: List[Dict[str, Any]],
-                    caps: Optional["caps_mod.Capabilities"] = None
-                    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """The macro targets computed from the best data this user actually has.
-    Returns (targets, basis) where `basis` is the inputs the numbers came from, so
-    the app can show them honestly.
-
-    Energy: a rolling TDEE (measured total_cals_out) adjusted by the goal's calorie
-    offset, as a soft window. Protein/fat scale with body weight; carbs fill the
-    remaining energy; fibre scales with the calorie target; the added-sugar and
-    saturated-fat ceilings are 10% of energy each.
-
-    **The source ladder is the whole point of the `caps` argument.** Each input
-    takes the best available layer and says which one it used:
-
-        measured  a real total_cals_out average / a real weigh-in
-        declared  what the user typed into the `config` tab (Mifflin-St Jeor for
-                  energy) — the only layer a friend with no watch and no scale has
-        default   the built-in constants, which describe nobody in particular
-
-    Without the declared layer a phone-only user got a hard-coded 2200 kcal and a
-    70 kg protein target no matter who they were; with it, the same code path
-    produces a target for their actual body. `basis.sources` records the choice per
-    input, so the app can label a number "medido" or "declarado" rather than
-    implying a measurement that never happened.
-    """
-    caps = caps or caps_mod.FULL
-    goal = _GOAL_PARAMS.get(caps.goal, _GOAL_PARAMS[caps_mod.DEFAULT_GOAL])
-    sources: Dict[str, str] = {}
-
-    tdee = _recent_average(daily_rows, "total_cals_out", TDEE_WINDOW_DAYS) \
-        if caps.has("activity") else None
-    if tdee is not None:
-        sources["tdee"] = SRC_MEASURED
-    else:
-        bmr = _latest(daily_rows, "bmr_kcal") if caps.has("body") else None
-        declared = caps.declared_tdee()
-        if bmr:
-            tdee, sources["tdee"] = bmr * BMR_TO_TDEE, SRC_MEASURED
-        elif declared is not None:
-            tdee, sources["tdee"] = declared, SRC_DECLARED
-        else:
-            tdee, sources["tdee"] = DEFAULT_TDEE, SRC_DEFAULT
-
-    weight = _latest(daily_rows, "weight_kg") if caps.has("body") else None
-    if weight is not None:
-        sources["weight"] = SRC_MEASURED
-    elif caps.declared_weight_kg is not None:
-        weight, sources["weight"] = caps.declared_weight_kg, SRC_DECLARED
-    else:
-        weight, sources["weight"] = DEFAULT_WEIGHT_KG, SRC_DEFAULT
-    lean = _latest(daily_rows, "lean_mass_kg") if caps.has("body") else None
-
-    deficit, protein_per_kg = goal["deficit"], goal["protein_g_per_kg"]
-    centre = tdee * (1 - deficit)
-    cal_floor = tdee * (1 - deficit - CALORIE_WINDOW_HALF)
-    cal_ceil = tdee * (1 - deficit + CALORIE_WINDOW_HALF)
-    protein = protein_per_kg * weight
-    fat = FAT_G_PER_KG * weight
-    carbs = max(0.0, (centre - 4 * protein - 9 * fat) / 4)
-    fiber = FIBER_G_PER_1000KCAL * centre / 1000
-    added_sugar = LIMIT_ENERGY_FRACTION * centre / 4
-    sat_fat = LIMIT_ENERGY_FRACTION * centre / 9
-
-    r10 = lambda x: float(round(x / 10) * 10)   # calories, to the nearest 10
-    rg = lambda x: float(round(x))              # grams, to the nearest 1
-
-    targets = {
-        "calories": {"kind": TARGET_WINDOW, "floor": r10(cal_floor),
-                     "ceiling": r10(cal_ceil), "unit": "kcal", "source": SRC_MEASURED},
-        "protein_g": {"kind": TARGET_REACH, "floor": rg(protein), "unit": "g",
-                      "source": SRC_MEASURED},
-        "fat_g": {"kind": TARGET_WINDOW, "floor": rg(fat),
-                  "ceiling": rg(fat * FAT_CEILING_MULTIPLIER), "unit": "g",
-                  "source": SRC_MEASURED},
-        "carbs_g": {"kind": TARGET_WINDOW, "floor": rg(carbs * 0.9),
-                    "ceiling": rg(carbs * 1.1), "unit": "g", "source": SRC_MEASURED},
-        "fiber_g": {"kind": TARGET_REACH, "floor": rg(fiber), "unit": "g",
-                    "source": SRC_MEASURED},
-        "added_sugar_g": {"kind": TARGET_LIMIT, "ceiling": rg(added_sugar),
-                          "unit": "g", "source": SRC_MEASURED},
-        "saturated_fat_g": {"kind": TARGET_LIMIT, "ceiling": rg(sat_fat),
-                            "unit": "g", "source": SRC_MEASURED},
+def _fixed_targets() -> Dict[str, Dict[str, Any]]:
+    """The daily plan: 2000 kcal at a ~700 kcal deficit, protein-forward to hold
+    muscle (165 g, ~2.4 g/kg). Fixed every day, on purpose — see conversation
+    2026-08-01. Fibre/added-sugar/saturated-fat ceilings still derive from the
+    calorie number (14 g fibre per 1000 kcal, 10% of energy each), they just no
+    longer move day to day since the calorie number they derive from doesn't."""
+    fiber = round(FIBER_G_PER_1000KCAL * FIXED_CALORIES_KCAL / 1000)
+    added_sugar = round(LIMIT_ENERGY_FRACTION * FIXED_CALORIES_KCAL / 4)
+    sat_fat = round(LIMIT_ENERGY_FRACTION * FIXED_CALORIES_KCAL / 9)
+    return {
+        "calories": {"kind": TARGET_WINDOW,
+                     "floor": FIXED_CALORIES_KCAL - CALORIE_WINDOW_KCAL,
+                     "ceiling": FIXED_CALORIES_KCAL + CALORIE_WINDOW_KCAL,
+                     "unit": "kcal", "source": SRC_FIXED},
+        "protein_g": {"kind": TARGET_REACH, "floor": FIXED_PROTEIN_G,
+                      "unit": "g", "source": SRC_FIXED},
+        "fat_g": {"kind": TARGET_REACH, "floor": FIXED_FAT_G,
+                  "unit": "g", "source": SRC_FIXED},
+        "carbs_g": {"kind": TARGET_REACH, "floor": FIXED_CARBS_G,
+                    "unit": "g", "source": SRC_FIXED},
+        "fiber_g": {"kind": TARGET_REACH, "floor": float(fiber),
+                    "unit": "g", "source": SRC_FIXED},
+        "added_sugar_g": {"kind": TARGET_LIMIT, "ceiling": float(added_sugar),
+                          "unit": "g", "source": SRC_FIXED},
+        "saturated_fat_g": {"kind": TARGET_LIMIT, "ceiling": float(sat_fat),
+                            "unit": "g", "source": SRC_FIXED},
     }
-    basis = {
-        "tdee_kcal": rg(tdee),
-        "calorie_target_kcal": r10(centre),
-        "weight_kg": round(weight, 2),
-        "lean_mass_kg": round(lean, 2) if lean is not None else None,
-        "protein_g_per_kg": protein_per_kg,
-        "calorie_deficit_pct": round(deficit * 100, 1),
-        "goal": caps.goal,
-        "goal_label_pt": caps_mod.GOAL_LABELS_PT.get(caps.goal, caps.goal),
-        # Which layer each input came from, so nothing is ever presented as
-        # measured when it was typed into a config tab.
-        "sources": sources,
-    }
-    return targets, basis
 
 
 def _micro_target_dict() -> Dict[str, Dict[str, Any]]:
@@ -2380,66 +2260,15 @@ def _micro_target_dict() -> Dict[str, Dict[str, Any]]:
     return out
 
 
-def _targets_from_grid(values: Optional[List[List[Any]]]
-                       ) -> Dict[str, Dict[str, Any]]:
-    """Parse the `targets` tab into metric -> target dict. These are the rows the
-    user can see and edit; a blank floor/ceiling is simply omitted.
-
-    `None` (the tab could not be read) yields {}, so `_resolve_targets` falls back to
-    the RDA defaults plus the live measured macros — complete and correct, just
-    without the user's own edits for that one request. Note this is last-wins on
-    duplicate metric rows, which is what kept the app behaving correctly while the
-    live tab silently accumulated 11 copies of everything.
-    """
-    out: Dict[str, Dict[str, Any]] = {}
-    for row in _rows_as_dicts(values or []):
-        metric = str(row.get("metric") or "").strip()
-        if not metric:
-            continue
-        target: Dict[str, Any] = {
-            "kind": str(row.get("kind") or "").strip() or TARGET_REACH,
-            "unit": str(row.get("unit") or "").strip(),
-            "source": str(row.get("source") or "").strip() or SRC_RDA,
-        }
-        floor = _to_float(row.get("floor"))
-        ceiling = _to_float(row.get("ceiling"))
-        if floor is not None:
-            target["floor"] = floor
-        if ceiling is not None:
-            target["ceiling"] = ceiling
-        out[metric] = target
-    return out
-
-
-def _resolve_targets(derived: Dict[str, Dict[str, Any]],
-                     tab: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """The full target set the app sees, layered so completeness and freshness are
-    both guaranteed regardless of whether the sheet has been seeded yet:
-
-      1. the RDA reference defaults (so every micro is always present);
-      2. the tab rows on top (the user's edits / manual overrides / any snapshot);
-      3. the measured macros, computed live, on top of that — EXCEPT where the user
-         pinned a metric with source=manual, which always wins.
-    """
-    final: Dict[str, Dict[str, Any]] = _micro_target_dict()
-    final.update(tab)
-    for metric, target in derived.items():
-        if tab.get(metric, {}).get("source") == SRC_MANUAL:
-            continue
-        final[metric] = target
-    return final
-
-
 def _with_kinetics(targets: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """Attach each metric's intrinsic biology to its target: a `horizon` (daily vs
     rolling) and, for a nutrient with a reachable toxicity ceiling (a UL) that has no
     ceiling yet, that UL as `ceiling`.
 
-    This is the last layer over _resolve_targets, applied only at the /today boundary
-    so the layering logic and its tests stay untouched. It is purely additive — a
-    user's own floor/ceiling (from the sheet) is never overwritten — and it is where
-    the app learns that a low vitamin-D day is fine (rolling) while an iron surplus is
-    not (a 45 mg ceiling)."""
+    Applied only at the /today boundary, over the merged fixed + RDA target dict.
+    It is purely additive — an existing floor/ceiling is never overwritten — and
+    it is where the app learns that a low vitamin-D day is fine (rolling) while an
+    iron surplus is not (a 45 mg ceiling)."""
     out: Dict[str, Dict[str, Any]] = {}
     for metric, target in targets.items():
         horizon, upper = _NUTRIENT_KINETICS.get(metric, (HORIZON_DAILY, None))
@@ -2649,10 +2478,10 @@ def _ensure_config_tab() -> None:
 
 
 def _seed_config(grid: List[List[Any]]) -> None:
-    """Materialise any missing config key into the sheet, exactly as `_seed_targets`
-    does for targets. Idempotent, so it is cheap to call on every read, and the
-    result is that a fresh sheet gains an editable, self-documenting description of
-    what this user measures instead of an empty grid."""
+    """Materialise any missing config key into the sheet. Idempotent, so it is
+    cheap to call on every read, and the result is that a fresh sheet gains an
+    editable, self-documenting description of what this user measures instead of
+    an empty grid."""
     existing = {str(r.get("key") or "").strip().lower()
                 for r in _rows_as_dicts(grid)}
     rows = [list(seed) for seed in caps_mod.CONFIG_SEED
@@ -2691,86 +2520,6 @@ def _capabilities() -> "caps_mod.Capabilities":
     _caps_cache.update({"at": now, "value": caps})
     return caps
 
-
-def _read_targets_grid() -> Optional[List[List[Any]]]:
-    """The raw `targets` tab, or **None if it could not be read**.
-
-    None and [] must stay distinguishable, and this is not a style point — conflating
-    them is what corrupted the tab once already. `_seed_targets` treats "no rows" as
-    "nothing is seeded yet" and appends the ENTIRE metric set. So when a transient
-    Sheets error (a 429, a 503, a network blip) was swallowed into `[]`, the next
-    read re-seeded all ~36 metrics on top of the ones already there. Ten such blips
-    left the live tab with 11 duplicate copies of every metric and 386 rows.
-
-    It stayed invisible because `_targets_from_grid` does `out[metric] = ...` in row
-    order — last-wins — so the app kept reading the newest copy and behaved
-    correctly while the tab silently grew.
-
-    Callers must treat None as "unknown, change nothing"; only [] may be seeded.
-    """
-    try:
-        return _read_tab(TARGETS_TAB)
-    except Exception:
-        app.logger.warning("targets tab unreadable — skipping seed this run",
-                           exc_info=True)
-        return None
-
-
-def _ensure_targets_tab() -> None:
-    meta = _execute(lambda: _sheets().spreadsheets().get(spreadsheetId=_sid()))
-    titles = {s["properties"]["title"] for s in meta.get("sheets", [])}
-    if TARGETS_TAB not in titles:
-        _execute(lambda: _sheets().spreadsheets().batchUpdate(
-            spreadsheetId=_sid(),
-            body={"requests": [{"addSheet": {
-                "properties": {"title": TARGETS_TAB}}}]}))
-    rng = f"{TARGETS_TAB}!A1:{TARGETS_LAST_COL}1"
-    current = _execute(lambda: _sheets().spreadsheets().values().get(
-        spreadsheetId=_sid(), range=rng)).get("values", [[]])
-    if not current or current[0] != TARGETS_TAB_HEADERS:
-        _execute(lambda: _sheets().spreadsheets().values().update(
-            spreadsheetId=_sid(), range=f"{TARGETS_TAB}!A1",
-            valueInputOption="RAW", body={"values": [TARGETS_TAB_HEADERS]}))
-
-
-def _target_seed_rows(existing: set,
-                      derived: Dict[str, Dict[str, Any]]) -> List[List[Any]]:
-    """Rows to APPEND so every known metric has a row, without touching a metric the
-    user already has (their edits are law). Micros seed as `rda`; the measured
-    macros seed as a snapshot — the live value is recomputed on every read anyway,
-    so the snapshot is just there to make the sheet self-explanatory and editable."""
-    seed = {**_micro_target_dict(), **derived}
-    rows: List[List[Any]] = []
-    for metric, target in seed.items():
-        if metric in existing:
-            continue
-        rows.append([metric, target.get("kind", ""),
-                     target.get("floor", ""), target.get("ceiling", ""),
-                     target.get("unit", ""), target.get("source", "")])
-    return rows
-
-
-def _seed_targets(grid: Optional[List[List[Any]]],
-                  derived: Dict[str, Dict[str, Any]]) -> None:
-    """Materialise any missing metric rows into the sheet. Idempotent: once every
-    metric has a row this appends nothing, so it's cheap to call on each read.
-
-    A `grid` of None means the tab could not be read (see `_read_targets_grid`). That
-    is NOT an empty tab, and seeding on it would append a full duplicate set of every
-    metric — the exact bug that grew the live tab to 11 copies. Do nothing instead:
-    a missed seed is fixed by the next successful read, a spurious one is permanent.
-    """
-    if grid is None:
-        return
-    existing = {str(r.get("metric") or "").strip() for r in _rows_as_dicts(grid)}
-    rows = _target_seed_rows(existing, derived)
-    if not rows:
-        return
-    _ensure_targets_tab()
-    _execute(lambda: _sheets().spreadsheets().values().append(
-        spreadsheetId=_sid(), range=f"{TARGETS_TAB}!A1",
-        valueInputOption="RAW", insertDataOption="INSERT_ROWS",
-        body={"values": rows}))
 
 
 # -- HTTP ------------------------------------------------------------------------
@@ -3478,12 +3227,11 @@ def today():
     for the day in progress. `consumed` therefore sums the meal rows the same way
     the list and totals do, extended to all 37 micronutrients.
 
-    `targets` merges three layers (see _resolve_targets): the RDA reference table,
-    the user's edits in the `targets` tab, and the calorie/macro targets derived
-    live from measured data, then each is stamped with its kinetics (`horizon` +, for
-    a nutrient with a reachable toxicity ceiling, that UL — see _with_kinetics).
-    `basis` exposes the inputs behind the derived numbers (TDEE, weight) so the app
-    can be honest about where they came from. `history` is the last
+    `targets` merges the RDA reference table with the fixed daily plan (see
+    _fixed_targets), then each is stamped with its kinetics (`horizon` +, for a
+    nutrient with a reachable toxicity ceiling, that UL — see _with_kinetics).
+    `basis` carries the fixed calorie target plus the latest measured weight/lean
+    mass, for the Profile screen's biometrics display. `history` is the last
     NUTRIENT_HISTORY_DAYS completed days of intake (same shape as `consumed`), so the
     app can read a buffered nutrient against its rolling average.
 
@@ -3500,15 +3248,7 @@ def today():
     meal_rows = [r for r in all_meal_rows               # today: consumed + the list
                  if str(r.get("datetime", "")).startswith(day)]
     caps = _capabilities()
-    daily_rows = _rows_as_dicts(_read_tab(DAILY_TAB))   # for the measured derivation
-    derived, basis = _derive_targets(daily_rows, caps)
-
-    grid = _read_targets_grid()
-    try:  # materialise the defaults into the sheet on first run; never fatal
-        _seed_targets(grid, derived)
-    except Exception:
-        app.logger.warning("targets seed skipped (non-fatal)", exc_info=True)
-    targets = _with_kinetics(_resolve_targets(derived, _targets_from_grid(grid)))
+    targets, basis = _resolved_targets_and_basis()
 
     meals_out = _today_meals_out(meal_rows)
     return jsonify({
@@ -3519,9 +3259,9 @@ def today():
         "basis": basis,
         "meals": meals_out,
         "history": _history_window(all_meal_rows, day, NUTRIENT_HISTORY_DAYS),
-        # The app draws itself from this: which tabs and sections exist at all, and
-        # what the goal is called. Rides along on a call the app already makes on
-        # every launch, so the switch costs no extra round trip.
+        # The app draws itself from this: which tabs and sections exist at all.
+        # Rides along on a call the app already makes on every launch, so the
+        # switch costs no extra round trip.
         "capabilities": caps.to_api(),
     }), 200
 
@@ -3608,13 +3348,16 @@ def _nutrient_policy() -> Dict[str, Any]:
 
 
 def _resolved_targets_and_basis() -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """The full target set (RDA + user edits + measured macros, stamped with kinetics)
-    and its basis — exactly what `/today` computes, factored out so every insights
-    endpoint reads the identical science."""
+    """The full target set (RDA + the fixed daily plan, stamped with kinetics) and
+    its basis — exactly what `/today` computes, factored out so every insights
+    endpoint reads the identical numbers."""
     daily_rows = _rows_as_dicts(_read_tab(DAILY_TAB))
-    derived, basis = _derive_targets(daily_rows, _capabilities())
-    targets = _with_kinetics(_resolve_targets(derived, _targets_from_grid(
-        _read_targets_grid())))
+    weight = _latest(daily_rows, "weight_kg")
+    lean = _latest(daily_rows, "lean_mass_kg")
+    basis = {"calorie_target_kcal": FIXED_CALORIES_KCAL,
+             "weight_kg": round(weight, 2) if weight is not None else None,
+             "lean_mass_kg": round(lean, 2) if lean is not None else None}
+    targets = _with_kinetics({**_micro_target_dict(), **_fixed_targets()})
     return targets, basis
 
 

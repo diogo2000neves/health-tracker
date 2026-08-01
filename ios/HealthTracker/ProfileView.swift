@@ -2,10 +2,9 @@
 //  ProfileView.swift
 //  HealthTracker
 //
-//  Perfil & objetivos — the goal, the body inputs the targets are derived from, and
-//  the derived targets themselves, shown read-only and honestly (every number names
-//  where it came from). Deep edits happen in the `targets` tab of the sheet, which
-//  this screen points to rather than duplicating.
+//  Perfil & objetivos — the latest measured biometrics and the fixed daily plan,
+//  shown read-only. The targets are constants in the backend (see
+//  backend/ingest/main.py's _fixed_targets), not derived from anything here.
 //
 
 import SwiftUI
@@ -18,12 +17,11 @@ struct ProfileView: View {
         NavigationStack {
             List {
                 if let r = store.response {
-                    goalSection(r)
                     bodySection(r.basis)
                     targetsSection(r)
                     measuringSection(r.caps)
                     Section {
-                        Text("Estes objetivos são calculados a partir dos teus próprios dados e atualizam-se sozinhos. Para ajustes finos, edita o separador `targets` na folha de cálculo; para mudar o que a app acompanha, o separador `config`.")
+                        Text("Estes objetivos são fixos e não mudam de dia para dia. Para os alterar, edita as constantes no backend; para mudar o que a app acompanha, o separador `config` na folha de cálculo.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                 } else {
@@ -40,46 +38,18 @@ struct ProfileView: View {
         }
     }
 
-    /// The goal comes from the `config` tab now. It used to read "Recomposição" for
-    /// everyone, which stops being true the moment a second person uses the app.
-    @ViewBuilder
-    private func goalSection(_ r: TodayResponse) -> some View {
-        let label = r.basis.goalLabelPt ?? r.caps.goalLabelPt
-        Section("Objetivo") {
-            HStack(alignment: .firstTextBaseline) {
-                Image(systemName: "target").foregroundStyle(Palette.muscle)
-                Text(label)
-                    .font(.subheadline)
-                    .multilineTextAlignment(.leading)
-            }
-        }
-    }
-
-    /// Each number says where it came from. A weight typed into the config tab and
-    /// a weight read off a scale are both useful, but they are not the same claim,
-    /// and showing them identically would be quietly dishonest.
+    /// The latest measured biometrics — real per-day readings, unrelated to the
+    /// fixed targets below.
     @ViewBuilder
     private func bodySection(_ basis: Basis) -> some View {
         Section("Corpo") {
             if basis.weightKg != nil {
-                row("Peso", value(basis.weightKg, "kg", decimals: 1),
-                    caption: basis.provenance("weight"))
+                row("Peso", value(basis.weightKg, "kg", decimals: 1), caption: "medido")
             }
             if basis.leanMassKg != nil {
                 row("Massa magra", value(basis.leanMassKg, "kg", decimals: 1),
                     caption: "medido")
             }
-            row("Gasto diário (TDEE)", value(basis.tdeeKcal, "kcal", decimals: 0),
-                caption: tdeeCaption(basis))
-        }
-    }
-
-    private func tdeeCaption(_ basis: Basis) -> String {
-        switch basis.sources?["tdee"] {
-        case "measured": return "média de 14 dias, medida"
-        case "declared": return "estimado a partir do que indicaste"
-        case "default":  return "valor por defeito — indica os teus dados no config"
-        default:         return "média de 14 dias, medida"
         }
     }
 
@@ -116,19 +86,17 @@ struct ProfileView: View {
     private func targetsSection(_ r: TodayResponse) -> some View {
         Section("Objetivos diários") {
             if let cal = r.targets["calories"] {
-                row("Calorias",
-                    "\(int(cal.floor))–\(int(cal.ceiling)) kcal",
-                    caption: "alvo ~\(int(r.basis.calorieTargetKcal)) · défice ~\(int(r.basis.calorieDeficitPct))%")
+                row("Calorias", "\(int(cal.floor))–\(int(cal.ceiling)) kcal",
+                    caption: "meta fixa ~\(int(r.basis.calorieTargetKcal)) kcal")
             }
             if let p = r.targets["protein_g"] {
-                row("Proteína", "\(int(p.floor)) g",
-                    caption: "\(fmt(r.basis.proteinGPerKg, 1)) g por kg de peso")
+                row("Proteína", "\(int(p.floor)) g", caption: "preserva massa muscular")
             }
             if let f = r.targets["fat_g"] {
-                row("Gordura", "≥ \(int(f.floor)) g", caption: "mínimo p/ saúde hormonal")
+                row("Gordura", "\(int(f.floor)) g", caption: "mínimo p/ saúde hormonal")
             }
             if let c = r.targets["carbs_g"] {
-                row("Hidratos", "\(int(c.floor))–\(int(c.ceiling)) g", caption: "preenche a energia restante")
+                row("Hidratos", "\(int(c.floor)) g", caption: "energia para os treinos")
             }
             if let fib = r.targets["fiber_g"] {
                 row("Fibra", "\(int(fib.floor)) g")
@@ -161,10 +129,5 @@ struct ProfileView: View {
     private func int(_ v: Double?) -> String {
         guard let v else { return "—" }
         return "\(Int(v.rounded()))"
-    }
-
-    private func fmt(_ v: Double?, _ decimals: Int) -> String {
-        guard let v else { return "—" }
-        return v.formatted(.number.precision(.fractionLength(decimals)))
     }
 }

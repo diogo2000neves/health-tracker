@@ -46,8 +46,7 @@ TARGETS = {
     "sodium_mg": {"kind": "limit", "ceiling": 2300, "unit": "mg", "horizon": "daily"},
 }
 
-BASIS = {"weight_kg": 70.0, "calorie_target_kcal": 1930, "protein_g_per_kg": 2.0,
-         "goal": "recomp"}
+BASIS = {"weight_kg": 70.0, "calorie_target_kcal": 1930}
 
 # ~30 nutrient keys, enough to read as a grounded (well-characterised) item.
 _GROUNDED = {f"k{i}_mg": 1.0 for i in range(30)}

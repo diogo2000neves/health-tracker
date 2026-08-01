@@ -132,10 +132,10 @@ class _FakeCLI:
         self.calls = []
 
     def call_claude_json(self, prompt, *, model, effort, timeout_s, require_key,
-                         tools):
+                         tools, source):
         self.calls.append({"prompt": prompt, "model": model, "effort": effort,
                            "timeout_s": timeout_s, "require_key": require_key,
-                           "tools": tools})
+                           "tools": tools, "source": source})
         if self.raises:
             raise self.raises
         return dict(self.answer)

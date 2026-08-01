@@ -145,7 +145,6 @@ struct TodayView: View {
 
                 CalorieHeroCard(response: r)
                 MacrosCard(response: r)
-                EnergyBalanceCard(response: r)
                 FlagsCard(response: r)
                 MealsCard(meals: r.meals, store: store, isReadOnly: isHistorical)
             }
@@ -281,46 +280,6 @@ private struct MacroRing: View {
         .sheet(isPresented: $showDetail) {
             MacroDetailSheet(response: response, key: key,
                             title: title, unit: "g", color: fill)
-        }
-    }
-}
-
-// MARK: - Energy balance (honest)
-
-private struct EnergyBalanceCard: View {
-    let response: TodayResponse
-
-    var body: some View {
-        let intake = response.consumed("calories")
-        let tdee = response.basis.tdeeKcal ?? 0
-        let plan = response.basis.calorieTargetKcal ?? 0
-        let scaleMax = max(intake, tdee, 1)
-
-        VStack(alignment: .leading, spacing: 12) {
-            SectionHeader(title: "Balanço energético", systemImage: "arrow.left.arrow.right")
-
-            bar(label: "Ingerido", value: intake, color: Palette.accent, scaleMax: scaleMax)
-            bar(label: "Gasto médio", value: tdee, color: Palette.neutral, scaleMax: scaleMax)
-
-            Text("Alvo de recomposição: ~\(Int(plan.rounded())) kcal (défice de ~\(Int((response.basis.calorieDeficitPct ?? 0).rounded()))%). "
-                 + "O gasto é a média dos últimos 14 dias; o dia ainda vai a meio.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .card()
-    }
-
-    @ViewBuilder
-    private func bar(label: String, value: Double, color: Color, scaleMax: Double) -> some View {
-        HStack(spacing: 12) {
-            Text(label)
-                .font(.subheadline)
-                .frame(width: 100, alignment: .leading)
-            TargetBar(fraction: value / scaleMax, fill: color, height: 12)
-            Text("\(Int(value.rounded()))")
-                .font(.subheadline.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .frame(width: 46, alignment: .trailing)
         }
     }
 }

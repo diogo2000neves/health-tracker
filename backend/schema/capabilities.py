@@ -93,41 +93,6 @@ DOMAIN_LABELS_PT: Dict[str, str] = {
     "digestion": "digestão",
 }
 
-# Goals. This is a SEPARATE axis from capability: what you own decides what can be
-# observed, the goal decides what the advice is for. Conflating them is why the old
-# ProfileView had "Recomposição" hard-coded for everyone.
-GOALS: Tuple[str, ...] = (
-    "recomposition",    # lose fat, hold muscle (the owner's)
-    "fat_loss",
-    "muscle_gain",
-    "maintenance",
-    "health",           # no body-composition goal; eat well, feel well
-)
-DEFAULT_GOAL = "recomposition"
-
-GOAL_LABELS_PT: Dict[str, str] = {
-    "recomposition": "recomposição corporal — perder gordura mantendo músculo",
-    "fat_loss": "perda de gordura",
-    "muscle_gain": "ganho de massa muscular",
-    "maintenance": "manutenção do peso e da composição atual",
-    "health": "comer melhor e sentir-se bem, sem objetivo de peso",
-}
-
-# Declared activity levels -> the multiplier applied to a computed BMR when there
-# is no measured expenditure to use instead. Standard Harris-Benedict/Mifflin
-# activity factors.
-ACTIVITY_FACTORS: Dict[str, float] = {
-    "sedentary": 1.2,
-    "light": 1.375,
-    "moderate": 1.55,
-    "active": 1.725,
-    "very_active": 1.9,
-}
-DEFAULT_ACTIVITY_LEVEL = "moderate"
-
-SEXES: Tuple[str, ...] = ("male", "female")
-
-
 def _clean_blocks(raw: Iterable[str]) -> Tuple[str, ...]:
     """Keep declaration order (so downstream output is stable), drop unknowns and
     duplicates. An unknown block name is ignored rather than fatal: this is
@@ -143,14 +108,6 @@ class Capabilities:
     have simply told us about themselves."""
 
     blocks: Tuple[str, ...] = TOGGLEABLE_BLOCKS
-    goal: str = DEFAULT_GOAL
-    # Declared, not measured. Every one is optional — an empty profile just means
-    # the built-in constants stay in charge.
-    sex: Optional[str] = None
-    age: Optional[int] = None
-    height_cm: Optional[float] = None
-    declared_weight_kg: Optional[float] = None
-    activity_level: str = DEFAULT_ACTIVITY_LEVEL
     # Which preset name (if any) produced `blocks`, purely so the UI can show it.
     preset: Optional[str] = None
 
@@ -217,31 +174,6 @@ class Capabilities:
         one, an absent one."""
         return self.has_all(*blocks)
 
-    # -- the declared body -----------------------------------------------------
-    def basal_metabolic_rate(self) -> Optional[float]:
-        """Mifflin-St Jeor from the DECLARED profile, or None if it is incomplete.
-
-        Only ever a fallback. A measured `bmr_kcal` off the scale, and better still
-        a measured `total_cals_out`, beat this every time — this exists so someone
-        with no hardware still gets a target that describes a body roughly their
-        size instead of a hard-coded 2200.
-        """
-        if self.age is None or self.height_cm is None \
-                or self.declared_weight_kg is None or self.sex not in SEXES:
-            return None
-        base = (10 * self.declared_weight_kg) + (6.25 * self.height_cm) \
-            - (5 * self.age)
-        return base + (5 if self.sex == "male" else -161)
-
-    def declared_tdee(self) -> Optional[float]:
-        """Declared BMR scaled by the declared activity level."""
-        bmr = self.basal_metabolic_rate()
-        if bmr is None:
-            return None
-        factor = ACTIVITY_FACTORS.get(self.activity_level,
-                                      ACTIVITY_FACTORS[DEFAULT_ACTIVITY_LEVEL])
-        return bmr * factor
-
     # -- serialisation ---------------------------------------------------------
     def to_api(self) -> Dict[str, Any]:
         """What the app is told. The app renders from this rather than from a
@@ -252,15 +184,6 @@ class Capabilities:
             "blocks": list(self.blocks),
             "domains": list(self.domains()),
             "blind_spots": list(self.blind_spots()),
-            "goal": self.goal,
-            "goal_label_pt": GOAL_LABELS_PT.get(self.goal, self.goal),
-            "declared": {
-                "sex": self.sex,
-                "age": self.age,
-                "height_cm": self.height_cm,
-                "weight_kg": self.declared_weight_kg,
-                "activity_level": self.activity_level,
-            },
         }
 
 
@@ -272,16 +195,6 @@ FULL = Capabilities(blocks=TOGGLEABLE_BLOCKS, preset="full")
 def from_preset(name: str, **overrides: Any) -> Capabilities:
     blocks = PRESETS.get(name, PRESETS[DEFAULT_PRESET])
     return Capabilities(blocks=_clean_blocks(blocks), preset=name, **overrides)
-
-
-def _num(value: Any) -> Optional[float]:
-    if value is None or value == "":
-        return None
-    try:
-        out = float(str(value).replace(",", "."))
-    except (TypeError, ValueError):
-        return None
-    return out
 
 
 def from_config(rows: Sequence[Dict[str, Any]]) -> Capabilities:
@@ -316,29 +229,7 @@ def from_config(rows: Sequence[Dict[str, Any]]) -> Capabilities:
         # the whole app off. Nutrition is the one block every user has.
         preset, cleaned = "nutrition", _clean_blocks(PRESETS["nutrition"])
 
-    goal = values.get("goal", "").strip().lower() or DEFAULT_GOAL
-    if goal not in GOALS:
-        goal = DEFAULT_GOAL
-
-    sex = values.get("sex", "").strip().lower() or None
-    if sex not in SEXES:
-        sex = None
-
-    age = _num(values.get("age"))
-    activity = values.get("activity_level", "").strip().lower()
-    if activity not in ACTIVITY_FACTORS:
-        activity = DEFAULT_ACTIVITY_LEVEL
-
-    return Capabilities(
-        blocks=cleaned,
-        goal=goal,
-        sex=sex,
-        age=int(age) if age is not None else None,
-        height_cm=_num(values.get("height_cm")),
-        declared_weight_kg=_num(values.get("weight_kg")),
-        activity_level=activity,
-        preset=preset,
-    )
+    return Capabilities(blocks=cleaned, preset=preset)
 
 
 # The rows written into a fresh `config` tab: the current behaviour, spelled out,
@@ -350,10 +241,4 @@ CONFIG_SEED: Tuple[Tuple[str, str, str], ...] = (
     ("blocks", DEFAULT_PRESET,
      "full | nutrition | nutrition_sleep | nutrition_activity, or an explicit "
      "list: nutrition, sleep, recovery, activity, body, self_report"),
-    ("goal", DEFAULT_GOAL, " | ".join(GOALS)),
-    ("sex", "", "male | female — only used when there is no measured body data"),
-    ("age", "", "years — only used when there is no measured body data"),
-    ("height_cm", "", "only used when there is no measured body data"),
-    ("weight_kg", "", "declared weight; a scale reading always wins over this"),
-    ("activity_level", DEFAULT_ACTIVITY_LEVEL, " | ".join(ACTIVITY_FACTORS)),
 )

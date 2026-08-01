@@ -129,7 +129,7 @@ def _set_config(monkeypatch, rows, daily=None):
 
 class TestTheOwnersCoach:
     def test_a_generation_carries_every_domain_into_the_prompt(self, wired):
-        _set_config(wired, [("blocks", "full"), ("goal", "recomposition")])
+        _set_config(wired, [("blocks", "full")])
         job = ingest._build_generation_job(TODAY, slot="morning", reason="test")
         assert job is not None
         prompt = job["prompt"]
@@ -173,9 +173,7 @@ class TestTheOwnersCoach:
 
 
 class TestTheFriendsCoach:
-    CONFIG = [("blocks", "nutrition"), ("goal", "health"),
-              ("sex", "female"), ("age", "31"), ("height_cm", "168"),
-              ("weight_kg", "64"), ("activity_level", "light")]
+    CONFIG = [("blocks", "nutrition")]
 
     def test_no_metric_findings_at_all(self, wired):
         _set_config(wired, self.CONFIG)
@@ -199,21 +197,6 @@ class TestTheFriendsCoach:
         assert "SONO E RECUPERAÇÃO" not in prompt
         assert "COMPOSIÇÃO CORPORAL" not in prompt
         assert "AS LIGAÇÕES" not in prompt
-        # ...and the goal is theirs, not the owner's.
-        assert "recomposição corporal" not in prompt
-
-    def test_targets_come_from_the_declared_body(self, wired):
-        _set_config(wired, self.CONFIG)
-        caps = ingest._capabilities()
-        # No measured rows are readable for a nutrition-only user even though the
-        # fixture sheet has them, because every body/activity column is gated off.
-        _targets, basis = ingest._derive_targets(daily_rows(), caps)
-        assert basis["sources"] == {"tdee": "declared", "weight": "declared"}
-        assert basis["weight_kg"] == 64.0
-        # Mifflin-St Jeor for a 31yo 168cm 64kg female, x1.375 for "light".
-        assert basis["tdee_kcal"] == pytest.approx(
-            ((10 * 64) + (6.25 * 168) - (5 * 31) - 161) * 1.375, rel=0.01)
-        assert basis["goal"] == "health"
 
     def test_the_daily_api_never_serves_a_block_they_do_not_have(self, wired):
         _set_config(wired, self.CONFIG)

@@ -710,12 +710,6 @@ def _blind_spots(facts: Dict[str, Any]) -> str:
             f"trabalho aqui é inteiramente sobre o que ela regista.")
 
 
-def _goal_line(facts: Dict[str, Any]) -> str:
-    """The user's actual goal, which is a different axis from what they measure."""
-    caps = facts.get("capabilities") or {}
-    label = str(caps.get("goal_label_pt") or "").strip()
-    return f"\n\nO OBJETIVO DESTA PESSOA: {label}." if label else ""
-
 _FEED_SCHEMA = """Devolve APENAS um objeto JSON com esta forma exata:
 {
   "next_meal": {
@@ -760,12 +754,11 @@ def build_feed_prompt(facts: Dict[str, Any]) -> str:
     answers pass through byte-identical validation.
 
     Assembled per generation rather than constant: the shared voice and rules, then
-    the goal, then the blind spots, then only the specialist frames for the domains
-    that actually have something to say today. A day of pure food findings produces
-    the same prompt this had before domains existed.
+    the blind spots, then only the specialist frames for the domains that actually
+    have something to say today. A day of pure food findings produces the same
+    prompt this had before domains existed.
     """
     return (f"{_FEED_RULES}"
-            f"{_goal_line(facts)}"
             f"{_blind_spots(facts)}\n\n"
             f"{_frames_for(facts)}\n\n"
             f"FACTOS (JSON, já calculados):\n"

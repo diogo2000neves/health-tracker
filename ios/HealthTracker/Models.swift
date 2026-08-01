@@ -70,7 +70,7 @@ struct Target: Decodable, Hashable {
     let floor: Double?      // reach: hit this. window: lower edge.
     let ceiling: Double?    // limit: stay under this. window: upper edge. reach: the UL.
     let unit: String
-    let source: String?     // "measured" | "rda" | "manual"
+    let source: String?     // "fixed" | "rda"
     let horizon: String?    // Horizon.daily / .rolling; nil on older payloads
 
     enum Kind {
@@ -104,58 +104,30 @@ struct Target: Decodable, Hashable {
     }
 }
 
-/// The inputs the measured targets were derived from — shown in Profile so the
-/// numbers are never a black box.
+/// The fixed daily plan plus the latest measured biometrics — shown in Profile.
 struct Basis: Decodable, Hashable {
-    let tdeeKcal: Double?
     let calorieTargetKcal: Double?
     let weightKg: Double?
     let leanMassKg: Double?
-    let proteinGPerKg: Double?
-    let calorieDeficitPct: Double?
-    let goal: String?
-    let goalLabelPt: String?
-    /// Which layer each input came from: "measured", "declared" or "default". The
-    /// Profile screen labels every number with it, so a figure typed into the config
-    /// tab is never shown as though a scale had produced it.
-    let sources: [String: String]?
 
     enum CodingKeys: String, CodingKey {
-        case tdeeKcal = "tdee_kcal"
         case calorieTargetKcal = "calorie_target_kcal"
         case weightKg = "weight_kg"
         case leanMassKg = "lean_mass_kg"
-        case proteinGPerKg = "protein_g_per_kg"
-        case calorieDeficitPct = "calorie_deficit_pct"
-        case goalLabelPt = "goal_label_pt"
-        case goal, sources
-    }
-
-    /// How a derived number should be described to the user, in pt-PT.
-    func provenance(_ key: String) -> String? {
-        switch sources?[key] {
-        case "measured": return "medido"
-        case "declared": return "indicado por ti"
-        case "default":  return "valor por defeito"
-        default:         return nil
-        }
     }
 }
 
-/// What this user measures, aims at, and has told us — the one switch the whole app
-/// reads. See `schema/capabilities.py`: a set of blocks, deliberately not a level,
-/// because someone with a watch but no scale is not "level 2.5".
+/// What this user measures — the one switch the whole app reads. See
+/// `schema/capabilities.py`: a set of blocks, deliberately not a level, because
+/// someone with a watch but no scale is not "level 2.5".
 struct Capabilities: Decodable, Hashable {
     let blocks: [String]
     let domains: [String]
     let blindSpots: [String]
-    let goal: String
-    let goalLabelPt: String
 
     enum CodingKeys: String, CodingKey {
-        case blocks, domains, goal
+        case blocks, domains
         case blindSpots = "blind_spots"
-        case goalLabelPt = "goal_label_pt"
     }
 
     /// Every block on — what every build before capabilities existed assumed, and
@@ -163,8 +135,7 @@ struct Capabilities: Decodable, Hashable {
     static let full = Capabilities(
         blocks: ["self_report", "sleep", "recovery", "activity", "nutrition", "body"],
         domains: ["nutrition", "sleep", "activity", "body", "digestion"],
-        blindSpots: [], goal: "recomposition",
-        goalLabelPt: "recomposição corporal — perder gordura mantendo músculo")
+        blindSpots: [])
 
     func has(_ block: String) -> Bool { blocks.contains(block) }
 

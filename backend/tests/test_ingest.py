@@ -1311,12 +1311,6 @@ def test_edit_meal_only_writes_the_touched_columns(monkeypatch):
 
 
 # -- targets: the per-metric goals (the foundation of the whole app) ------------
-def test_targets_tab_headers_match_the_spec():
-    assert ingest.TARGETS_TAB_HEADERS == [
-        "metric", "kind", "floor", "ceiling", "unit", "source"]
-    assert ingest.TARGETS_LAST_COL == "F"
-
-
 def test_micro_targets_are_adult_male_references():
     micro = ingest._micro_target_dict()
     # a reach floor is the RDA/AI; a limit carries a ceiling instead
@@ -1336,41 +1330,21 @@ def test_micro_targets_are_adult_male_references():
     assert len(micro) == len(ingest._MICRO_TARGETS)
 
 
-def test_derive_targets_from_measured_data():
-    # a rolling TDEE from measured total_cals_out; body from the latest weigh-in
-    daily = [
-        {"total_cals_out": 2400, "weight_kg": 70.5, "lean_mass_kg": 56.5, "bmr_kcal": 1588},
-        {"total_cals_out": 2600, "weight_kg": 70.2, "lean_mass_kg": 56.4},
-        {"total_cals_out": 2200, "weight_kg": 70.0, "lean_mass_kg": 56.3},
-    ]
-    t, b = ingest._derive_targets(daily)
-    assert b["tdee_kcal"] == 2400.0                 # mean of the three days
-    assert b["calorie_target_kcal"] == 2100.0       # 12.5% below TDEE
-    assert b["weight_kg"] == 70.0                    # LATEST, not the mean
-    assert b["lean_mass_kg"] == 56.3
-    assert b["goal"] == "recomposition" and b["protein_g_per_kg"] == 2.0
-    # Every input names the layer it came from, so nothing declared is ever
-    # presented as measured.
-    assert b["sources"] == {"tdee": "measured", "weight": "measured"}
-    assert t["protein_g"] == {"kind": "reach", "floor": 140.0, "unit": "g",
-                              "source": "measured"}          # 2.0 g/kg * 70
-    assert t["fat_g"]["floor"] == 56.0                       # 0.8 * 70
+def test_fixed_targets_returns_the_daily_plan():
+    t = ingest._fixed_targets()
     assert t["calories"]["kind"] == "window"
-    assert t["calories"]["floor"] == 1920.0 and t["calories"]["ceiling"] == 2280.0
-    assert t["fiber_g"]["floor"] == 29.0                     # 14 g / 1000 kcal
+    assert t["calories"]["floor"] == 1925.0 and t["calories"]["ceiling"] == 2075.0
+    assert t["protein_g"] == {"kind": "reach", "floor": 165.0, "unit": "g",
+                              "source": "fixed"}
+    assert t["fat_g"] == {"kind": "reach", "floor": 55.0, "unit": "g",
+                          "source": "fixed"}
+    assert t["carbs_g"] == {"kind": "reach", "floor": 210.0, "unit": "g",
+                            "source": "fixed"}
+    assert t["fiber_g"]["floor"] == 28.0                     # 14 g / 1000 kcal * 2000
     assert t["saturated_fat_g"]["kind"] == "limit"           # ceiling, not a floor
     assert "ceiling" in t["saturated_fat_g"] and "floor" not in t["saturated_fat_g"]
-
-
-def test_derive_targets_falls_back_without_history():
-    t, b = ingest._derive_targets([])
-    assert b["tdee_kcal"] == ingest.DEFAULT_TDEE
-    assert b["weight_kg"] == ingest.DEFAULT_WEIGHT_KG
-    assert b["lean_mass_kg"] is None
-    assert t["protein_g"]["floor"] == 140.0     # 2.0 * default 70
-    # a scale BMR alone still beats the flat default TDEE
-    _, b2 = ingest._derive_targets([{"bmr_kcal": 1600}])
-    assert b2["tdee_kcal"] == float(round(1600 * ingest.BMR_TO_TDEE))
+    # the same plan every time — nothing here depends on measured data
+    assert ingest._fixed_targets() == t
 
 
 def test_todays_consumed_sums_macros_and_micros_excluding_stubs():
@@ -1394,78 +1368,6 @@ def test_todays_consumed_sums_macros_and_micros_excluding_stubs():
     assert c["iron_mg"] == 3.0          # 2.0 + 1.0, summed across meals' items
     assert c["zinc_mg"] == 3.0
     assert "calcium_mg" not in c        # nothing supplied it -> omitted, not a zero
-
-
-def test_targets_from_grid_parses_and_omits_blanks():
-    grid = [ingest.TARGETS_TAB_HEADERS,
-            ["protein_g", "reach", 140, "", "g", "measured"],
-            ["sodium_mg", "limit", "", 2300, "mg", "rda"],
-            ["", "", "", "", "", ""]]                          # blank metric -> ignored
-    parsed = ingest._targets_from_grid(grid)
-    assert parsed["protein_g"] == {"kind": "reach", "unit": "g",
-                                   "source": "measured", "floor": 140.0}
-    assert "ceiling" not in parsed["protein_g"]                # blank cell omitted
-    assert parsed["sodium_mg"]["ceiling"] == 2300.0
-    assert "floor" not in parsed["sodium_mg"]
-    assert len(parsed) == 2
-
-
-def test_resolve_targets_layers_defaults_then_tab_then_measured():
-    derived, _ = ingest._derive_targets([{"total_cals_out": 2400, "weight_kg": 70}])
-    tab = {
-        "calories": {"kind": "window", "floor": 1500.0, "ceiling": 1800.0,
-                     "unit": "kcal", "source": "manual"},   # user pinned it
-        "iron_mg": {"kind": "reach", "floor": 10.0, "unit": "mg", "source": "rda"},
-    }
-    final = ingest._resolve_targets(derived, tab)
-    assert final["vitamin_c_mg"]["floor"] == 90.0     # default present w/o a tab row
-    assert final["iron_mg"]["floor"] == 10.0          # a tab edit of a default wins
-    assert final["protein_g"]["floor"] == 140.0       # measured, computed live...
-    assert final["calories"]["source"] == "manual"    # ...unless pinned manual
-    assert final["calories"]["floor"] == 1500.0
-
-
-def test_target_seed_rows_only_adds_missing_metrics():
-    derived, _ = ingest._derive_targets([])
-    rows_all = ingest._target_seed_rows(set(), derived)       # nothing seeded yet
-    metrics = {r[0] for r in rows_all}
-    assert "iron_mg" in metrics and "protein_g" in metrics
-    assert len(rows_all) == len(ingest._MICRO_TARGETS) + len(derived)
-    # a metric the user already has is never re-seeded (their edits are law)
-    rows_some = ingest._target_seed_rows({"iron_mg", "protein_g"}, derived)
-    assert {"iron_mg", "protein_g"}.isdisjoint({r[0] for r in rows_some})
-    assert len(rows_some) == len(rows_all) - 2
-
-
-def test_unreadable_targets_tab_never_reseeds(monkeypatch):
-    """An unreadable tab must NOT be treated as an empty one.
-
-    Regression test for the bug that grew the live `targets` tab to 386 rows:
-    `_read_targets_grid` swallowed every exception into `[]`, `_seed_targets` read
-    that as "nothing seeded yet" and appended the whole ~36-metric set. Ten transient
-    Sheets errors left 11 duplicate copies of every metric. It hid for months because
-    `_targets_from_grid` is last-wins, so the app kept reading the newest copy.
-    """
-    derived, _ = ingest._derive_targets([])
-
-    # a failing read yields None (the "unknown" signal), never []
-    monkeypatch.setattr(ingest, "_read_tab",
-                        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("503")))
-    assert ingest._read_targets_grid() is None
-
-    # and None must append nothing at all
-    appended = []
-    monkeypatch.setattr(ingest, "_ensure_targets_tab", lambda: None)
-    monkeypatch.setattr(ingest, "_execute", lambda fn: appended.append(fn))
-    ingest._seed_targets(None, derived)
-    assert appended == [], "an unreadable tab must never trigger a re-seed"
-
-    # a genuinely empty tab still seeds — the first-run path must keep working
-    ingest._seed_targets([], derived)
-    assert appended, "an empty tab is the first-run case and must still seed"
-
-    # and None degrades to defaults rather than exploding
-    assert ingest._targets_from_grid(None) == {}
 
 
 # -- kinetics: the biology stamped onto each target -----------------------------
@@ -1562,23 +1464,12 @@ _TODAY_MEALS_GRID = [
      100, 5, 5, 5, 0.5, "m", "", 100, "sha4", "", ""],
 ]
 
-# A partly-populated targets tab: one plain rda row, plus two manual overrides.
-_TODAY_TARGETS_GRID = [
-    ingest.TARGETS_TAB_HEADERS,
-    ["iron_mg", "reach", 8, "", "mg", "rda"],
-    ["calories", "window", 1500, 1800, "kcal", "manual"],     # user pinned calories
-    ["sodium_mg", "limit", "", 2000, "mg", "manual"],         # user tightened sodium
-]
-
-
-def _today_client(monkeypatch, meals=None, daily=None, targets=None):
+def _today_client(monkeypatch, meals=None, daily=None):
     grids = {
         ingest.MEALS_TAB: _TODAY_MEALS_GRID if meals is None else meals,
         ingest.DAILY_TAB: _TODAY_DAILY_GRID if daily is None else daily,
-        ingest.TARGETS_TAB: _TODAY_TARGETS_GRID if targets is None else targets,
     }
     monkeypatch.setattr(ingest, "_read_tab", lambda tab: grids.get(tab, []))
-    monkeypatch.setattr(ingest, "_seed_targets", lambda *a, **k: None)  # no writes
     monkeypatch.setenv("INGEST_TOKEN", "t")
     monkeypatch.setenv("HEALTH_SPREADSHEET_ID", "sid")
     return ingest.app.test_client()
@@ -1607,19 +1498,16 @@ def test_today_sums_live_consumed_macros_and_micros(monkeypatch):
     assert "vitamin_c_mg" not in c                    # nothing supplied it
 
 
-def test_today_attaches_targets_layered_over_defaults(monkeypatch):
+def test_today_attaches_the_fixed_targets_and_rda_defaults(monkeypatch):
     t = _today_client(monkeypatch).get(
         "/today?date=2026-07-18", headers=_HDR).get_json()["targets"]
-    # a measured macro, computed live from the user's own data
-    assert t["protein_g"] == {"kind": "reach", "floor": 140.0, "unit": "g",
-                              "source": "measured", "horizon": "daily"}
-    # an RDA default present though it isn't in the tab at all
+    # the fixed daily plan, regardless of the user's own data
+    assert t["protein_g"] == {"kind": "reach", "floor": 165.0, "unit": "g",
+                              "source": "fixed", "horizon": "daily"}
+    assert t["calories"]["floor"] == 1925.0 and t["calories"]["ceiling"] == 2075.0
+    # an RDA default present alongside the fixed macros
     assert t["vitamin_c_mg"]["floor"] == 90.0 and t["vitamin_c_mg"]["source"] == "rda"
-    # a manual override WINS over the measured calorie window
-    assert t["calories"]["source"] == "manual"
-    assert t["calories"]["floor"] == 1500.0 and t["calories"]["ceiling"] == 1800.0
-    # a manual micro override wins over the rda default (2300 -> 2000)
-    assert t["sodium_mg"]["ceiling"] == 2000.0 and t["sodium_mg"]["source"] == "manual"
+    assert t["sodium_mg"]["ceiling"] == 2300.0 and t["sodium_mg"]["source"] == "rda"
 
 
 def test_today_stamps_horizon_and_returns_the_rolling_history(monkeypatch):
@@ -1638,11 +1526,11 @@ def test_today_stamps_horizon_and_returns_the_rolling_history(monkeypatch):
     assert hist[0]["consumed"]["iron_mg"] == 99.0
 
 
-def test_today_basis_exposes_the_derivation_inputs(monkeypatch):
+def test_today_basis_exposes_the_fixed_target_and_measured_weight(monkeypatch):
     b = _today_client(monkeypatch).get(
         "/today?date=2026-07-18", headers=_HDR).get_json()["basis"]
-    assert b["tdee_kcal"] == 2400.0 and b["weight_kg"] == 70.0
-    assert b["protein_g_per_kg"] == 2.0 and b["goal"] == "recomposition"
+    assert b["calorie_target_kcal"] == 2000.0
+    assert b["weight_kg"] == 70.0 and b["lean_mass_kg"] == 56.3
 
 
 def test_today_meals_carry_per_item_nutrients_for_drilldown(monkeypatch):

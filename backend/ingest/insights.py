@@ -354,8 +354,6 @@ def build_diagnosis(*, ref_day: str, window_days: int,
         "basis": {
             "weight_kg": basis.get("weight_kg"),
             "calorie_target_kcal": basis.get("calorie_target_kcal"),
-            "protein_g_per_kg": basis.get("protein_g_per_kg"),
-            "goal": basis.get("goal"),
         },
     }
 

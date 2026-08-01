@@ -238,23 +238,14 @@ class TestPromptComposition:
         # Silence is not enough: a model given no sleep data still writes
         # confident sleep advice unless it is told the data does not exist.
         prompt = self._prompt(capabilities={
-            "blind_spots": ["sleep", "activity", "body"],
-            "goal_label_pt": "comer melhor"})
+            "blind_spots": ["sleep", "activity", "body"]})
         assert "O QUE NÃO VÊS" in prompt
         assert "sono e recuperação" in prompt
         assert "composição corporal" in prompt
 
     def test_a_full_capability_states_no_blind_spots(self):
-        prompt = self._prompt(capabilities={"blind_spots": [],
-                                            "goal_label_pt": "recomposição"})
+        prompt = self._prompt(capabilities={"blind_spots": []})
         assert "O QUE NÃO VÊS" not in prompt
-
-    def test_the_goal_is_carried_not_hard_coded(self):
-        # It used to say "recomposição corporal" for everyone, which is wrong the
-        # moment a second person uses the app.
-        prompt = self._prompt(capabilities={"blind_spots": [],
-                                            "goal_label_pt": "ganho de massa"})
-        assert "ganho de massa" in prompt
 
     def test_the_schema_offers_the_link_kind(self):
         assert "link" in narrator._FEED_SCHEMA
