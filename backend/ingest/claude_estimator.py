@@ -205,7 +205,7 @@ def analyze(prompt: str, images: Optional[List[Tuple[bytes, str]]] = None,
 
         data = cli.call_claude_json(
             full, model=model(), effort=effort(), timeout_s=timeout_s(),
-            require_key="kind", tools=tools)
+            require_key="kind", tools=tools, source="ingest.claude_estimator")
         log.info("claude estimated a meal (%s, %s effort, %d image(s))",
                  data.get("_model_id") or model(), effort(), len(images))
         return data

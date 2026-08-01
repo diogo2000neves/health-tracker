@@ -146,7 +146,8 @@ def estimate(note: str, img_paths: List[Path], *, model: str = DEFAULT_MODEL,
     `_model_id`/`_cost_usd`. Raises claude_cli.ClaudeError on failure."""
     prompt = build_prompt(note, img_paths)
     result = claude_cli.call_claude_json(
-        prompt, model=model, effort=effort, timeout_s=timeout_s)
+        prompt, model=model, effort=effort, timeout_s=timeout_s,
+        source="audit.estimate")
     items = nutrients.normalize_items(result.get("items"))
     return {
         "items": items,

@@ -27,10 +27,45 @@ import logging
 import os
 import shutil
 import subprocess
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 log = logging.getLogger("nutrition-audit")
+
+# Every caller of this module funnels through call_claude_json, so this is the one
+# place that sees every prompt sent to Claude — the coach's reports and chat, and
+# the nutrition-audit pipeline's estimate/adjudicate/ground/eval stages alike. One
+# line per call: when, which model was asked for and which one actually answered,
+# how long it took, what it cost, and the prompt itself. Meant for answering "how
+# many requests are we making and to which model" while the coach is still new
+# enough to need watching closely.
+_CALL_LOG = Path(__file__).resolve().parent / "logs" / "calls.jsonl"
+
+
+def _log_call(*, prompt: str, model: str, effort: str, started: float,
+             status: str, source: str, answered_by: Optional[str] = None,
+             cost_usd: Optional[float] = None, error: Optional[str] = None) -> None:
+    entry = {
+        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source": source,
+        "model": model,
+        "answered_by": answered_by,
+        "effort": effort,
+        "duration_s": round(time.monotonic() - started, 1),
+        "status": status,
+        "cost_usd": cost_usd,
+        "error": error,
+        "prompt": prompt,
+    }
+    try:
+        _CALL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _CALL_LOG.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
+
 
 # Falls back to whatever `claude` is on PATH. The old default was a hard-coded
 # MacBook nvm path; on the laptop that resolves to nothing and every call fails
@@ -55,11 +90,37 @@ class ClaudeError(RuntimeError):
 
 
 def call_claude_json(prompt: str, *, model: str, effort: str,
-                     timeout_s: int, require_key: str = "items",
+                     timeout_s: int, source: str, require_key: str = "items",
                      tools: str = "Read") -> Dict[str, Any]:
     """Run the headless CLI and return the first JSON object carrying `require_key`.
     Attaches `_cost_usd` and `_model_id` from the CLI envelope. Raises ClaudeError
     on any failure so the caller decides how to degrade.
+
+    `source` identifies the caller (e.g. "audit.estimate", "coach") so the usage
+    log can be broken down by feature, not just totalled.
+
+    Every call — answered or failed — is recorded to `_CALL_LOG` before this
+    returns or raises, regardless of which caller made it.
+    """
+    started = time.monotonic()
+    try:
+        result = _run_claude_json(prompt, model=model, effort=effort,
+                                  timeout_s=timeout_s, require_key=require_key,
+                                  tools=tools)
+    except ClaudeError as exc:
+        _log_call(prompt=prompt, model=model, effort=effort, started=started,
+                  status="error", source=source, error=str(exc))
+        raise
+    _log_call(prompt=prompt, model=model, effort=effort, started=started,
+              status="ok", source=source, answered_by=result.get("_model_id"),
+              cost_usd=result.get("_cost_usd"))
+    return result
+
+
+def _run_claude_json(prompt: str, *, model: str, effort: str,
+                     timeout_s: int, require_key: str,
+                     tools: str) -> Dict[str, Any]:
+    """The actual CLI invocation. See `call_claude_json` for the public contract.
 
     `tools` is the exact tool budget for the call. "Read" is what the audit needs (to
     open the meal images). Pass "" for a pure reasoning call: a prompt that needs no

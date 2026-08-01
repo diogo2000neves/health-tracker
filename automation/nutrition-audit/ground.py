@@ -107,7 +107,8 @@ def _match_with_model(items: List[Dict[str, Any]],
     try:
         result = claude_cli.call_claude_json(
             prompt, model=MATCH_MODEL, effort=MATCH_EFFORT,
-            timeout_s=MATCH_TIMEOUT_S, require_key="matches")
+            timeout_s=MATCH_TIMEOUT_S, require_key="matches",
+            source="audit.ground")
         chosen: Dict[int, Optional[int]] = {}
         for m in result.get("matches", []):
             idx = m.get("item_index")

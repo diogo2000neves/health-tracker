@@ -1,0 +1,20 @@
+[Unit]
+Description=Health Tracker Claude call log sync — push calls.jsonl into the claude_calls Sheet tab
+Documentation=file://%h/projects/health-tracker/automation/nutrition-audit/sync_calls_to_sheet.py
+After=network-online.target health-tracker-api.service
+Wants=network-online.target
+OnFailure=health-tracker-alert@%n.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/health-tracker/env
+
+# Mirrors the local calls.jsonl log (every audit + coach + ingest.claude_estimator
+# call, see claude_cli.py) into the shared Sheet, so usage/cost is visible without
+# shelling into this machine. Batched and incremental — see the module docstring.
+ExecStart=%h/projects/health-tracker/backend/venv/bin/python \
+    %h/projects/health-tracker/automation/nutrition-audit/sync_calls_to_sheet.py
+
+WorkingDirectory=%h/projects/health-tracker
+
+TimeoutStartSec=300

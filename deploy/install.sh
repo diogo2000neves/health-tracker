@@ -47,6 +47,10 @@ UNITS=(
   # (insights next-meal is deliberately NOT here: the coach supersedes it.)
   health-tracker-insights-weekly.service
   health-tracker-insights-weekly.timer
+  # Mirrors the local Claude call log (calls.jsonl) into the shared Sheet. Without
+  # it the log only ever exists on this machine.
+  health-tracker-calls-sync.service
+  health-tracker-calls-sync.timer
 )
 # What actually gets enabled. The daily and coach *services* are deliberately
 # absent: they are started by their timers (and the daily one by a weigh-in),
@@ -71,6 +75,7 @@ ENABLE=(
   health-tracker-coach-worker.timer
   health-tracker-audit.timer
   health-tracker-insights-weekly.timer
+  health-tracker-calls-sync.timer
 )
 
 say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }

@@ -129,7 +129,8 @@ def answer(job: Dict[str, Any]) -> Dict[str, Any]:
     # with a prose summary where the JSON should have been.
     result = claude_cli.call_claude_json(
         job["prompt"], model=model, effort=effort, timeout_s=timeout,
-        require_key=job.get("require_key", "cards"), tools="")
+        require_key=job.get("require_key", "cards"), tools="",
+        source="coach")
     log.info("job %s answered in %.1fs (cost %s)", job["id"],
              time.monotonic() - started, result.get("_cost_usd"))
     return result

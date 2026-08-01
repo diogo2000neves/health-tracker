@@ -168,7 +168,8 @@ def adjudicate(note: str, img_paths: List[Path], estimates: List[Dict[str, Any]]
         estimates="\n\n".join(blocks),
     )
     result = claude_cli.call_claude_json(
-        prompt, model=model, effort=effort, timeout_s=timeout_s)
+        prompt, model=model, effort=effort, timeout_s=timeout_s,
+        source="audit.adjudicate")
 
     # Normalize items but preserve the resolution metadata (normalize_items drops
     # unknown keys), so re-attach it by position.

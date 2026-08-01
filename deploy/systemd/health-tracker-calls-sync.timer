@@ -1,0 +1,17 @@
+[Unit]
+Description=Sync the Claude call log to the Sheet every 30 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+
+# Catch up a missed run (laptop asleep) rather than silently skipping it — this is
+# a log mirror, not a live poll, so a delayed sync is still worth doing.
+Persistent=true
+
+# Offset from the audit/coach timers so this doesn't contend with them for the
+# same usage window.
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target
