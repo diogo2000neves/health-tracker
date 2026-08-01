@@ -166,6 +166,8 @@ enum CoachCardKind: String {
     case checkIn = "check_in"
     case daySummary = "day_summary"
     case weeklyReview = "weekly_review"
+    case monthlyReview = "monthly_review"
+    case yearlyReview = "yearly_review"
     case nextMeal = "next_meal"
     case pattern
     /// A measured relationship between two areas of the user's life (late dinners
@@ -186,6 +188,8 @@ enum CoachCardKind: String {
         case .checkIn: return "COMO VAI O DIA"
         case .daySummary: return "DIA FECHADO"
         case .weeklyReview: return "A TUA SEMANA"
+        case .monthlyReview: return "O TEU MÊS"
+        case .yearlyReview: return "O TEU ANO"
         case .nextMeal: return "A PRÓXIMA REFEIÇÃO"
         case .pattern: return "UM PADRÃO"
         case .link: return "UMA LIGAÇÃO"
@@ -200,6 +204,8 @@ enum CoachCardKind: String {
         case .checkIn: return "clock.badge.checkmark.fill"
         case .daySummary: return "moon.stars.fill"
         case .weeklyReview: return "calendar"
+        case .monthlyReview: return "calendar"
+        case .yearlyReview: return "calendar"
         case .nextMeal: return "fork.knife"
         case .pattern: return "chart.bar.doc.horizontal.fill"
         case .link: return "arrow.triangle.branch"
@@ -214,7 +220,7 @@ enum CoachCardKind: String {
         case .pattern: return Palette.warningText
         case .link: return Palette.muscle
         case .nextMeal: return Palette.accentText
-        case .weeklyReview: return Palette.protein
+        case .weeklyReview, .monthlyReview, .yearlyReview: return Palette.protein
         default: return Palette.accentText
         }
     }

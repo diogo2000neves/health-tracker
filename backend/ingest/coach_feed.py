@@ -125,6 +125,8 @@ _TTL_HOURS = {
     # act on something structural.
     "link": 5 * 24,
     "weekly_review": 8 * 24,
+    "monthly_review": 8 * 24,
+    "yearly_review": 8 * 24,
     "win": 48,
 }
 
@@ -136,6 +138,8 @@ _PRIORITY = {
     "day_plan": 90,
     "day_summary": 88,
     "weekly_review": 80,
+    "monthly_review": 80,
+    "yearly_review": 80,
     # Above a plain pattern: a link is the rarest thing the coach produces and the
     # one the user could not have worked out alone. Still below the cards about
     # today, which are what the app was opened for.

@@ -311,13 +311,16 @@ def assemble_report(answer: Dict[str, Any], *, period: str, key: str,
 def as_card_fields(report: Dict[str, Any]) -> Dict[str, Any]:
     """The report reduced to a feed card. The card is the doorway; the full report
     lives in the archive and is read in the app's history."""
+    period = report.get("period")
     label = {"weekly": "A tua semana", "monthly": "O teu mês",
-             "yearly": "O teu ano"}.get(report.get("period"), "Revisão")
+             "yearly": "O teu ano"}.get(period, "Revisão")
+    kind = {"weekly": "weekly_review", "monthly": "monthly_review",
+            "yearly": "yearly_review"}.get(period, "weekly_review")
     body = report.get("summary") or ""
     focus = report.get("focus") or {}
     if focus.get("label"):
         body = f"{body} Foco: {focus['label']}."
-    return {"kind": "weekly_review",
+    return {"kind": kind,
             "title": report.get("headline") or label,
             "body": body.strip(),
             "chips": [{"label": f"{label} · {report.get('key')}", "tone": "neutral"}]}

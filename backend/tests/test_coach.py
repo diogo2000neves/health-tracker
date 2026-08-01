@@ -1659,3 +1659,17 @@ class TestReportPeriods:
              "summary": "Correu assim.", "focus": {"label": "peixe 2x"}})
         assert card["kind"] == "weekly_review"
         assert "peixe 2x" in card["body"]
+
+    def test_a_monthly_report_gets_its_own_card_kind(self):
+        """A monthly review must not be tagged as a weekly one — that's what made the
+        app show 'A tua semana' on a month's worth of review."""
+        card = reports.as_card_fields(
+            {"period": "monthly", "key": "2026-07", "headline": "O mês"})
+        assert card["kind"] == "monthly_review"
+        assert card["chips"][0]["label"].startswith("O teu mês")
+
+    def test_a_yearly_report_gets_its_own_card_kind(self):
+        card = reports.as_card_fields(
+            {"period": "yearly", "key": "2026", "headline": "O ano"})
+        assert card["kind"] == "yearly_review"
+        assert card["chips"][0]["label"].startswith("O teu ano")
