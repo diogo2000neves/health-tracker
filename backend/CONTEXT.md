@@ -196,6 +196,72 @@ log, never a scale reading (there's no screen to OCR), so `analyze_text` runs wi
 Cloud Tasks retry just re-sets TRUE). Keyed on the **local day the note was sent**,
 not the waking-day grain nutrition uses.
 
+### Source 5 — Strength training (a Hevy screenshot)
+
+The gym app is the sensor; a screenshot of the finished session is the capture. It
+enters through the **same `POST /ingest`** as everything else and the model routes
+it — `ROUTER_PREFIX` now forks three ways (`meal` / `body` / `workout`), so there is
+no new endpoint, no new queue and no new auth.
+
+**Why not a Drive folder + a watcher.** It was the obvious design and it cannot
+work here, for three independent reasons worth recording so nobody re-proposes it:
+* `src/auth.py` holds **`drive.file` only**, which sees exclusively files *our own
+  app created*. A screenshot uploaded by the Drive iOS app is invisible to it;
+  listing that folder returns nothing. Seeing it would mean `drive.readonly` —
+  reading the entire Drive, against §4's least-privilege rule.
+* `files.watch` needs a public HTTPS webhook with a validated domain, and the
+  deployment is **tailnet-only**. Google cannot reach us, so a "trigger" degrades
+  to polling `changes.list` on a new timer with new state.
+* It is *more* taps than the button that already exists (screenshot → open Drive →
+  upload → pick folder).
+
+**The gesture.** Screenshot the session normally (a Hevy summary usually takes 2-3
+screens), then send them with a Control Center Shortcut — the same button pattern
+the meal photos already use. A Back Tap + in-Shortcut "Take Screenshot" variant was
+considered and dropped: reaching the Shortcut from Control Center is already fast,
+and it keeps one mental model.
+
+⚠️ **Send them through the JSON `images` array, not as multipart file parts.**
+Shortcuts' multipart file-list sends only the first item, and where it does pack
+several it CONCATENATES them into one part. `_split_jpegs` splits both JPEG and
+PNG runs for exactly this reason — screenshots are **PNG**, and before that half
+existed three screenshots arrived as one unreadable blob with two silently lost.
+
+**Self-dating like the scale.** The row is keyed on the session's own printed date
+(`workout.performed_at`), not on when it was sent — so scrolling the app's history
+and screenshotting old sessions **backfills** them. Unlike the scale it does **not**
+trigger the daily sync: a workout says nothing about whether the night is scored.
+
+**The traps, all in `SECTION C` and `ingest/workouts.py`.** PR badges and the
+previous-session column (same shape as the scale app's "since <date>" delta block);
+kg-vs-lb, converted in code and never by the model; warm-up and drop-set markers,
+without which volume inflates 20-30%; and `load_type`, without which a whole
+bodyweight back session scores as zero. Every set passes a plausibility band
+(`workouts.SET_RANGES`) before it is written, exactly as `_normalize_body` guards
+the scale.
+
+**Where it lands, and why not as JSON on the day row.** `sessions` is the
+event-grain table (one row per session, `sets_json` per set) — the same shape as
+`meals`/`items`, for the same reason: that is where cardinality genuinely varies.
+`daily_summary` gets a five-column roll-up in a new `training` block.
+
+There is deliberately **no total-tonnage column**. Σ(load × reps) rises when you add
+a set of curls and falls when you swap squats for lunges, so it cannot answer *are
+my loads going up*. `lift_load_index` answers it by normalising each exercise
+against **its own** best e1RM over the previous 28 days (excluding today, so the
+published number is out-of-sample for its own row — the same discipline
+`src/calibration.py` insists on) and averaging: 100 = at baseline, 107 = 7% above.
+`lift_summary` carries the readable one-line session (`Tronco A · supino 4×8@60 · …`)
+as **text, not JSON** — the §2b measurement is that JSON costs ~5× the tokens
+because it repeats every key on every set, and this column is read on every row of
+every export and every coach prompt.
+
+The causal split matters and is not cosmetic: `lift_sets`/`lift_hard_sets` are
+**inputs** (stimulus applied during day N) while `lift_load_index` is an
+**outcome** (`PERFORMED_ON` — what the body managed). That is what makes
+`links.py` pair *yesterday's protein against today's load* and *today's hard sets
+against tomorrow's HRV*, with the lag derived rather than declared.
+
 ## 2b. Data architecture (read this before changing the schema)
 
 **`schema/registry.py` is the single source of truth.** Every column declares its
@@ -291,6 +357,8 @@ changes — no code path, no branch.
 * **`baselines`** — 28-day mean/SD/z per metric. An absolute value is
   uninterpretable (73 ms HRV is excellent for one person, a warning for another);
   against a personal baseline it becomes a sentence.
+* **`calibration`** — one row per day: how wrong the devices were, measured
+  against the weight trend, and the correction applied to that day. See §2e.
 * **`schema`** — the data dictionary, in the sheet next to the numbers.
 
 The causal alignment described above isn't a materialised tab — pair day N's
@@ -337,6 +405,50 @@ science demands it ("vitamin D3 is required to absorb calcium") — that is corr
 deliberate. Naming a nutrient as context is not the same as scoring the user against
 it, and here it reads as the honest instruction: get this one somewhere other than
 your plate.
+
+## 2e. Device calibration (read before touching `energy_balance_*`)
+
+`energy_balance_kcal` is the difference of two **estimates**, neither measured:
+Fitbit infers expenditure from heart rate and steps; a vision model guesses what
+was on the plate. Their errors do not cancel.
+
+Measured over the first 33 contiguous days (2026-07-17..08-18):
+
+| | |
+|---|---|
+| recorded mean energy balance | −762 kcal/day |
+| cumulative over 32 days | −24,373 kcal → predicts **−3.17 kg** |
+| actual weight change (OLS trend) | **−2.12 kg**, 95% CI [−2.48, −1.77] |
+| **discrepancy** | **+250 kcal/day**, 95% CI [+165, +336] |
+
+The calorie prediction fell *outside* the CI of the weight trend, so this is a real
+bias, not noise: about a third of the deficit the sheet reports is not happening in
+the body. `src/calibration.py` estimates it continuously; `energy_balance_adj_kcal`
+publishes the corrected figure. **Read the adjusted column when you care about what
+the body did; read the raw one when auditing the devices.**
+
+**The full derivation, the four rules, the known limitations and — importantly —
+the list of approaches already tried and rejected live in the module docstring of
+`src/calibration.py`. Read it before recalculating any of this.** The short version:
+
+* **Fit the trend on weight *levels*, never on daily differences.** Differencing
+  inflates noise by exactly √2 (0.309 → 0.413 kg). Endpoint subtraction
+  (first − last) is worse still: it bets the whole calibration on 2 of 33 rows,
+  and in this dataset both endpoints are atypical (~0.6 kg of pure artifact).
+* **Precision improves as N^−1.5**, not N^−0.5, because the deficit accumulates
+  while the scale's noise does not. ±46 kcal/day at 32 days, ±10 at 90.
+* **Estimate on the past, apply to the future.** Every published correction is
+  out-of-sample for its own row. Refit in-sample and the adjusted balance matches
+  the scale *by construction*, destroying the ability to detect a device failing.
+* **Drift is flagged, never absorbed** — a calibration layer that silently
+  swallows every discrepancy hides the failures it exists to reveal.
+
+Already tested and dead — do not redo: `bowel_movement`, `total_carbs_g`,
+`total_sodium_mg` and `body_water_pct` explain ~0% of daily weight variance (each
+made residual sd *worse*); and the two devices cannot be told apart by daily
+regression (would need ~16 years of data). The open route for attributing the error
+to a specific device is **period contrast** — compare long windows with different
+mean `total_cals_out`, which requires activity to vary.
 
 ## 3. Architecture
 
@@ -570,7 +682,7 @@ token is read-only across `sleep`, `health_metrics_and_measurements` and
 | Code (master copy) | `/Users/dneves/Health Tracker/` — `src/` (job), `ingest/` (service) |
 
 ### Sheet schema
-- **`daily_summary`** (78 columns), grouped by **who owns each block** — the
+- **`daily_summary`** (82 columns), grouped by **who owns each block** — the
   merge-upsert means a source only ever writes its own columns:
   - `date`
   - **self-report** (ingest): `bowel_movement`
@@ -663,6 +775,13 @@ token is read-only across `sleep`, `health_metrics_and_measurements` and
     which AI analysed the photo (audit); `image_sha` de-duplicates double-taps.
   - Rows with foods `not food` / `analysis failed` (or all-zero macros) are
     excluded from every roll-up.
+- **`sessions`**: one row per training session — `datetime | date | title |
+  duration_min | exercises | sets | hard_sets | sets_json | e1rms_json |
+  load_index | image_sha | photo_url | confidence | model | note`. Append-only: a
+  session is an observation, never rebuilt. `e1rms_json` caches that session's best
+  estimated 1RM per exercise so a baseline lookup doesn't re-derive 28 days of sets
+  on every write. `sets_json` holds the per-set array (exercise, set_type,
+  load_type, weight_kg, reps, rir) — the same role `meals.items` plays.
 - **`config`**: `key | value | notes` — what this user measures (`blocks`), what
   they are aiming at (`goal`), and the declared body used only when nothing is
   measured (`sex`, `age`, `height_cm`, `weight_kg`, `activity_level`). Created and
@@ -673,7 +792,73 @@ token is read-only across `sleep`, `health_metrics_and_measurements` and
   `python -m src.maintenance` (inserts the column in place so history stays
   aligned). Never reorder or rename existing columns.
 
-## 6. Models: Claude first, Gemini behind it
+## 6. Models: routed per task, Claude first for judgement
+
+**`automation/nutrition-audit/llm_cli.py` is the single place that decides which
+model answers a prompt.** Routing is keyed on the caller's own `source` string —
+the one every call already passes and every line of `logs/calls.jsonl` already
+records — so the task taxonomy and the routing table are one vocabulary rather than
+two that drift.
+
+Three layers, and none of them asks the user anything mid-flow:
+
+1. **Per-task defaults (`ROUTES`).** `deep` for judgement (meal estimation, the
+   coach's prose, the audit's adjudication); `fast` for transcription (reading a
+   scale or gym screen). An **unknown** source gets `deep` — a new call site nobody
+   has classified should show up as a cost, not as a silent quality regression.
+   A photo cannot be classified before it is routed, so `_classify_images` makes
+   one cheap `fast` call that returns **only** `kind` and the real call then runs
+   at the tier that verdict implies. The asymmetry is the safety property: only a
+   confident `body`/`workout` may downgrade, and anything else — including a
+   failed or unavailable classify — stays `deep`. A screenshot on the deep tier
+   costs a little of the window; a **meal** on the fast tier costs accuracy on the
+   number §2e already shows carrying a measured bias. The classifier has its own
+   short timeout (`CLASSIFY_TIMEOUT_S`) so it can never eat the budget the real
+   call needs.
+2. **Automatic failover (`TIERS`).** A tier is an ORDERED list of providers, not one
+   model: `deep` = Claude Sonnet 5 high → **agy `gemini-3.7-flash` high (the AI Pro
+   subscription)** → and only then the Gemini **API** chain below. `fast` leads with
+   agy at **medium** and `classify` with agy at **low** — the effort split is not
+   fussiness: a gym screen is a dense grid of near-identical rows, and a misread rep
+   count (8 vs 3) lands *inside* `workouts.SET_RANGES`, so unlike a dropped decimal
+   on the scale the plausibility band cannot catch it and effort is the only guard. A spent 5-hour window, a timeout
+   or an unparseable answer moves to the next provider by itself. A Claude failure
+   also arms a ~30 min cooldown so the following meals start at agy instead of
+   burning a failed subprocess each. **Any** Claude failure arms it, not only a
+   usage-limit one — `claude_cli` collapses every failure into one `ClaudeError`,
+   and this repo already learned on the Gemini side that sniffing error strings
+   misclassifies (`_retry_same_model` classifies on `APIError.code` for exactly
+   that reason). The fallback is a strong model on a subscription already paid for,
+   so guessing wrong costs one session of slightly different prose.
+3. **A deliberate mode**, in the sheet's **`config` tab** (`llm_mode`): `auto` |
+   `economy` (agy only — *"I need my Claude window for something else today"*) |
+   `quality` (first provider only, never silently downgraded). One cell, edited
+   from the phone, read per request by `ingest/main.py:_llm_mode` with a 60 s
+   cache. A typo reads as `auto`.
+
+**`agy` is installed and verified live (2026-08-21)** — binary, text call, image
+call and the routing chain, re-run under `systemd-run` to prove the service's own
+context can reach its credentials. Two things learned on that first live call, both
+now encoded:
+* the CLI takes effort **either** as a model-id suffix (`gemini-3.7-flash-high`,
+  which is how `agy models` lists them) **or** as a separate `--effort` flag; a bare
+  id with neither is a hard error. `agy_cli._effort_args` handles both.
+* `agy` now has **`--json-schema`**, which enforces structured output the way the
+  Gemini API's `response_schema` does. Unused so far — the claude path has no
+  equivalent and both must answer one contract — but the transcription tier is
+  exactly where it would pay.
+
+`PRIMARY_MODEL` still pins one model globally and bypasses all of it — the instant
+rollback. **Leave it empty**: setting it turns off per-task routing, failover and
+`llm_mode` together. An explicit `model=` argument does the same per call, which is what keeps
+the audit's ensemble pinnable (see the re-independence note below).
+
+**The scarce resource here is not money.** The system costs €0 and Claude is a flat
+subscription. What routing protects is the **5-hour usage window** — `_try_claude`
+calls a spent one "an expected daily event" — and latency on the calls where it
+shows.
+
+### Claude first, Gemini behind it
 
 **Every meal is estimated by Claude Sonnet 5 at high effort**
 (`ingest/claude_estimator.py`), through the local `claude` CLI on the personal
@@ -779,7 +964,7 @@ and it is not attributable to this project.
     read must use `valueRenderOption="UNFORMATTED_VALUE"`, or `float("7,8")`
     silently zeroes the numbers. Avoid locale-sensitive formulas; charts and
     stats are written via the API instead.
-11. **Read ranges must be wide enough for the schema.** `daily_summary` is 78
+11. **Read ranges must be wide enough for the schema.** `daily_summary` is 82
     columns; an `A1:Z` read silently truncates the header, so a column past the cut
     looks "missing" and its writes land nowhere. `sheets.READ_LAST_COL` is derived
     from `DAILY_HEADERS` — keep it that way, don't hard-code a letter.
@@ -787,6 +972,26 @@ and it is not attributable to this project.
     `[:10]` a UTC timestamp to get it. Sleep intervals ship **no civil time** at
     all — only `startTime` + `startUtcOffset` — so the local day must be derived
     (a 23:03Z bedtime is already tomorrow in Lisbon).
+
+18. **The API clients must be per-THREAD, never per-process** (`_per_thread` in
+    `ingest/main.py`). httplib2 says it of itself — *"Not thread-safe, requires
+    external synchronization against concurrent requests"* — and the
+    googleapiclient service object owns one of its connections. Under gunicorn's
+    `--threads 8` a single `lru_cache`d client had eight threads interleaving on
+    one TLS socket. The symptoms look like eight unrelated bugs:
+    `ssl.SSLError: WRONG_VERSION_NUMBER`, `IncompleteRead(0 bytes read)`,
+    `ValueError: invalid literal for int() with base 16: b'\x0c\xb3...'` (the
+    chunked-transfer parser reading pixel bytes), and **`Worker was sent code 139`**
+    — a SIGSEGV inside OpenSSL. Diagnosed 2026-08-21; the segfaults had been in
+    the log since 2026-08-20 with nothing visibly broken.
+19. **A connection error never means the write did not happen.** It means the
+    *response* could not be read. Google may well have appended the row before the
+    socket broke, so `_execute` retrying an append writes it twice — which is how
+    one lunch became two `meals` rows on 2026-08-21. Every `values().append` now
+    passes `idempotent=False`: it fails fast and lets the **queue** re-run the whole
+    task, because `/process` re-checks `_exact_duplicate` against the sheet first
+    and a retry down inside `_execute` cannot. A test pins the flag on every append
+    in the module, since a new one that forgets it reintroduces the bug silently.
 
 ### Google Health API specifics (all verified against the live API, 2026-07-16)
 
@@ -817,10 +1022,17 @@ and it is not attributable to this project.
 
 ## 9. Open TODOs
 
+0. ⚠️ **`python -m src.maintenance` has not been run since the `training` block was
+   added.** `run_daily.py` refuses to write through a stale schema (it places values
+   by `DAILY_HEADERS` position), so until the sheet is migrated the daily job raises
+   and alerts. Ingest is unaffected — `_finalize_workout` catches the roll-up
+   failure and the `sessions` row still lands. Run it, then re-run the daily job.
 1. Rotate the OAuth **client secret** (it was once pasted in chat).
 2. Optional: archive scale screenshots to Drive as a provenance/bronze layer. They
    are deliberately *not* archived today — the transcribed numbers are the data,
-   and the screenshot is still in the camera roll.
+   and the screenshot is still in the camera roll. (The Back Tap Shortcut in
+   source 5 keeps them out of the camera roll entirely, which changes the shape of
+   this one — the screenshot then exists nowhere unless we archive it.)
 3. Optional: `ecg` + `irn` scopes, if the Air ever turns out to have the sensors.
 4. `skin_temp_dev`, `azm_*` and `vo2_max` fill in as history accumulates — no code
    change needed, just don't mistake the blanks for a bug before then.

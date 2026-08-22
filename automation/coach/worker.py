@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
-"""The Coach's primary brain: Claude Sonnet, running on this Mac.
+"""The Coach's primary brain, running on this Mac.
 
 The backend does all the arithmetic and builds the prompt, then parks it as a job.
-This worker claims a job, answers it with the local subscription `claude` CLI, and
+This worker claims a job, answers it via the local subscription CLI llm_cli.py
+routes to (Claude or Gemini/agy — see llm_cli.PRIMARY_MODEL, the one switch), and
 posts the raw JSON back for the backend to validate and assemble. It holds no
 nutrition logic at all — that is the point. Whichever model answers, the facts, the
 prompt and the validation are identical; only the quality of the prose differs.
 
-Why the local model at all, when the backend can call Gemini directly: the coaching
-voice is the product. A flash model produces correct, forgettable sentences; Sonnet
-notices that the oats held the morning and that lunch was the third day running
-without anything green. That difference is worth waiting for, so:
+Why a local subscription model at all, when the backend can call an API directly:
+the coaching voice is the product. A rushed flash-tier call produces correct,
+forgettable sentences; a stronger model at real effort notices that the oats held
+the morning and that lunch was the third day running without anything green. That
+difference is worth waiting for, so:
 
   * If the Mac is asleep, nothing claims the job. It waits.
-  * If Claude's five-hour usage window is spent, the worker RELEASES the job rather
+  * If the local CLI's usage window is spent, the worker RELEASES the job rather
     than consuming it, and tries again on the next tick.
   * If a job goes unanswered past `COACH_SONNET_WAIT_HOURS`, the backend's `/coach/sweep`
-    runs the same prompt through Gemini. Waiting is allowed; silence is not.
+    runs the same prompt through the Gemini-API fallback. Waiting is allowed; silence
+    is not.
 
 Run by launchd every few minutes (see com.dneves.coach-worker.plist). Safe to run by
 hand: `python3 automation/coach/worker.py --once`.
@@ -34,10 +37,11 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-# The audit pipeline's CLI wrapper already solves headless `claude` invocation and
-# the robust JSON extraction that took several production failures to get right.
+# The audit pipeline's CLI wrappers already solve headless invocation and the
+# robust JSON extraction that took several production failures to get right.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "nutrition-audit"))
-import claude_cli  # noqa: E402
+import claude_cli  # noqa: E402 — only for the shared ClaudeError type below
+import llm_cli  # noqa: E402
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -56,8 +60,12 @@ log = logging.getLogger("coach-worker")
 # producing cards with no error anywhere the user would see.
 BACKEND = os.environ.get("HEALTH_BACKEND_URL", "http://127.0.0.1:8080")
 TOKEN = os.environ.get("INGEST_TOKEN", "")
-MODEL = os.environ.get("COACH_MODEL", "claude-sonnet-5")
-EFFORT = os.environ.get("COACH_EFFORT", "high")
+# Empty by default, and that is the point: an empty model means "let llm_cli route
+# it" (source="coach" -> the deep tier -> Claude, with agy behind it on a spent
+# window). Setting COACH_MODEL pins one model and bypasses routing entirely, which
+# is the escape hatch, not the normal path.
+MODEL = os.environ.get("COACH_MODEL", "").strip()
+EFFORT = os.environ.get("COACH_EFFORT", "").strip()
 TIMEOUT_S = int(os.environ.get("COACH_TIMEOUT_S", "300"))
 # Reports think for longer: a bigger model, a slower effort, and a prompt carrying a
 # whole week of meals and advice.
@@ -120,19 +128,31 @@ def answer(job: Dict[str, Any]) -> Dict[str, Any]:
     # names a model and must not wait fifteen minutes for two sentences.
     timeout = int(job.get("timeout_s")
                   or (REPORT_TIMEOUT_S if job.get("model") else TIMEOUT_S))
-    log.info("running job %s (%s, %d chars) through %s at %s effort",
-             job["id"], job.get("slot"), len(job["prompt"]), model, effort)
+    # Chat and report always name their own model (COACH_CHAT_MODEL /
+    # COACH_REPORT_MODEL) and bypass llm_cli's routing entirely — see
+    # llm_cli.call_json: an explicit `model` skips ROUTES/TIERS regardless of
+    # `source`. Only the plain daily/weekly card reaches here with no model of its
+    # own, so it is the only job `source` can actually steer — kept as its own name
+    # (`coach.card`, not `coach`) so a routing change aimed at the card can't
+    # silently catch chat or a report if either ever loses its explicit model.
+    source = "coach" if job.get("model") else "coach.card"
+    log.info("running job %s (%s, %d chars) through %s", job["id"],
+             job.get("slot"), len(job["prompt"]),
+             f"{model} at {effort} effort" if model else "the routed chain")
     started = time.monotonic()
     # No tools at all. This is pure reasoning over facts that are already in the
     # prompt, and a model that *can* write a file may decide to answer by writing
     # one: the first live run did exactly that — 238 s of good work, saved to disk,
     # with a prose summary where the JSON should have been.
-    result = claude_cli.call_claude_json(
+    result = llm_cli.call_json(
         job["prompt"], model=model, effort=effort, timeout_s=timeout,
         require_key=job.get("require_key", "cards"), tools="",
-        source="coach")
-    log.info("job %s answered in %.1fs (cost %s)", job["id"],
-             time.monotonic() - started, result.get("_cost_usd"))
+        source=source)
+    # Log who ACTUALLY answered, not who we asked for: with a provider chain the
+    # two differ exactly when it matters most (a spent window that fell to agy).
+    log.info("job %s answered by %s in %.1fs (cost %s)", job["id"],
+             result.get("_model_id"), time.monotonic() - started,
+             result.get("_cost_usd"))
     return result
 
 

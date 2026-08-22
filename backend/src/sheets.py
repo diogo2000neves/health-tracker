@@ -31,7 +31,6 @@ from schema.registry import daily_headers, names_in, ocr_ranges
 DAILY_TAB = "daily_summary"
 MEALS_TAB = "meals"
 SCHEMA_TAB = "schema"
-BASELINES_TAB = "baselines"
 
 # The schema now lives in ONE place: schema/registry.py, which declares every
 # column's unit, source, causal window, direction, plausible range and description.
@@ -180,25 +179,27 @@ class SheetClient:
             body={"values": values},
         ).execute()
 
-    def replace_tab(self, tab: str, values: List[List[Any]]) -> None:
-        """Overwrite a tab wholesale (creating it if absent).
+    def replace_rows(self, tab: str, headers: Sequence[str],
+                     rows: List[List[Any]]) -> int:
+        """Rebuild a *derived* tab from scratch: ensure it exists, clear it, write
+        the header plus `rows`.
 
-        Only for **derived** tabs — `analysis`, `baselines` — which are pure
-        functions of daily_summary and rebuilt every run. Never point this at a
-        tab that holds observations."""
-        if tab not in self.tab_titles():
-            self.svc.spreadsheets().batchUpdate(
-                spreadsheetId=self.sid,
-                body={"requests": [{"addSheet": {"properties": {"title": tab}}}]},
-            ).execute()
-            self._titles = None
+        For tabs that are a pure function of `daily_summary` (`calibration`, and
+        `baselines` when it lands). Rebuilding beats incremental updates for these:
+        a derived tab that is patched row-by-row can drift away from its source
+        after a backfill or a corrected old meal, and the drift is invisible. The
+        clear is what makes a shrunken result actually shrink — writing 20 rows
+        over an old 40-row tab would otherwise leave 20 rows of stale garbage
+        below, which reads as real data."""
+        self.ensure_tab(tab, headers)
         self.svc.spreadsheets().values().clear(
-            spreadsheetId=self.sid, range=tab).execute()
-        if values:
+            spreadsheetId=self.sid, range=f"{tab}!A2:ZZ", body={}).execute()
+        if rows:
             self.svc.spreadsheets().values().update(
-                spreadsheetId=self.sid, range=f"{tab}!A1",
-                valueInputOption="RAW", body={"values": values},
+                spreadsheetId=self.sid, range=f"{tab}!A2",
+                valueInputOption="RAW", body={"values": rows},
             ).execute()
+        return len(rows)
 
     def append_row(self, tab: str, row: List[Any]) -> None:
         self.svc.spreadsheets().values().append(

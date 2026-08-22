@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -151,17 +152,30 @@ _PRIORITY = {
 
 # -- planning ------------------------------------------------------------------
 
+# Feature flag: the next_meal card ("what to eat next") costs tokens on every
+# morning/afternoon/adhoc generation. Set COACH_NEXT_MEAL_ENABLED=false in the
+# environment (~/.config/health-tracker/env) to turn it off without touching code
+# — unset, or "true", re-enables it. This is the one place `next_meal` is gated:
+# facts, prompt and assembly all check `_wants()`.
+NEXT_MEAL_ENABLED = os.environ.get(
+    "COACH_NEXT_MEAL_ENABLED", "true").strip().lower() != "false"
+
+
 def _wants(slot: str) -> Tuple[str, ...]:
     """Which card kinds a slot generates."""
     if slot == "morning":
-        return ("day_plan", "next_meal", "pattern")
-    if slot == "afternoon":
-        return ("check_in", "next_meal", "pattern")
-    if slot == "evening":
-        return ("day_summary", "win", "pattern")
-    if slot == "weekly":
-        return ("weekly_review", "pattern")
-    return ("next_meal", "check_in")          # adhoc
+        wants = ("day_plan", "next_meal", "pattern")
+    elif slot == "afternoon":
+        wants = ("check_in", "next_meal", "pattern")
+    elif slot == "evening":
+        wants = ("day_summary", "win", "pattern")
+    elif slot == "weekly":
+        wants = ("weekly_review", "pattern")
+    else:
+        wants = ("next_meal", "check_in")          # adhoc
+    if not NEXT_MEAL_ENABLED:
+        wants = tuple(k for k in wants if k != "next_meal")
+    return wants
 
 
 def eligible_findings(profile: Dict[str, Any], state: Dict[str, Any], *,

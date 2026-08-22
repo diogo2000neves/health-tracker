@@ -72,10 +72,6 @@ import google.auth
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
-from src.analysis import (
-    BASELINE_HEADERS,
-    baseline_rows,
-)
 from schema.capabilities import FULL, Capabilities, from_config
 from src.biometrics import (
     biometric_days, daily_activity, daily_exercise, daily_recovery, daily_sleep,
@@ -83,8 +79,12 @@ from src.biometrics import (
 from src.google_health import (
     DAILY_TYPES, EXERCISE, ROLLUP_TYPES, SLEEP, GoogleHealthClient,
 )
+from src.calibration import (
+    CALIBRATION_HEADERS, CALIBRATION_TAB, adjusted_balances, calibration_series,
+    current as current_calibration,
+)
 from src.sheets import (
-    BASELINES_TAB, DAILY_HEADERS, DAILY_TAB, MEALS_TAB, SheetClient, TIER1_NUTRIENTS,
+    DAILY_HEADERS, DAILY_TAB, MEALS_TAB, SheetClient, TIER1_NUTRIENTS,
 )
 
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
@@ -325,22 +325,6 @@ def build_daily_rows(*sources: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]
     return rows
 
 
-# -- derived views --------------------------------------------------------------
-def rebuild_views(sheet: SheetClient) -> Dict[str, int]:
-    """Regenerate the `baselines` tab from daily_summary.
-
-    Wholesale replacement, not incremental: these are pure functions of the
-    observations, so rebuilding is both simpler and drift-proof. A stale derived
-    row is worse than no row — it looks like data.
-    """
-    rows = sorted(sheet.read_rows(DAILY_TAB), key=lambda r: str(r.get("date", "")))
-
-    baselines = baseline_rows(rows)
-    sheet.replace_tab(BASELINES_TAB, [BASELINE_HEADERS] + baselines)
-    return {"baselines": len(baselines)}
-
-
-
 # -- capabilities ---------------------------------------------------------------
 # The `config` tab is owned by the ingest service (it creates and seeds it, because
 # that is where a user's first request lands). The job only ever reads it, and reads
@@ -423,6 +407,46 @@ def main() -> None:
 
     daily_result = sheet.upsert_daily(build_daily_rows(biometrics, nutrition))
 
+    # 3. Personal calibration. `energy_balance_kcal` is the difference of two
+    #    *estimates* — Fitbit infers expenditure, a vision model guesses intake —
+    #    and over the first 33 days the pair overstated the daily deficit by
+    #    ~250 kcal, about a third of it. Refit that correction from the trailing
+    #    weight trend, rebuild the `calibration` tab and write the corrected
+    #    balance back. See src/calibration.py for the derivation and the rules.
+    #
+    #    Runs AFTER the upsert so it reads today's freshly written nutrition and
+    #    weigh-in. Never fatal: this is an analysis layer sitting on top of the
+    #    data, and losing it must not also cost us the roll-up that is this job's
+    #    actual purpose — same reasoning as the biometrics block above.
+    calib_note = "skipped"
+    try:
+        daily_rows = sheet.read_rows(DAILY_TAB)
+        series = calibration_series(daily_rows)
+        sheet.replace_rows(CALIBRATION_TAB, CALIBRATION_HEADERS, series)
+        adj = adjusted_balances(daily_rows)
+        if adj:
+            # Partial merge-upsert: only this one derived column is sent, so every
+            # other source's columns are left exactly as they are.
+            sheet.upsert_daily(
+                [{"date": day, "energy_balance_adj_kcal": value}
+                 for day, value in sorted(adj.items())]
+            )
+        cal = current_calibration(daily_rows)
+        if cal is None:
+            calib_note = f"not enough history ({len(daily_rows)} row(s))"
+        else:
+            calib_note = (
+                f"bias {cal.bias_applied_kcal:+.0f} kcal/day (raw "
+                f"{cal.bias_raw_kcal:+.0f} +/-{cal.se_kcal:.0f}, n={cal.n_days}, "
+                f"{cal.status}); {len(adj)} day(s) adjusted"
+            )
+            # Rule 4: drift is surfaced, never silently absorbed.
+            if cal.status == "drift":
+                print(f"calibration: {cal.note}")
+    except Exception as err:
+        calib_note = f"FAILED ({err})"
+        print(f"calibration: {calib_note}")
+
     # Unconditional, so the tab self-heals: rows arrive in submission order, and a
     # backfilled scale screenshot appends a day that belongs above the ones already
     # there. Cheap (one call/day) and idempotent when already sorted.
@@ -432,21 +456,13 @@ def main() -> None:
     except Exception as err:  # ordering is cosmetic — never fail the data run
         sort_note = f"sort skipped ({err})"
 
-    # Derived views, rebuilt wholesale from the observations we just wrote. All
-    # three are cosmetic in the sense that the source of truth is daily_summary —
-    # so none of them may fail the data run.
-    views_note = "rebuilt"
-    try:
-        rebuild_views(sheet)
-    except Exception as err:
-        views_note = f"skipped ({err})"
-
     print(
         f"window>={start or 'ALL'}: biometrics {bio_note}; read {len(meals)} "
         f"meal rows -> {len(nutrition)} nutrition day(s); daily_summary updated "
         f"{daily_result['updated']}, appended {daily_result['appended']}, "
         f"healed {daily_result['healed']} duplicate(s), "
-        f"{sort_note}; views {views_note} "
+        f"calibration {calib_note}, "
+        f"{sort_note} "
         f"(spreadsheet {spreadsheet_id}, project {project})."
     )
 

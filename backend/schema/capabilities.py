@@ -67,6 +67,8 @@ PRESETS: Dict[str, Tuple[str, ...]] = {
     "nutrition_sleep": ("nutrition", "self_report", "sleep", "recovery"),
     # + the activity side of the same wearable.
     "nutrition_activity": ("nutrition", "self_report", "activity"),
+    # A phone, a gym and nothing else: meals plus logged lifts, no wearable.
+    "nutrition_training": ("nutrition", "self_report", "training"),
     # Everything this schema knows how to hold.
     "full": TOGGLEABLE_BLOCKS,
 }
@@ -80,6 +82,7 @@ BLOCK_DOMAINS: Dict[str, str] = {
     "sleep": "sleep",
     "recovery": "sleep",
     "activity": "activity",
+    "training": "training",
     "body": "body",
     "self_report": "digestion",
 }
@@ -88,7 +91,8 @@ BLOCK_DOMAINS: Dict[str, str] = {
 DOMAIN_LABELS_PT: Dict[str, str] = {
     "nutrition": "alimentação",
     "sleep": "sono e recuperação",
-    "activity": "atividade e treino",
+    "activity": "atividade e movimento",
+    "training": "treino de força",
     "body": "composição corporal",
     "digestion": "digestão",
 }
@@ -239,6 +243,14 @@ CONFIG_TAB_HEADERS: Tuple[str, ...] = ("key", "value", "notes")
 
 CONFIG_SEED: Tuple[Tuple[str, str, str], ...] = (
     ("blocks", DEFAULT_PRESET,
-     "full | nutrition | nutrition_sleep | nutrition_activity, or an explicit "
-     "list: nutrition, sleep, recovery, activity, body, self_report"),
+     "full | nutrition | nutrition_sleep | nutrition_activity | "
+     "nutrition_training, or an explicit list: nutrition, sleep, recovery, "
+     "activity, training, body, self_report"),
+    # Not a capability — a routing switch, but it lives here for the same reason
+    # `blocks` does: this tab is the one place the user can change the system's
+    # behaviour from their phone, with no deploy and no restart.
+    ("llm_mode", "auto",
+     "auto = Claude first, Gemini (agy) behind it on a spent usage window | "
+     "economy = Gemini only, to save the Claude window for something else today | "
+     "quality = the first model only, never silently downgraded"),
 )

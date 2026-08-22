@@ -231,21 +231,15 @@ behaves exactly as before. Verify either path with:
 backend/venv/bin/python automation/nutrition-audit/audit.py --check
 ```
 
-## Insights: one job migrated, one deliberately retired
+## Insights: both modes retired
 
-`automation/insights/generate.py` has two modes, and they are **not** in the same
-situation:
-
-* **`weekly` — migrated** (`health-tracker-insights-weekly.timer`, Sunday 20:00).
-  The iOS app calls `GET /insights/weekly` directly, and that endpoint is read-only:
-  it serves whatever this job last wrote to the `weekly_reports` tab and reports
-  `status: pending` until it has run. Without the timer that screen stays empty.
-  Sunday because `_sunday_ref()` anchors the report's `week_start` to the most
-  recent Sunday.
-* **`next-meal` — retired, no timer.** The coach supersedes it: it emits its own
-  `next_meal` cards through `/coach/feed`, and nothing in the app calls
-  `/insights/next-meal`. The script is kept for manual/dry-run use.
-
-Both had been failing on the MacBook since ~2026-07-25 for a reason unrelated to
-this migration: **`GEMINI_API_KEY` was never set there**. It is set here, from
-Secret Manager, so the weekly job works on this machine.
+`automation/insights/generate.py` (both its `weekly` and `next-meal` modes) and the
+`health-tracker-insights-weekly.timer` it ran under have been removed. The claim
+this section used to make — "the iOS app calls `GET /insights/weekly` directly" —
+was already false when it was written: the Coach's own card-feed rebuild
+(`dc05c4c`, 2026-07-26) deleted the iOS screen that made that call four days before
+this doc was. The coach's `/coach/report` (period=weekly) fully replaced it,
+reading meals/cards/events directly and storing reports in Cloud Storage rather
+than Sheets — so nothing was actually depending on the old job at all. The
+`weekly_reports` and `next_meal` Sheets tabs were deleted along with it, since
+nothing wrote or read them.

@@ -37,8 +37,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 # Blocks, in sheet order. These drive the collapsible column groups in the sheet
 # and the nesting of the iOS app's JSON.
 BLOCKS: List[str] = [
-    "key", "self_report", "sleep", "recovery", "activity", "nutrition", "body",
-    "meta",
+    "key", "self_report", "sleep", "recovery", "activity", "nutrition",
+    "training", "body", "meta",
 ]
 
 BLOCK_LABELS: Dict[str, str] = {
@@ -48,12 +48,13 @@ BLOCK_LABELS: Dict[str, str] = {
     "recovery": "Overnight recovery (Fitbit)",
     "activity": "Activity & energy (Fitbit)",
     "nutrition": "Nutrition (meals roll-up)",
+    "training": "Strength training (Hevy screenshot)",
     "body": "Body composition (scale screenshot)",
     "meta": "Bookkeeping",
 }
 
 # Who writes the column. Each source fills only its own columns (merge-upsert).
-SOURCES = ("system", "user", "fitbit", "scale", "meals", "derived")
+SOURCES = ("system", "user", "fitbit", "scale", "meals", "training", "derived")
 
 # Causal windows: when the measured phenomenon actually occurred.
 WAKING_DAY = "waking_day"        # 05:00 this day -> 05:00 next (nutrition)
@@ -61,6 +62,7 @@ CALENDAR_DAY = "calendar_day"    # 00:00-24:00 this day (activity)
 NIGHT_ENDING = "night_ending"    # the night that ended on this morning
 MORNING_OF = "morning_of"        # measured this morning, fasted
 DAY_OF = "day_of"                # self-reported about this day
+PERFORMED_ON = "performed_on"    # a performance measured during this day
 NO_WINDOW = "none"               # key / bookkeeping
 
 CAUSAL_LABELS: Dict[str, str] = {
@@ -69,6 +71,7 @@ CAUSAL_LABELS: Dict[str, str] = {
     NIGHT_ENDING: "the night that ended on this morning",
     MORNING_OF: "measured on this morning, fasted",
     DAY_OF: "reported about this date",
+    PERFORMED_ON: "performed during this date",
     NO_WINDOW: "not a measurement",
 }
 
@@ -76,7 +79,7 @@ CAUSAL_LABELS: Dict[str, str] = {
 # afterwards — it is caused by the *previous* day's inputs, which is exactly why
 # it cannot be correlated against the same row's intake.
 CAUSAL_INPUT = frozenset({WAKING_DAY, CALENDAR_DAY})
-CAUSAL_OUTCOME = frozenset({NIGHT_ENDING, MORNING_OF, DAY_OF})
+CAUSAL_OUTCOME = frozenset({NIGHT_ENDING, MORNING_OF, DAY_OF, PERFORMED_ON})
 
 UP_GOOD, DOWN_GOOD, NEUTRAL = "up_good", "down_good", "neutral"
 
@@ -324,6 +327,19 @@ DAILY_COLUMNS: List[Column] = [
                        "single most important derived number here: body composition "
                        "should track this over weeks, and the outcome shows up on "
                        "the FOLLOWING day's weigh-in, not this row's."),
+    Column("energy_balance_adj_kcal", "nutrition", "integer", "kcal", "derived",
+           WAKING_DAY, NEUTRAL, tier=1, range=(-8000, 8000),
+           description="energy_balance_kcal corrected for measured device bias — "
+                       "READ THIS ONE when you care about what the body actually "
+                       "did. Both sides of the raw figure are estimates (Fitbit "
+                       "infers expenditure; a vision model guesses intake) and over "
+                       "the first 33 days they overstated the daily deficit by "
+                       "~250 kcal, i.e. about a third of it. The correction is "
+                       "refitted every run from the trailing weight trend and is "
+                       "always out-of-sample for its own row. Blank until enough "
+                       "history exists. Raw stays raw: see src/calibration.py for "
+                       "the full derivation, the rules, and what was already tried "
+                       "and rejected."),
     Column("total_cals_in", "nutrition", "number", "kcal", "meals", WAKING_DAY,
            NEUTRAL, tier=1, range=(0, 15000), precision=1,
            description="Total energy eaten across the waking day (05:00 to 05:00, so "
@@ -353,6 +369,56 @@ DAILY_COLUMNS: List[Column] = [
     _nutrient("vitamin_a_ug", "ug", "vitamin A"),
     _nutrient("folate_ug", "ug", "folate"),
     _nutrient("omega3_g", "g", "omega-3 fatty acids"),
+
+    # -- strength training (transcribed from a Hevy session screenshot) --------
+    # Grain note: the per-set truth lives in the `sessions` tab, exactly as the
+    # per-ingredient truth lives in `meals`. These five columns are the 1:1-with-date
+    # roll-up — the row you (or a model) actually read.
+    #
+    # There is deliberately NO total-tonnage column. Sum(load x reps) across
+    # exercises is not comparable day to day: it rises when you add a set of curls
+    # and falls when you swap squats for lunges, so it cannot answer "are my loads
+    # going up". `lift_load_index` answers that instead, by normalising each
+    # exercise against its own history — the same move the `baselines` tab already
+    # makes for every other metric.
+    Column("lift_load_index", "training", "number", "index", "derived",
+           PERFORMED_ON, UP_GOOD, tier=1, range=(20, 300), precision=1,
+           description="How heavy this session was against your own recent best, "
+                       "as a percentage: 100 = exactly at baseline, 107 = 7% above. "
+                       "Per exercise, the session's best estimated 1RM (Epley: "
+                       "load x (1 + reps/30)) divided by that same exercise's best "
+                       "e1RM over the previous 28 days, then averaged across the "
+                       "exercises trained. Comparable across sessions with different "
+                       "exercises, which raw tonnage is not. Blank until an exercise "
+                       "has 28 days of history to compare against. This is an "
+                       "OUTCOME — what the body managed today, caused by the "
+                       "PREVIOUS day's food and sleep — so it pairs against day N-1's "
+                       "intake, never this row's."),
+    Column("lift_hard_sets", "training", "integer", "count", "training",
+           CALENDAR_DAY, NEUTRAL, tier=1, range=(0, 100),
+           description="Sets taken to RIR <= 2 (within two reps of failure). The "
+                       "volume measure hypertrophy actually responds to. Warm-up "
+                       "sets are excluded. Neutral rather than up_good on purpose: "
+                       "this is a dose against a weekly per-muscle target, not a "
+                       "number to maximise."),
+    Column("lift_sets", "training", "integer", "count", "training", CALENDAR_DAY,
+           NEUTRAL, tier=2, range=(0, 100),
+           description="Working sets performed this day, warm-ups excluded. Blank "
+                       "on a day with no logged session."),
+    Column("lift_session", "training", "string", "", "training", CALENDAR_DAY,
+           NEUTRAL, tier=2,
+           description="The session's name as the training app titled it (e.g. "
+                       "'Tronco A'). Several sessions in one day are joined with "
+                       "' + '. Blank on a day with no logged session."),
+    Column("lift_summary", "training", "string", "", "training", CALENDAR_DAY,
+           NEUTRAL, tier=2,
+           description="The whole session in one readable line — 'Tronco A - supino "
+                       "4x8@60 - remada 4x10@45 - 18 sets (14 hard) - RIR 2.1'. "
+                       "Deliberately compact text and NOT JSON: the same content as "
+                       "JSON costs ~5x the tokens (it repeats every key on every "
+                       "set), and this column is read on every row of every export "
+                       "and every coach prompt. The per-set detail is in the "
+                       "`sessions` tab for anything that needs it."),
 
     # -- body composition (OCR'd from the scale app screenshot) ----------------
     Column("weight_kg", "body", "number", "kg", "scale", MORNING_OF, NEUTRAL,

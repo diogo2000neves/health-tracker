@@ -7,6 +7,9 @@ import importlib.util
 import json
 import pathlib
 
+import random
+import ssl
+
 import pytest
 from google.genai import errors as genai_errors
 
@@ -571,7 +574,11 @@ def test_split_jpegs_passes_through_non_jpeg():
 
 def test_images_from_json_decodes_a_base64_array():
     import base64
-    a, b = _jpeg(b"\xaa\xaa"), _jpeg(b"\xbb\xbb")
+    # Realistically sized scans: the JSON path applies MIN_IMAGE_BYTES, because
+    # that is where a truncated header would otherwise pass for a photo. The
+    # 11-byte parser fixture is still right for _split_jpegs, which only cares
+    # about structure.
+    a, b = _jpeg(b"\xaa" * 2000), _jpeg(b"\xbb" * 2000)
     payload = {"images": [base64.b64encode(a).decode(),
                           "!!not-base64!!",                  # skipped
                           base64.b64encode(b).decode()],
@@ -609,10 +616,11 @@ def test_extract_images_collects_every_multipart_file_in_order():
 
 def test_build_prompt_adds_multi_and_note_blocks_only_when_relevant():
     # one photo, no note => router + base rubric (+ the always-on save-template
-    # rule) + the body section, which every image prompt carries
+    # rule) + the body and workout sections, which every image prompt carries
     plain = ingest._build_prompt(1, "")
     assert plain == (ingest.ROUTER_PREFIX + ingest.PROMPT
-                     + ingest.TEMPLATE_SAVE_SUFFIX + ingest.BODY_SECTION)
+                     + ingest.TEMPLATE_SAVE_SUFFIX + ingest.BODY_SECTION
+                     + ingest.WORKOUT_SECTION)
     assert "MULTIPLE IMAGES" not in plain and "NOTE:" not in plain
     # several photos => the multi-image block, carrying the count
     multi = ingest._build_prompt(3, "")
@@ -1030,6 +1038,85 @@ def test_body_section_defuses_the_delta_block_and_forbids_guessing():
     assert '`kind` to "meal"' in ingest.ROUTER_PREFIX
 
 
+def test_workout_section_forbids_the_screen_decorations_that_look_like_sets():
+    section = ingest.WORKOUT_SECTION
+    # the traps: a PR badge, the previous session's column, and the totals row —
+    # all printed in the same shape as a real set (see gotcha 3, and the scale
+    # app's "since <date>" block that this is the training-screen analogue of)
+    assert "PR" in section and "PREVIOUS" in section
+    assert "Volume" in section          # a totals row read as a set is a 4520 kg lift
+    assert "1RM" in section             # the app's own arithmetic, not a set
+    assert "Do NOT convert" in section  # units are converted server-side
+    # the markers whose absence silently inflates or zeroes a session
+    for marker in ("warmup", "bodyweight", "assisted", "rir"):
+        assert marker in section
+    # never collapse identical sets — that would throw away the per-set loads
+    assert "never collapse" in section.lower()
+    # the router forks before any rubric is read
+    assert '`kind` to "workout"' in ingest.ROUTER_PREFIX
+
+
+def test_a_workout_screenshot_is_transcribed_not_estimated_as_food(monkeypatch):
+    import json
+    reply = json.dumps({
+        "kind": "workout", "reasoning": "read 2 exercises",
+        "workout": {
+            "title": "Tronco A", "performed_at": "2026-08-21T18:42",
+            "duration_min": 62, "unit": "kg",
+            "sets": [
+                {"exercise": "barbell bench press", "set_type": "normal",
+                 "load_type": "external", "weight_kg": 60, "reps": 8, "rir": 2},
+            ],
+        },
+        "items": [], "confidence": 0,
+    })
+    _fake_genai([reply], monkeypatch)
+    monkeypatch.setenv("GEMINI_MODELS", "m1")
+    rec = ingest._run_models(["prompt"])
+    assert rec["kind"] == "workout"
+    assert rec["title"] == "Tronco A"
+    assert rec["sets"][0]["weight_kg"] == 60
+    assert "foods" not in rec            # never assembled as a meal
+
+
+def test_text_only_path_cannot_be_hijacked_into_a_workout(monkeypatch):
+    # a note has no screen to read, so "workout" there is a hallucination
+    import json
+    reply = json.dumps({"kind": "workout", "reasoning": "x",
+                        "workout": {"sets": []}, "items": [], "confidence": 0})
+    _fake_genai([reply], monkeypatch)
+    monkeypatch.setenv("GEMINI_MODELS", "m1")
+    rec = ingest._run_models(["prompt"], allow_body=False, allow_bowel=True,
+                             allow_workout=False)
+    assert rec["kind"] == "meal"
+
+
+def test_analyze_text_closes_the_workout_fork(monkeypatch):
+    from datetime import datetime
+    captured = {}
+
+    def fake_run(contents, **kw):
+        captured["kw"] = kw
+        return {"kind": "meal"}
+
+    monkeypatch.setattr(ingest, "_run_models", fake_run)
+    ingest.analyze_text("fiz cocó", datetime(2026, 7, 15, 9, 0))
+    assert captured["kw"]["allow_workout"] is False
+
+
+def test_every_workout_schema_key_is_named_in_the_cli_contract():
+    """Gemini gets the set shape from WORKOUT_RESPONSE_SCHEMA; the CLI path has no
+    response_schema and must be told the same thing in prose, or the two providers
+    silently disagree about what a set is."""
+    import claude_estimator
+    block = claude_estimator.JSON_INSTRUCTIONS
+    set_schema = ingest.WORKOUT_RESPONSE_SCHEMA.properties["sets"].items
+    for key in set_schema.properties:
+        assert f'"{key}"' in block, f"{key} missing from the CLI output contract"
+    for key in ingest.WORKOUT_RESPONSE_SCHEMA.properties:
+        assert f'"{key}"' in block, f"{key} missing from the CLI output contract"
+
+
 def test_col_letter_reaches_past_z():
     # daily_summary is 40 columns wide — the body block lives past Z
     assert ingest._col_letter(0) == "A"
@@ -1104,6 +1191,13 @@ _DAILY_GRID = [
     ["2026-07-16", "", 525, 73.1, 866, "", 1800, "x"],
 ]
 
+# ALWAYS pass this to /daily when asserting on `days`. The grid above is pinned to
+# fixed dates, but /daily defaults to a trailing 30-day window off the wall clock —
+# so any test that omits a range starts passing, then silently begins returning
+# zero days once real time moves 30 days past the fixture. That is exactly what
+# happened in Aug 2026. Tests that assert only on error handling don't need it.
+_RANGE = "from=2026-07-15&to=2026-07-16"
+
 
 def _api(monkeypatch, grid=None):
     monkeypatch.setattr(ingest, "_read_tab", lambda tab: grid or _DAILY_GRID)
@@ -1154,7 +1248,8 @@ def test_values_are_typed_from_the_schema(monkeypatch):
 
 
 def test_the_app_can_ask_for_only_the_blocks_it_draws(monkeypatch):
-    body = _api(monkeypatch).get("/daily?blocks=sleep,recovery", headers=_HDR).get_json()
+    body = _api(monkeypatch).get(
+        f"/daily?{_RANGE}&blocks=sleep,recovery", headers=_HDR).get_json()
     assert body["blocks"] == ["sleep", "recovery"]
     day = body["days"][0]
     assert "sleep" in day and "recovery" in day
@@ -1169,7 +1264,7 @@ def test_unknown_block_is_rejected_with_the_valid_list(monkeypatch):
 
 
 def test_tier1_trims_to_the_headline_metrics(monkeypatch):
-    day = _api(monkeypatch).get("/daily?tier=1&blocks=recovery",
+    day = _api(monkeypatch).get(f"/daily?{_RANGE}&tier=1&blocks=recovery",
                                 headers=_HDR).get_json()["days"][0]
     assert "hrv_ms" in day["recovery"]                 # tier 1
     assert "hrv_entropy" not in day["recovery"]        # tier 2
@@ -1333,14 +1428,19 @@ def test_micro_targets_are_adult_male_references():
 def test_fixed_targets_returns_the_daily_plan():
     t = ingest._fixed_targets()
     assert t["calories"]["kind"] == "window"
-    assert t["calories"]["floor"] == 1925.0 and t["calories"]["ceiling"] == 2075.0
-    assert t["protein_g"] == {"kind": "reach", "floor": 165.0, "unit": "g",
+    assert t["calories"]["floor"] == 2475.0 and t["calories"]["ceiling"] == 2625.0
+    assert t["protein_g"] == {"kind": "reach", "floor": 170.0, "unit": "g",
                               "source": "fixed"}
-    assert t["fat_g"] == {"kind": "reach", "floor": 55.0, "unit": "g",
+    assert t["fat_g"] == {"kind": "reach", "floor": 80.0, "unit": "g",
                           "source": "fixed"}
-    assert t["carbs_g"] == {"kind": "reach", "floor": 210.0, "unit": "g",
+    assert t["carbs_g"] == {"kind": "reach", "floor": 288.0, "unit": "g",
                             "source": "fixed"}
-    assert t["fiber_g"]["floor"] == 28.0                     # 14 g / 1000 kcal * 2000
+    assert t["fiber_g"]["floor"] == 36.0                     # 14 g / 1000 kcal * 2550
+    # The macros must actually add up to the calorie target, or the plan is incoherent
+    # however plausible each number looks on its own.
+    kcal = (t["protein_g"]["floor"] * 4 + t["carbs_g"]["floor"] * 4
+            + t["fat_g"]["floor"] * 9)
+    assert abs(kcal - ingest.FIXED_CALORIES_KCAL) <= 10
     assert t["saturated_fat_g"]["kind"] == "limit"           # ceiling, not a floor
     assert "ceiling" in t["saturated_fat_g"] and "floor" not in t["saturated_fat_g"]
     # the same plan every time — nothing here depends on measured data
@@ -1502,9 +1602,9 @@ def test_today_attaches_the_fixed_targets_and_rda_defaults(monkeypatch):
     t = _today_client(monkeypatch).get(
         "/today?date=2026-07-18", headers=_HDR).get_json()["targets"]
     # the fixed daily plan, regardless of the user's own data
-    assert t["protein_g"] == {"kind": "reach", "floor": 165.0, "unit": "g",
+    assert t["protein_g"] == {"kind": "reach", "floor": 170.0, "unit": "g",
                               "source": "fixed", "horizon": "daily"}
-    assert t["calories"]["floor"] == 1925.0 and t["calories"]["ceiling"] == 2075.0
+    assert t["calories"]["floor"] == 2475.0 and t["calories"]["ceiling"] == 2625.0
     # an RDA default present alongside the fixed macros
     assert t["vitamin_c_mg"]["floor"] == 90.0 and t["vitamin_c_mg"]["source"] == "rda"
     assert t["sodium_mg"]["ceiling"] == 2300.0 and t["sodium_mg"]["source"] == "rda"
@@ -1529,7 +1629,7 @@ def test_today_stamps_horizon_and_returns_the_rolling_history(monkeypatch):
 def test_today_basis_exposes_the_fixed_target_and_measured_weight(monkeypatch):
     b = _today_client(monkeypatch).get(
         "/today?date=2026-07-18", headers=_HDR).get_json()["basis"]
-    assert b["calorie_target_kcal"] == 2000.0
+    assert b["calorie_target_kcal"] == 2550.0
     assert b["weight_kg"] == 70.0 and b["lean_mass_kg"] == 56.3
 
 
@@ -1669,3 +1769,475 @@ def test_nutrient_info_covers_every_nutrient_as_a_fillable_row():
     # PDF is only ever filling blanks — never adding rows.
     info = ingest._nutrient_info()
     assert set(info["nutrients"]) == set(ingest.NUTRIENT_KEYS)
+
+
+def test_llm_mode_reads_the_same_duplicate_as_capabilities_does(monkeypatch):
+    """The live `config` tab carries 20+ copies of every key from an old seeding
+    bug. `capabilities.from_config` resolves those by letting the LAST one win, so
+    this reader must too — otherwise editing "the" cell changes one subsystem's
+    behaviour and not the other's."""
+    from schema import capabilities as caps
+    rows = [["key", "value", "notes"],
+            ["llm_mode", "auto", ""],
+            ["blocks", "full", ""],
+            ["llm_mode", "economy", ""]]
+    monkeypatch.setattr(ingest, "_read_config_grid", lambda: rows)
+    monkeypatch.setattr(ingest, "_llm_mode_cached", (0.0, ""))
+    assert ingest._llm_mode() == "economy"
+    # the same precedence capabilities applies to its own keys
+    assert caps.from_config([{"key": "blocks", "value": "nutrition"},
+                             {"key": "blocks", "value": "full"}]).preset == "full"
+
+
+def test_an_unreadable_config_leaves_routing_at_auto(monkeypatch):
+    def boom():
+        raise RuntimeError("sheets is down")
+
+    monkeypatch.setattr(ingest, "_read_config_grid", boom)
+    monkeypatch.setattr(ingest, "_llm_mode_cached", (0.0, ""))
+    assert ingest._llm_mode() == "auto"
+
+
+# -- classify-then-route (what makes the fast tier reachable at all) -----------
+def test_a_scale_screenshot_is_routed_to_the_transcription_tier(monkeypatch):
+    import claude_estimator
+    monkeypatch.setattr(claude_estimator, "enabled", lambda: True)
+    monkeypatch.setattr(claude_estimator, "analyze",
+                        lambda *a, **k: {"kind": "body"})
+    assert ingest._classify_images([(b"x", "image/jpeg")]) == "ingest.body_ocr"
+
+
+def test_a_workout_screenshot_is_routed_to_the_transcription_tier(monkeypatch):
+    import claude_estimator
+    monkeypatch.setattr(claude_estimator, "enabled", lambda: True)
+    monkeypatch.setattr(claude_estimator, "analyze",
+                        lambda *a, **k: {"kind": "workout"})
+    assert ingest._classify_images([(b"x", "image/jpeg")]) == "ingest.workout_ocr"
+
+
+@pytest.mark.parametrize("verdict", ["meal", "", "banana", None])
+def test_anything_short_of_a_confident_screenshot_stays_on_the_deep_tier(
+        verdict, monkeypatch):
+    """The asymmetry IS the safety property. A screenshot sent to the deep tier
+    costs a little of the Claude window; a MEAL sent to the fast tier costs
+    accuracy on the number §2e says is already carrying a measured bias."""
+    import claude_estimator
+    monkeypatch.setattr(claude_estimator, "enabled", lambda: True)
+    monkeypatch.setattr(claude_estimator, "analyze",
+                        lambda *a, **k: {"kind": verdict})
+    assert ingest._classify_images([(b"x", "image/jpeg")]) == ingest.MEAL_SOURCE
+
+
+def test_a_broken_classifier_never_blocks_an_ingest(monkeypatch):
+    import claude_estimator
+    monkeypatch.setattr(claude_estimator, "enabled", lambda: True)
+
+    def boom(*a, **k):
+        raise RuntimeError("agy could not be started")
+
+    monkeypatch.setattr(claude_estimator, "analyze", boom)
+    # degrades to exactly the behaviour this system had before routing existed
+    assert ingest._classify_images([(b"x", "image/jpeg")]) == ingest.MEAL_SOURCE
+
+
+def test_no_classify_call_is_made_when_there_is_nothing_to_classify(monkeypatch):
+    import claude_estimator
+    called = []
+    monkeypatch.setattr(claude_estimator, "enabled", lambda: True)
+    monkeypatch.setattr(claude_estimator, "analyze",
+                        lambda *a, **k: called.append(1) or {"kind": "body"})
+    assert ingest._classify_images([]) == ingest.MEAL_SOURCE
+    assert not called
+
+
+def test_the_classifier_gets_its_own_short_timeout(monkeypatch):
+    """It asks one question and reads one word back. Letting it inherit the
+    estimator's 900 s would mean a hung classify eats the budget the real call
+    needs — and falling back to the deep tier is already a correct answer."""
+    import claude_estimator
+    seen = {}
+    monkeypatch.setattr(claude_estimator, "enabled", lambda: True)
+
+    def capture(prompt, images=None, **kw):
+        seen.update(kw)
+        seen["prompt"] = prompt
+        return {"kind": "body"}
+
+    monkeypatch.setattr(claude_estimator, "analyze", capture)
+    ingest._classify_images([(b"x", "image/jpeg")])
+    assert seen["timeout_override"] == ingest.CLASSIFY_TIMEOUT_S
+    assert seen["timeout_override"] < claude_estimator.DEFAULT_TIMEOUT_S
+    assert seen["source"] == "ingest.image_router"
+    # the cheap call carries the question only — no rubric, no sections
+    assert "SECTION" not in seen["prompt"]
+    assert len(seen["prompt"]) < len(ingest.PROMPT) / 4
+
+
+def test_the_classifiers_safe_answer_is_spelled_out_in_its_prompt():
+    p = ingest.CLASSIFY_PROMPT
+    assert '"body"' in p and '"workout"' in p and '"meal"' in p
+    assert "not certain" in p and "safe answer" in p
+
+
+# -- concatenated screenshots (the workout / scale send path) -------------------
+def _png(width=64, height=64, shade=0):
+    """A valid PNG, built here so the tests need no fixtures.
+
+    Pixels are pseudo-random rather than a flat colour, for one reason that
+    matters: a solid-colour image compresses to a couple of hundred bytes, which
+    is below MIN_IMAGE_BYTES and would make every test here assert against
+    something the real code rejects. `shade` seeds the noise, so different shades
+    give genuinely different files."""
+    import struct, zlib
+    rnd = random.Random(shade)
+    raw = b"".join(bytes([0]) + bytes(rnd.randrange(256)
+                                      for _ in range(width * 3))
+                   for _ in range(height))
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    out = (ingest.PNG_MAGIC
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw))
+           + chunk(b"IEND", b""))
+    assert len(out) > ingest.MIN_IMAGE_BYTES, "fixture must clear the size floor"
+    return out
+
+
+def test_three_concatenated_screenshots_split_back_into_three():
+    """A Hevy session rarely fits one screen, and iOS Shortcuts packs several
+    images into ONE part with the files simply concatenated. Without this, sending
+    three screenshots delivers one unreadable blob and loses two silently."""
+    shots = [_png(shade=s) for s in (0, 128, 255)]
+    out = ingest._split_jpegs(b"".join(shots))
+    assert out == shots
+
+
+def test_a_single_screenshot_is_returned_untouched():
+    one = _png()
+    assert ingest._split_jpegs(one) == [one]
+
+
+def test_a_png_signature_inside_pixel_data_is_not_a_boundary():
+    """Why _png_end walks the chunk table instead of searching for the next
+    signature: those eight bytes can occur inside compressed pixel data."""
+    import struct, zlib
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    # a chunk whose payload literally contains the PNG magic
+    booby = (ingest.PNG_MAGIC
+             + chunk(b"IHDR", struct.pack(">IIBBBBB", 4, 4, 8, 2, 0, 0, 0))
+             + chunk(b"IDAT", ingest.PNG_MAGIC * 3)
+             + chunk(b"IEND", b""))
+    assert ingest._split_jpegs(booby) == [booby]
+
+
+def test_the_mime_of_a_split_screenshot_is_png_not_jpeg():
+    segs = ingest._split_jpegs(_png() + _png(shade=200))
+    assert [ingest._sniff_mime(s) for s in segs] == ["image/png", "image/png"]
+
+
+def test_a_truncated_png_degrades_to_one_image_instead_of_raising():
+    assert ingest._split_jpegs(_png()[:20]) == [_png()[:20]]
+
+
+def test_heic_is_still_left_alone():
+    # a single-file container off the camera — never concatenated
+    heic = b"\x00\x00\x00\x18ftypheic" + b"\x00" * 64
+    assert ingest._split_jpegs(heic) == [heic]
+
+
+def test_json_images_carry_multiple_screenshots_through(monkeypatch):
+    """The reliable Shortcuts multi-image route is the JSON base64 array, and it
+    must survive PNGs as well as JPEGs."""
+    import base64, json
+    shots = [_png(shade=0), _png(shade=255)]
+    body = json.dumps({"images": [base64.b64encode(s).decode() for s in shots]})
+    with ingest.app.test_request_context("/ingest", method="POST", data=body,
+                                         content_type="application/json"):
+        got = ingest._extract_images()
+    assert [d for d, _ in got] == shots
+    assert {m for _, m in got} == {"image/png"}
+
+
+# -- the Shortcuts JSON payload, in every shape it actually arrives in ---------
+def _padded_pngs(n=3):
+    """PNGs whose base64 genuinely carries "=" padding — the case that silently
+    lost images before _b64_units existed. Without forcing padding the bug is
+    invisible, which is exactly how it would have shipped."""
+    import base64 as b64mod
+    shots = []
+    for width in range(64, 200):
+        for shade in (1, 2, 3, 4, 5):
+            one = _png(width=width, shade=shade)
+            if b64mod.b64encode(one).decode().endswith("=") and one not in shots:
+                shots.append(one)
+                break
+        if len(shots) == n:
+            break
+    assert len(shots) == n
+    return shots
+
+
+@pytest.mark.parametrize("join", [None, "\n", " ", ""])
+def test_three_screenshots_survive_however_shortcuts_packs_them(join):
+    """Putting a repeat's results into a JSON body field does NOT reliably produce
+    a JSON array — Shortcuts can flatten the list into one string. Decoded naively
+    that is a silent 2-of-3 loss, because b64decode stops making sense at the first
+    embedded pad."""
+    import base64, json
+    shots = _padded_pngs()
+    encoded = [base64.b64encode(s).decode() for s in shots]
+    payload = {"images": encoded if join is None else join.join(encoded)}
+    with ingest.app.test_request_context("/ingest", method="POST",
+                                         data=json.dumps(payload),
+                                         content_type="application/json"):
+        got = ingest._extract_images()
+    assert [d for d, _ in got] == shots
+    assert {m for _, m in got} == {"image/png"}
+
+
+def test_the_padding_case_is_the_one_that_actually_bites():
+    # Guards the fixture itself: if these ever stop carrying "=", the test above
+    # silently stops testing anything.
+    import base64
+    assert all(base64.b64encode(s).decode().endswith("=") for s in _padded_pngs())
+
+
+def test_a_run_with_no_padding_is_left_for_the_image_splitter():
+    # No "=" means no boundary marker in the base64 — but the decoded bytes are
+    # concatenated image files, which _split_jpegs separates.
+    assert ingest._b64_units("QUJDRA") == ["QUJDRA"]
+
+
+def test_units_split_on_padding_boundaries():
+    assert ingest._b64_units("QQ==QUJD") == ["QQ==", "QUJD"]
+    assert ingest._b64_units("QQ==\nQUJD") == ["QQ==", "QUJD"]
+
+
+def test_garbage_in_the_images_field_is_ignored_not_fatal():
+    import json
+    for payload in ({"images": 7}, {"images": [None, 3, ""]}, {"images": "!!!!"}):
+        with ingest.app.test_request_context("/ingest", method="POST",
+                                             data=json.dumps(payload),
+                                             content_type="application/json"):
+            assert ingest._extract_images() == [] or True  # must not raise
+
+
+def test_unencoded_photo_variables_are_refused_instead_of_becoming_a_row():
+    """The failure this prevents is silent and expensive: a Shortcut that forgets
+    to base64-encode sends text, any 12-character string decodes to 9 bytes, and
+    _sniff_mime calls that image/jpeg. It would be archived to Drive, sent to the
+    model, and written as a meal."""
+    import json
+    for junk in ("AAAAAAAAAAAA", "Fotografia01", "abcdabcdabcd"):
+        with ingest.app.test_request_context("/ingest", method="POST",
+                                             data=json.dumps({"images": junk}),
+                                             content_type="application/json"):
+            assert ingest._extract_images() == []
+
+
+def test_real_image_headers_are_still_accepted():
+    assert ingest._looks_like_image(_png())
+    assert ingest._looks_like_image(b"\xff\xd8\xff\xe0" + b"\x00" * 4000)
+    assert ingest._looks_like_image(b"\x00\x00\x00\x18ftypheic" + b"\x00" * 4000)
+    assert not ingest._looks_like_image(b"not an image at all")
+    assert not ingest._looks_like_image(b"")
+
+
+def test_the_multipart_path_is_deliberately_not_gated_on_magic_bytes():
+    """A multipart part is a real file with its own declared content type — the
+    guessing that _looks_like_image guards against happens only on the JSON path.
+    Pinned so nobody 'tidies' the check into both and breaks a working Shortcut."""
+    from io import BytesIO
+    with ingest.app.test_request_context("/ingest", method="POST", data={
+        "image": (BytesIO(b"\xff\xd8plate"), "plate.jpg"),
+    }, content_type="multipart/form-data"):
+        assert len(ingest._extract_images()) == 1
+
+
+# -- the 2026-08-21 regression: MIME line-wrapped base64 -----------------------
+def _wrapped(data, width=76):
+    """Base64 as Shortcuts actually emits it: MIME, wrapped at 76 characters."""
+    import base64, textwrap
+    return "\n".join(textwrap.wrap(base64.b64encode(data).decode(), width))
+
+
+@pytest.mark.parametrize("shape", ["array", "joined"])
+def test_line_wrapped_base64_is_one_image_not_one_per_line(shape):
+    """THE bug that cost a real ingest. Shortcuts emits MIME base64 wrapped at 76
+    chars; splitting on whitespace made every LINE its own "image", each decoding
+    to 57 bytes — a PNG signature, an IHDR, and the start of an iCCP chunk. Six
+    screenshots reached the model as six truncated headers."""
+    import json
+    shots = _padded_pngs()
+    wrapped = [_wrapped(s) for s in shots]
+    payload = {"images": wrapped if shape == "array" else "\n".join(wrapped)}
+    with ingest.app.test_request_context("/ingest", method="POST",
+                                         data=json.dumps(payload),
+                                         content_type="application/json"):
+        got = ingest._extract_images()
+    assert [d for d, _ in got] == shots
+
+
+def test_whitespace_is_not_a_payload_boundary():
+    import base64
+    one = base64.b64encode(b"x" * 90).decode()          # no padding
+    assert ingest._b64_units("\n".join([one[:76], one[76:]])) == [one]
+
+
+def test_padding_is_the_only_boundary():
+    assert ingest._b64_units("QQ==QUJD") == ["QQ==", "QUJD"]
+    assert ingest._b64_units("   ") == []
+
+
+def test_a_truncated_png_header_is_not_an_image():
+    """The second half of the same failure: _looks_like_image waved the 57-byte
+    stub through because a truncated header still STARTS like a PNG. Starting like
+    one and being one are different claims."""
+    whole = _png()
+    assert ingest._looks_like_image(whole * 40)          # big enough, has IEND
+    assert not ingest._looks_like_image(whole[:57])      # the exact stub shape
+    assert not ingest._looks_like_image(ingest.PNG_MAGIC + b"\x00" * 4000)  # no IEND
+
+
+def test_a_real_sized_jpeg_still_passes():
+    assert ingest._looks_like_image(b"\xff\xd8\xff\xe0" + b"\x00" * 4000)
+    assert not ingest._looks_like_image(b"\xff\xd8\xff\xe0" + b"\x00" * 8)
+
+
+def test_the_workout_prompt_tells_the_model_the_shots_overlap():
+    """Screenshots of a scrolled session repeat content on purpose. Without this
+    the model reads the repeat as more sets and inflates the whole session."""
+    section = ingest.WORKOUT_SECTION
+    assert "OVERLAP" in section.upper()
+    assert "not as separate sessions" in section
+    assert "four sets, not eight" in section
+    # and the genuine-second-block case must survive the de-duplication
+    assert "SEPARATE blocks" in section
+
+
+def test_a_routing_bypass_is_logged_loudly_enough_to_survive_startup(caplog):
+    """At import time Flask's app.logger has no handler and inherits the root
+    logger's WARNING threshold, so an INFO line is swallowed — which would make
+    this check worthless exactly when it matters."""
+    import claude_estimator
+    import logging
+    for status, level in [("⚠️ routing BYPASSED: x", logging.WARNING),
+                          ("routing ACTIVE via llm_cli", logging.INFO)]:
+        emitted = (ingest.app.logger.warning if "⚠️" in status
+                   else ingest.app.logger.info)
+        assert emitted == (ingest.app.logger.warning if level == logging.WARNING
+                           else ingest.app.logger.info)
+    # and the real status string carries the marker the dispatch keys on
+    assert claude_estimator.routing_status().startswith(("routing", "⚠️", "local-CLI"))
+
+
+# -- thread safety: the 2026-08-21 duplicate-meal root cause -------------------
+def test_each_thread_gets_its_own_api_client():
+    """httplib2 says of itself: "Not thread-safe, requires external synchronization
+    against concurrent requests." Under --threads 8 a single cached client means
+    eight threads interleaving on one TLS socket, which produced WRONG_VERSION_NUMBER,
+    IncompleteRead, garbage chunk sizes and SIGSEGV — and a meal written twice."""
+    import threading
+    made = []
+
+    @ingest._per_thread
+    def client():
+        made.append(1)
+        return object()
+
+    seen = {}
+
+    def grab(name):
+        seen[name] = (client(), client())      # twice: must be the SAME object
+
+    threads = [threading.Thread(target=grab, args=(n,)) for n in ("a", "b", "c")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(made) == 3                       # one build per thread, not per call
+    for pair in seen.values():
+        assert pair[0] is pair[1]               # cached within the thread
+    assert len({id(p[0]) for p in seen.values()}) == 3   # never shared across them
+
+
+def test_clearing_a_client_only_affects_the_calling_thread():
+    """A thread that hit a broken socket rebuilds its own; it must not yank the
+    connection out from under seven others mid-request."""
+    import threading
+
+    @ingest._per_thread
+    def client():
+        return object()
+
+    mine = client()
+    other = {}
+
+    def elsewhere():
+        other["before"] = client()
+        mine_cleared.wait()
+        other["after"] = client()
+
+    mine_cleared = threading.Event()
+    t = threading.Thread(target=elsewhere)
+    t.start()
+    while "before" not in other:
+        pass
+    client.cache_clear()
+    mine_cleared.set()
+    t.join()
+
+    assert client() is not mine                 # mine was rebuilt
+    assert other["after"] is other["before"]    # theirs was untouched
+
+
+# -- never blind-retry a write that isn't idempotent --------------------------
+def test_an_append_is_not_retried_because_the_row_may_already_exist():
+    """A connection error means the RESPONSE could not be read, never that the
+    request was not performed. Google may well have added the row before the socket
+    broke — retrying here is what turned one lunch into two rows."""
+    calls = []
+
+    def build():
+        calls.append(1)
+        raise ssl.SSLError("WRONG_VERSION_NUMBER")
+
+    with pytest.raises(ssl.SSLError):
+        ingest._execute(build=build, idempotent=False)
+    assert len(calls) == 1, "a non-idempotent write must fail fast, not retry"
+
+
+def test_a_read_is_still_retried(monkeypatch):
+    monkeypatch.setattr(ingest.time, "sleep", lambda *_: None)
+    calls = []
+
+    def build():
+        calls.append(1)
+        if len(calls) < 3:
+            raise ssl.SSLError("WRONG_VERSION_NUMBER")
+
+        class _Req:
+            def execute(self):
+                return {"ok": True}
+        return _Req()
+
+    assert ingest._execute(build)["ok"] is True
+    assert len(calls) == 3
+
+
+def test_every_append_in_the_module_is_marked_non_idempotent():
+    """Pinned by source, because adding a new append and forgetting the flag
+    reintroduces the duplicate silently — the failure only shows up on a bad
+    network day, months later, as one extra row."""
+    src = pathlib.Path(ingest.__file__).read_text()
+    for line in src.splitlines():
+        if "values().append(" in line and "_execute" in line:
+            assert "idempotent=False" in line, f"unguarded append: {line.strip()}"

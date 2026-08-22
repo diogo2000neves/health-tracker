@@ -76,9 +76,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # against the registry so the two can never drift apart.
 WAKING_DAY, CALENDAR_DAY = "waking_day", "calendar_day"
 NIGHT_ENDING, MORNING_OF, DAY_OF = "night_ending", "morning_of", "day_of"
+PERFORMED_ON = "performed_on"
 
 CAUSAL_INPUT = frozenset({WAKING_DAY, CALENDAR_DAY})
-CAUSAL_OUTCOME = frozenset({NIGHT_ENDING, MORNING_OF, DAY_OF})
+CAUSAL_OUTCOME = frozenset({NIGHT_ENDING, MORNING_OF, DAY_OF, PERFORMED_ON})
 
 UP, DOWN = "up", "down"
 
@@ -226,6 +227,37 @@ LINKS: Tuple[Link, ...] = (
          label_pt="sal e peso da manhã seguinte",
          mechanism="O sódio retém água, por isso um dia salgado pesa na balança da "
                    "manhã seguinte sem que nada de gordura tenha mudado."),
+
+    # -- strength training ----------------------------------------------------
+    # The lag on all four is derived, not declared, and it is what makes these
+    # honest: `lift_load_index` is an OUTCOME (performed_on), so an input on day N
+    # meets it on day N+1 — "what I ate yesterday against what I lifted today".
+    # `lift_hard_sets` is an INPUT (the stimulus applied), so it meets the NEXT
+    # night's recovery. Writing those lags by hand is exactly the off-by-one
+    # `_offset` exists to prevent.
+    Link("protein_next_day_load", "total_protein_g", "lift_load_index", UP,
+         ("nutrition", "training"), min_n=20, min_effect=2.0,
+         label_pt="proteína e a carga do dia seguinte",
+         mechanism="A síntese proteica que repara a sessão de ontem corre durante "
+                   "a noite, por isso a proteína de ontem aparece na força de hoje."),
+    Link("calories_next_day_load", "total_cals_in", "lift_load_index", UP,
+         ("nutrition", "training"), min_n=20, min_effect=2.0,
+         label_pt="energia e a carga do dia seguinte",
+         mechanism="O glicogénio muscular reposto pela comida de ontem é o "
+                   "combustível das séries pesadas de hoje; um dia curto em "
+                   "energia paga-se na barra no dia seguinte."),
+    Link("sleep_next_day_load", "sleep_deep_mins", "lift_load_index", UP,
+         ("sleep", "training"), min_n=20, min_effect=2.0,
+         label_pt="sono profundo e a carga do dia seguinte",
+         mechanism="O sono profundo é onde vive a maior parte da libertação de "
+                   "hormona de crescimento e da recuperação neuromuscular que uma "
+                   "série pesada exige."),
+    Link("hard_sets_recovery", "lift_hard_sets", "hrv_ms", DOWN,
+         ("training", "sleep"), min_n=20, min_effect=3.0,
+         label_pt="séries duras e recuperação nocturna",
+         mechanism="Séries levadas perto da falha deixam o sistema nervoso "
+                   "autónomo em tom simpático nessa noite, e a variabilidade "
+                   "cardíaca desce enquanto o corpo ainda está a reparar."),
 )
 
 

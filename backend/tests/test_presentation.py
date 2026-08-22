@@ -41,7 +41,8 @@ def test_a_collapsed_sheet_still_shows_the_headlines():
     visible = [headers[i] for i in range(len(headers)) if i not in grouped]
     assert visible == [
         "date", "bowel_movement", "sleep_mins",
-        "resting_hr_bpm", "total_cals_out", "energy_balance_kcal", "weight_kg",
+        "resting_hr_bpm", "total_cals_out", "energy_balance_kcal",
+        "lift_load_index", "weight_kg",
         "updated_at",
     ]
     from schema.registry import BY_NAME
@@ -54,7 +55,7 @@ def test_small_blocks_are_not_grouped():
     # self_report is 2 columns; grouping it would hide exactly one.
     assert "self_report" not in {g["block"] for g in block_groups()}
     assert {g["block"] for g in block_groups()} == {
-        "sleep", "recovery", "activity", "nutrition", "body"}
+        "sleep", "recovery", "activity", "nutrition", "training", "body"}
 
 
 def test_groups_stay_inside_their_block():

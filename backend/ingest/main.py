@@ -88,6 +88,7 @@ import re
 import socket
 import ssl
 import subprocess
+import threading
 import time
 import math
 import uuid
@@ -114,15 +115,21 @@ from schema.registry import (
 # is pure stdlib and touches nothing at import time — importing main.py must stay
 # possible with no env and no credentials (test_ingest.py asserts it).
 import claude_estimator
+import workouts
 
 app = Flask(__name__)
 # Headroom for a few photos in one meal log while staying under Cloud Run's
 # ~32 MiB request cap.
-app.config["MAX_CONTENT_LENGTH"] = 30 * 1024 * 1024
+# A meal is 1-3 camera photos; a scrolled gym session is 4-8 full-resolution
+# screenshots, and base64 adds a third on top. 30 MB was comfortable for the
+# former and marginal for the latter, and the failure mode is a bare 413 that says
+# nothing about which screenshot was one too many.
+app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
 
 MEALS_TAB = "meals"
 DAILY_TAB = "daily_summary"
 TEMPLATES_TAB = "templates"
+SESSIONS_TAB = "sessions"
 # What this user measures. One row per setting; see schema/capabilities.py.
 CONFIG_TAB = "config"
 
@@ -148,6 +155,22 @@ LAST_COL = chr(ord("A") + len(MEALS_HEADERS) - 1)  # "O"
 # per-ingredient JSON shape as meals, so a template is just a canonical, measured
 # items array. Matching a photo to one of these replaces the vision estimate with
 # these exact numbers, so a repeat meal gets identical values every time.
+# One row per training session — the event-grain table for lifting, exactly as
+# `meals` is for food. `sets_json` carries the per-set array for the same reason
+# `meals.items` carries the per-ingredient one: that is where cardinality genuinely
+# varies. The five daily_summary `lift_*` columns are the 1:1-with-date roll-up
+# derived from these rows, and they are what anything reading the sheet should use.
+#
+# Append-only by intent: a session is an observation of something that happened,
+# never rebuilt. `e1rms_json` is cached per session so a baseline lookup does not
+# have to re-derive every set of the last 28 days on every write.
+SESSIONS_HEADERS = [
+    "datetime", "date", "title", "duration_min", "exercises", "sets",
+    "hard_sets", "sets_json", "e1rms_json", "load_index", "image_sha",
+    "photo_url", "confidence", "model", "note",
+]
+SESSIONS_LAST_COL = chr(ord("A") + len(SESSIONS_HEADERS) - 1)  # "O"
+
 TEMPLATES_HEADERS = [
     "name", "description", "items", "portion_g",
     "calories", "protein_g", "carbs_g", "fat_g", "created_at", "updated_at",
@@ -251,6 +274,12 @@ DEFAULT_FALLBACK_LAST_N = 2
 #    request timeout. It is measured from the start of the request (see
 #    _analysis_budget), so the worst case is DEADLINE_S + TIMEOUT_MS + the final
 #    sheet write = 105 + 60 + ~5 = ~170 s, inside the 180 s timeout.
+# The image router asks one question and reads one word back. It must never eat the
+# budget the real call needs, so it gets its own short timeout rather than the
+# estimator's 900 s: a slow classify is a classify not worth waiting for, and
+# falling back to the deep tier is a correct answer.
+CLASSIFY_TIMEOUT_S = 120
+
 DEFAULT_MAX_OUTPUT_TOKENS = 8192
 DEFAULT_TIMEOUT_MS = 60000
 DEFAULT_DEADLINE_S = 105
@@ -431,14 +460,30 @@ _NUTRIENT_KINETICS: Dict[str, Tuple[str, Optional[float]]] = {
     "zinc_mg":        (HORIZON_DAILY,   40.0),     # excess depletes copper
 }
 
-# The daily plan: 2000 kcal at a ~700 kcal deficit, protein-forward to hold muscle
-# through the cut. Fixed every day by design (see _fixed_targets) — this replaced
-# a system that recomputed calories/macros live from a rolling TDEE average, which
-# made the goal move day to day for no reason the app could explain to the user.
-FIXED_CALORIES_KCAL = 2000.0
-FIXED_PROTEIN_G = 165.0
-FIXED_FAT_G = 55.0
-FIXED_CARBS_G = 210.0
+# The daily plan: 2550 kcal against a measured TDEE of ~2570 — maintenance, not a
+# deficit. Protein-forward at 170 g (2.6 g/kg) precisely BECAUSE the energy is not in
+# surplus: at maintenance it is protein, not the surplus, that decides whether the
+# tissue built is muscle. Fat held at ~28% of energy for the hormonal profile; carbs
+# take the remainder.
+#
+# This replaced a 2000 kcal / ~700 kcal deficit plan on 2026-08-20, after a DEXA and
+# 34 days of logs showed the deficit WAS the problem, not the thing that would fix it:
+# energy availability averaging 38 kcal/kg FFM with 10 days under 30, and ~75% of the
+# 3 kg lost coming off lean mass. Two lessons worth keeping:
+#   * a plan that lives in constants can only be changed by a deploy, which is why a
+#     month of unintended deficit went by looking like adherence. Making the plan
+#     phased, dated data is proposal §1.1 in new_plan_phases/;
+#   * the numbers here are the steady state (Fase 2/3, weeks 3-24). The plan's 2-week
+#     ramp at 2600 kcal is deliberately NOT modelled — there is nowhere to put a date
+#     range yet, and inventing one here would be the same mistake in a new place.
+#
+# Still fixed every day by design (see _fixed_targets) — that replaced a system which
+# recomputed calories/macros live from a rolling TDEE average, and so made the goal
+# move day to day for no reason the app could explain to the user.
+FIXED_CALORIES_KCAL = 2550.0
+FIXED_PROTEIN_G = 170.0
+FIXED_FAT_G = 80.0
+FIXED_CARBS_G = 288.0
 CALORIE_WINDOW_KCAL = 75.0     # a fixed cushion around the target, not derived
 FIBER_G_PER_1000KCAL = 14.0    # standard fibre recommendation
 LIMIT_ENERGY_FRACTION = 0.10   # added sugar & saturated fat ceilings: 10% of energy
@@ -452,15 +497,24 @@ LIMIT_ENERGY_FRACTION = 0.10   # added sugar & saturated fat ceilings: 10% of en
 # to hit a free-tier 503.
 ROUTER_PREFIX = """FIRST, CLASSIFY THE IMAGE. Everything else follows from this.
 
-Is it a SCREENSHOT of a body-composition / smart-scale phone app — a list of body
-metrics like weight, BMI, body fat, muscle mass, bone mass, BMR, metabolic age?
-Or is it FOOD — a meal, a drink, a nutrition label, packaging?
+There are exactly three possibilities:
 
-  * A screenshot of body metrics -> set `kind` to "body", follow SECTION B and
-    SECTION B ONLY. Return `items` as [] and `confidence` as 0. Do not analyse it
-    as food; there is no food in it.
-  * Anything else -> set `kind` to "meal", leave `body` empty, and follow
-    SECTION A.
+  * A SCREENSHOT of a body-composition / smart-scale phone app — a list of body
+    metrics like weight, BMI, body fat, muscle mass, bone mass, BMR, metabolic
+    age -> set `kind` to "body", follow SECTION B and SECTION B ONLY. Return
+    `items` as [] and `confidence` as 0. There is no food in it.
+  * A SCREENSHOT of a WEIGHT-TRAINING app (a finished gym session: a list of
+    exercises, each with sets showing a load and a rep count, often with RIR, a
+    session title and a duration) -> set `kind` to "workout", follow SECTION C
+    and SECTION C ONLY. Return `items` as [] and `confidence` as 0. There is no
+    food in it either.
+  * FOOD — a meal, a drink, a nutrition label, packaging — or anything else ->
+    set `kind` to "meal", leave `body` and `workout` empty, and follow SECTION A.
+
+Body and workout screenshots are both app screens full of numbers, so read the
+LABELS before deciding: a body screen names body parts and composition (peso,
+gordura, massa muscular, IMC); a workout screen names exercises and prints
+"kg x reps" rows under each one.
 
 ================================ SECTION A — MEAL ==============================
 
@@ -717,6 +771,113 @@ in `reasoning`.
 In `reasoning`, list every metric you read together with the literal on-screen
 text you read it from, so the transcription can be audited afterwards."""
 
+# The cheap first pass, and the whole reason layer 3 of the routing table can
+# exist (llm_cli.ROUTES). One call used to both classify the image AND do the work,
+# so at dispatch time nobody knew whether the photo was a plate or a screenshot —
+# and a meal must never be routed to a weaker model on the chance it was a
+# screenshot. This asks ONLY the question, so the answer can pick the tier.
+#
+# It is deliberately tiny: no rubric, no sections, no reasoning. On the fast tier it
+# costs a couple of seconds, against a 6-9 minute high-effort call it precedes.
+CLASSIFY_PROMPT = """Look at the image(s) and answer ONE question: what are they?
+
+  "body"     a body-composition / smart-scale app screen — weight, BMI, body fat,
+             muscle mass, bone mass, BMR, metabolic age
+  "workout"  a weight-training app screen — a finished gym session, exercises with
+             sets of "load x reps", often RIR, a session title and a duration
+  "meal"     anything else at all: food, a drink, a nutrition label, packaging, or
+             something you are not sure about
+
+Both app screens are full of numbers, so read the LABELS: a body screen names body
+parts and composition; a workout screen names exercises. If you are not certain,
+answer "meal" — that is the safe answer and the common case.
+
+Reply with ONE JSON object and nothing else: {"kind": "meal"}"""
+
+WORKOUT_SECTION = """
+
+============================= SECTION C — WORKOUT ==============================
+(Only when `kind` is "workout". Ignore SECTIONS A and B entirely.)
+
+You are transcribing a finished strength-training session from a training app
+(Hevy or similar). This is OCR, NOT estimation. Report ONLY what is on screen.
+Never infer a load you cannot see, never "complete" a session, never carry a
+number down from the set above it. An omitted set is fine; an invented one
+permanently corrupts a strength baseline.
+
+1) FIND THE SESSION HEADER. Put the session's own title in `workout.title`
+(e.g. "Tronco A", "Push Day", "Treino de Pernas") and the date and time it was
+performed in `workout.performed_at`, as ISO 8601 local time "YYYY-MM-DDTHH:MM".
+The app prints these in the user's own language ("21 de agosto de 2026, 18:42").
+This is what decides which day's row the session lands on, so read it carefully.
+Leave `performed_at` empty ONLY if no date is shown. Put the session duration in
+minutes in `workout.duration_min` when shown.
+
+2) READ THE UNIT ONCE. The app shows loads in kg or lb. Put whichever it is in
+`workout.unit` ("kg" or "lb") and then transcribe every load EXACTLY as printed,
+in that unit. Do NOT convert anything yourself — the server converts.
+
+3) IGNORE EVERYTHING THAT IS NOT THIS SESSION'S SETS. These apps decorate the
+screen with numbers that look exactly like the real ones:
+  * PR / record badges and trophy icons next to a set;
+  * the PREVIOUS session's values, often greyed out or in a "previous" column
+    beside the set you actually did;
+  * session totals ("Volume 4.520 kg", "Total 18 séries") — the server computes
+    these itself, and a total read as a set is a 4520 kg lift;
+  * "1RM estimado" / estimated-max figures — those are the app's arithmetic, not
+    a set that happened.
+Read ONLY the rows of the current session's own set list.
+
+4) TRANSCRIBE EVERY SET as one object in `workout.sets`, in the order performed,
+with:
+  exercise      the exercise name in lowercase English, canonical and singular
+                ("barbell bench press", "lat pulldown", "romanian deadlift")
+  exercise_pt   the name as the app actually printed it, in the user's language,
+                lowercase — omit when it would be identical to `exercise`
+  muscle_group  the primary muscle worked, one of: chest, back, shoulders,
+                biceps, triceps, quads, hamstrings, glutes, calves, core,
+                forearms
+  set_type      "warmup" for a set the app marks as a warm-up (W, "aquecimento");
+                "drop" for a drop set (D); "failure" for a set marked as taken to
+                failure; otherwise "normal". Marking a warm-up as normal inflates
+                the session by 20-30%, so read those markers.
+  load_type     "external" for a normal loaded lift; "bodyweight" for a movement
+                where the body IS the load (pull-ups, dips, push-ups) —
+                `weight_kg` then holds only ADDED load, or 0 for none;
+                "assisted" when the machine REMOVES load (assisted pull-up) —
+                `weight_kg` holds the assistance; "band" for band resistance.
+                Getting this wrong makes a whole back session read as zero.
+  weight_kg     the load exactly as printed, in the unit from step 2. For a plain
+                bodyweight set with no added plate, 0 is correct and expected.
+  reps          the repetitions actually performed for THAT set
+  rir           reps-in-reserve, if the app shows it (RIR / RPE-derived). Omit it
+                when it is not on screen — do NOT guess it. A missing RIR is
+                simply not counted as a hard set; a guessed one is a lie about
+                how hard the session was.
+
+Each set is its OWN object, even when four sets of an exercise are identical —
+never collapse "4 x 8 @ 60" into one entry with a count.
+
+5) THE SCREENSHOTS OVERLAP — DO NOT COUNT ANYTHING TWICE. A session rarely fits
+one screen, so the images are consecutive scroll positions of the SAME session and
+each one deliberately repeats a little of the one before it. Read them as one
+continuous page, not as separate sessions:
+  * an exercise visible at the bottom of image 1 and again at the top of image 2 is
+    ONE exercise with ONE set list — emit it once;
+  * so are its sets. Four sets of bench press seen twice are four sets, not eight.
+    Match them on exercise + set number + load + reps, not on position;
+  * the session header (title, date, duration) appears on the first image and
+    perhaps again later; read it once;
+  * if the same exercise genuinely appears twice in the session as SEPARATE blocks
+    (a second wave later in the workout), that is not an overlap — the set numbers
+    restart and the surrounding exercises differ. Keep both.
+Say in `reasoning` where you judged one image to continue the previous one, and
+which rows you treated as repeats, so the de-duplication can be audited.
+
+In `reasoning`, list every exercise you found and how many set rows you read for
+it, and name anything you deliberately skipped (a PR badge, a previous-session
+column, a totals row), so the transcription can be audited afterwards."""
+
 # Prepended to every text-only note, the way ROUTER_PREFIX fronts the image path:
 # one Shortcut sends every note, so the model's first job is to say what the note
 # IS. Today that's meal-vs-bowel; a body reading can't arrive as text (no screen to
@@ -838,11 +999,52 @@ BODY_RESPONSE_SCHEMA = types.Schema(
     },
 )
 
+# One finished training session. Every set is its own object — a schema that let
+# the model emit {"sets": 4} would throw away the per-set loads that are the whole
+# point, and `workouts.normalize_sets` has nothing to validate.
+WORKOUT_RESPONSE_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    property_ordering=["title", "performed_at", "duration_min", "unit", "sets"],
+    properties={
+        "title": types.Schema(type=types.Type.STRING),
+        # Local "YYYY-MM-DDTHH:MM" read off the screen — like the scale's
+        # measured_at, this is what makes the screenshot self-dating and what
+        # makes backfilling an old session work.
+        "performed_at": types.Schema(type=types.Type.STRING),
+        "duration_min": types.Schema(type=types.Type.NUMBER),
+        # "kg" or "lb", read once off the screen. The conversion happens in
+        # workouts.normalize_sets, never in the model.
+        "unit": types.Schema(type=types.Type.STRING),
+        "sets": types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(
+                type=types.Type.OBJECT,
+                property_ordering=["exercise", "exercise_pt", "muscle_group",
+                                   "set_type", "load_type", "weight_kg", "reps",
+                                   "rir"],
+                properties={
+                    "exercise": types.Schema(type=types.Type.STRING),
+                    "exercise_pt": types.Schema(type=types.Type.STRING),
+                    "muscle_group": types.Schema(type=types.Type.STRING),
+                    "set_type": types.Schema(type=types.Type.STRING),
+                    "load_type": types.Schema(type=types.Type.STRING),
+                    "weight_kg": types.Schema(type=types.Type.NUMBER),
+                    "reps": types.Schema(type=types.Type.NUMBER),
+                    "rir": types.Schema(type=types.Type.NUMBER),
+                },
+                # `rir` is deliberately NOT required: the app does not always show
+                # it, and a required field is a field the model invents.
+                required=["exercise", "set_type", "load_type", "reps"],
+            ),
+        ),
+    },
+)
+
 RESPONSE_SCHEMA = types.Schema(
     type=types.Type.OBJECT,
-    property_ordering=["kind", "reasoning", "body", "meal_time", "template",
-                       "template_scale", "save_template_name", "items",
-                       "confidence"],
+    property_ordering=["kind", "reasoning", "body", "workout", "meal_time",
+                       "template", "template_scale", "save_template_name",
+                       "items", "confidence"],
     properties={
         # The ROUTER_PREFIX fork: "meal" or "body". Decided first, before any
         # analysis, so the model commits to one rubric. Anything but "body" is
@@ -851,6 +1053,8 @@ RESPONSE_SCHEMA = types.Schema(
         "reasoning": types.Schema(type=types.Type.STRING),
         # Filled only when kind == "body"; empty for every meal.
         "body": BODY_RESPONSE_SCHEMA,
+        # Filled only when kind == "workout"; empty otherwise.
+        "workout": WORKOUT_RESPONSE_SCHEMA,
         # Optional "HH:MM" (24h local) inferred from a text note ("breakfast",
         # "lunch", or an explicit time). Empty when unknown / for photo meals.
         "meal_time": types.Schema(type=types.Type.STRING),
@@ -917,7 +1121,46 @@ def _sid() -> str:
     return os.environ["HEALTH_SPREADSHEET_ID"]
 
 
-@functools.lru_cache(maxsize=1)
+def _per_thread(factory):
+    """One API client per THREAD, not one per process.
+
+    httplib2 says it of itself (`__init__.py`: "Not thread-safe, requires external
+    synchronization against concurrent requests"), and the googleapiclient service
+    object owns one of its connections. Under `--threads 8` a single cached client
+    means eight threads interleaving reads and writes on one TLS socket, and the
+    symptoms are exactly what the logs showed on 2026-08-20/21:
+
+        ssl.SSLError: WRONG_VERSION_NUMBER
+        http.client.IncompleteRead(0 bytes read)
+        ValueError: invalid literal for int() with base 16: b'\x0c\xb3...'
+        gunicorn: Worker was sent code 139        (SIGSEGV inside OpenSSL)
+
+    …and, because `_execute` retries on connection errors, a meal appended TWICE
+    when the row landed but the scrambled response could not be read.
+
+    `cache_clear()` deliberately drops only the CALLING thread's client: a thread
+    that hit a broken socket should rebuild its own, not yank one out from under
+    seven others mid-request.
+    """
+    store = threading.local()
+
+    def get():
+        client = getattr(store, "value", None)
+        if client is None:
+            client = factory()
+            store.value = client
+        return client
+
+    def cache_clear():
+        store.value = None
+
+    get.cache_clear = cache_clear
+    get.__name__ = factory.__name__
+    get.__doc__ = factory.__doc__
+    return get
+
+
+@_per_thread
 def _sheets():
     creds, _ = google.auth.default(
         scopes=["https://www.googleapis.com/auth/spreadsheets"]
@@ -925,7 +1168,7 @@ def _sheets():
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
-@functools.lru_cache(maxsize=1)
+@_per_thread
 def _drive():
     # The one user-identity token left in the system: a service account has no
     # Drive storage quota of its own, so meal photos must be uploaded as the user.
@@ -1088,20 +1331,36 @@ def _enqueue_process(payload: Dict[str, Any]) -> None:
 _CONN_ERRORS = (ConnectionError, socket.timeout, ssl.SSLError)
 
 
-def _execute(build):
+def _execute(build, *, idempotent: bool = True):
     """Run `build().execute()` resiliently. `build` must return a *fresh* API
     request each call so a retry picks up a rebuilt client (with a live socket)
-    after a stale-connection error."""
+    after a stale-connection error.
+
+    ⚠️ `idempotent=False` for anything that APPENDS. A connection error means the
+    response could not be read — never that the request was not performed. Google
+    may well have added the row before the socket broke, so retrying here writes it
+    a second time, which is exactly how one lunch became two rows on 2026-08-21.
+
+    A non-idempotent call therefore fails fast and lets the layer above own the
+    retry, because that layer can tell the difference: `/process` re-checks
+    `_exact_duplicate` against the sheet before writing, so a queue re-run of the
+    whole task is safe in a way that a retry down here can never be.
+    """
     for attempt in range(3):
         try:
             return build().execute()
         except _CONN_ERRORS as err:
+            _sheets.cache_clear()
+            _drive.cache_clear()
+            if not idempotent:
+                app.logger.warning(
+                    "connection lost on a non-idempotent write; NOT retrying here "
+                    "(the row may already exist) — leaving it to the queue: %s", err)
+                raise
             if attempt == 2:
                 raise
             app.logger.warning("stale API connection, reconnecting (%d): %s",
                                attempt + 1, err)
-            _sheets.cache_clear()
-            _drive.cache_clear()
             time.sleep(min(2 ** attempt, 4))
 
 
@@ -1420,7 +1679,8 @@ def _gen_config(timeout_ms: Optional[int] = None) -> "types.GenerateContentConfi
 def _run_models(contents: List[Any], *, models: Optional[List[str]] = None,
                 retries: Optional[int] = None, timeout_ms: Optional[int] = None,
                 deadline_s: Optional[float] = None,
-                allow_body: bool = True, allow_bowel: bool = False) -> Dict[str, Any]:
+                allow_body: bool = True, allow_bowel: bool = False,
+                allow_workout: bool = True) -> Dict[str, Any]:
     """Send `contents` (photos+prompt or a text prompt) through `models` in order
     and assemble the record from the JSON reply.
 
@@ -1492,12 +1752,14 @@ def _run_models(contents: List[Any], *, models: Optional[List[str]] = None,
                     model, perr)
                 break
             return _record_from(data, model, allow_body=allow_body,
-                                allow_bowel=allow_bowel)
+                                allow_bowel=allow_bowel,
+                                allow_workout=allow_workout)
     raise RuntimeError(f"all models failed ({models}); last error: {last_err}")
 
 
 def _record_from(data: Dict[str, Any], model: str, *, allow_body: bool = True,
-                 allow_bowel: bool = False) -> Dict[str, Any]:
+                 allow_bowel: bool = False,
+                 allow_workout: bool = True) -> Dict[str, Any]:
     """Turn a model's parsed JSON into the record the callers act on.
 
     The router fork: only a verdict the current path can legitimately produce is
@@ -1522,6 +1784,23 @@ def _record_from(data: Dict[str, Any], model: str, *, allow_body: bool = True,
     if allow_bowel and kind == "bowel":
         app.logger.info("%s classified the note as a bowel-movement log", model)
         return {"kind": "bowel", "model": model}
+    if allow_workout and kind == "workout":
+        raw = data.get("workout") or {}
+        sets = workouts.normalize_sets(raw.get("sets"),
+                                       unit=raw.get("unit") or "kg",
+                                       log=app.logger)
+        app.logger.info("%s read a training session: %d set(s) kept of %d read",
+                        model, len(sets),
+                        len(raw.get("sets") or []) if isinstance(
+                            raw.get("sets"), list) else 0)
+        return {
+            "kind": "workout", "model": model,
+            "title": str(raw.get("title") or "").strip(),
+            "performed_at": str(raw.get("performed_at") or "").strip(),
+            "duration_min": _round_num(raw.get("duration_min"), 0)
+            if isinstance(raw.get("duration_min"), (int, float)) else None,
+            "sets": sets,
+        }
 
     items = _normalize_items(data.get("items"))
     meal = _meal_from_items(items, data.get("confidence"), model)
@@ -1546,13 +1825,14 @@ def _templates_block(templates: Optional[List[Dict[str, Any]]]) -> str:
 
 def _build_prompt(num_images: int, note: str, now: Optional[datetime] = None,
                   templates: Optional[List[Dict[str, Any]]] = None) -> str:
-    """Assemble the vision prompt as ROUTER + SECTION A (meal) + SECTION B (body).
+    """Assemble the vision prompt: ROUTER + SECTION A (meal) + B (body) + C (workout).
 
     Section A is the meal rubric plus its conditional blocks: a multi-image block
     when the log has several photos, the authoritative note block when given, a
     meal-time block (with `now`) so a photo logged after the fact lands at the right
-    hour, and the template match/save rules. Section B (transcribing a scale
-    screenshot) is constant and always last. The router at the top picks one."""
+    hour, and the template match/save rules. Sections B (transcribing a scale
+    screenshot) and C (transcribing a training session) are constant and always
+    last. The router at the top picks exactly one."""
     prompt = ROUTER_PREFIX + PROMPT
     if num_images > 1:
         prompt += MULTI_IMAGE_SUFFIX.format(n=num_images)
@@ -1560,12 +1840,13 @@ def _build_prompt(num_images: int, note: str, now: Optional[datetime] = None,
         prompt += NOTE_SUFFIX.format(note=note)
         if now is not None:
             prompt += MEAL_TIME_SUFFIX.format(now_hhmm=now.strftime("%H:%M"))
-    return prompt + _templates_block(templates) + BODY_SECTION
+    return prompt + _templates_block(templates) + BODY_SECTION + WORKOUT_SECTION
 
 
 def _try_claude(prompt: str, images: Optional[List[Tuple[bytes, str]]] = None,
-                *, allow_body: bool = True,
-                allow_bowel: bool = False) -> Optional[Dict[str, Any]]:
+                *, allow_body: bool = True, allow_bowel: bool = False,
+                allow_workout: bool = True, mode: Optional[str] = None,
+                source: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Estimate with the local Claude CLI, or return None to fall through to Gemini.
 
     Returns None — never raises — on every failure mode: the estimator not being
@@ -1581,7 +1862,7 @@ def _try_claude(prompt: str, images: Optional[List[Tuple[bytes, str]]] = None,
     if not claude_estimator.enabled():
         return None
     try:
-        data = claude_estimator.analyze(prompt, images)
+        data = claude_estimator.analyze(prompt, images, mode=mode, source=source)
     except Exception as err:
         # warning, not exception(): a spent usage window is an expected daily event
         # on a subscription, not a defect, and a stack trace per meal would bury the
@@ -1590,17 +1871,59 @@ def _try_claude(prompt: str, images: Optional[List[Tuple[bytes, str]]] = None,
                            err)
         return None
     try:
-        return _record_from(data, claude_estimator.model(),
-                            allow_body=allow_body, allow_bowel=allow_bowel)
+        return _record_from(data, claude_estimator.answered_by(data),
+                            allow_body=allow_body, allow_bowel=allow_bowel,
+                            allow_workout=allow_workout)
     except Exception:
         app.logger.exception("claude answered but the record could not be built")
         return None
 
 
+# Which `source` — and therefore which tier (llm_cli.ROUTES) — each verdict earns.
+# Note the asymmetry, which is the safety property: a screenshot misrouted to the
+# deep tier costs a little of the Claude window, while a MEAL misrouted to the fast
+# tier costs accuracy on the number this whole system exists to measure (§2e). So
+# only a confident "body"/"workout" may downgrade; everything else stays deep.
+_SOURCE_BY_KIND = {
+    "body": "ingest.body_ocr",
+    "workout": "ingest.workout_ocr",
+}
+MEAL_SOURCE = "ingest.meal_estimate"
+# Text-only note (no photo): routed separately in llm_cli.ROUTES so it leads with
+# Gemini/agy instead of Claude — see llm_cli.NOTE for why.
+TEXT_NOTE_SOURCE = "ingest.text_note"
+
+
+def _classify_images(images: List[Tuple[bytes, str]],
+                     mode: Optional[str] = None) -> str:
+    """One cheap call that returns only what the photo IS, so the real call can be
+    routed. Returns the `source` to use.
+
+    Never raises and never blocks the ingest: an unavailable CLI, a timeout or an
+    unreadable answer all fall back to the meal source, which is the deep tier —
+    i.e. exactly the behaviour this system had before routing existed. The full
+    prompt still carries its own router, so a wrong guess here costs a tier, never
+    a misclassified row.
+    """
+    if not images or not claude_estimator.enabled():
+        return MEAL_SOURCE
+    try:
+        data = claude_estimator.analyze(CLASSIFY_PROMPT, images, mode=mode,
+                                        source="ingest.image_router",
+                                        timeout_override=CLASSIFY_TIMEOUT_S)
+    except Exception as err:
+        app.logger.info("image router unavailable, staying on the deep tier: %s", err)
+        return MEAL_SOURCE
+    kind = str((data or {}).get("kind") or "").strip().lower()
+    source = _SOURCE_BY_KIND.get(kind, MEAL_SOURCE)
+    app.logger.info("image router said %r -> %s", kind or "?", source)
+    return source
+
+
 def analyze(images: List[Tuple[bytes, str]], note: str = "",
             now: Optional[datetime] = None,
             templates: Optional[List[Dict[str, Any]]] = None,
-            **kw) -> Dict[str, Any]:
+            mode: Optional[str] = None, **kw) -> Dict[str, Any]:
     """Analyse the image(s) the phone sent — either a meal or a scale screenshot;
     the model decides which (see ROUTER_PREFIX) and the returned record's `kind`
     says what came back.
@@ -1613,7 +1936,8 @@ def analyze(images: List[Tuple[bytes, str]], note: str = "",
     deadline_s) carry the worker's per-attempt patience policy (_worker_kwargs)."""
     prompt = _build_prompt(len(images), note, now, templates)
 
-    record = _try_claude(prompt, images=images, allow_body=True)
+    record = _try_claude(prompt, images=images, allow_body=True, mode=mode,
+                         source=_classify_images(images, mode))
     if record is not None:
         return record
 
@@ -1625,7 +1949,7 @@ def analyze(images: List[Tuple[bytes, str]], note: str = "",
 
 def analyze_text(note: str, now: datetime,
                  templates: Optional[List[Dict[str, Any]]] = None,
-                 **kw) -> Dict[str, Any]:
+                 mode: Optional[str] = None, **kw) -> Dict[str, Any]:
     """Classify a text-only note and act on it: a bowel-movement log
     (`kind` == "bowel", see TEXT_ROUTER_PREFIX), or otherwise a meal estimated from
     the description alone. `now` is the current local time, injected so the model
@@ -1636,11 +1960,16 @@ def analyze_text(note: str, now: datetime,
               + _templates_block(templates))
     # A text note can be a meal or a bowel log, never a scale reading (no screen to
     # OCR) — so open the bowel fork and close the body one.
-    record = _try_claude(prompt, allow_body=False, allow_bowel=True)
+    # A text note is never a screenshot, so there is nothing to classify: it is a
+    # meal description or a bowel log, and estimating a meal from words alone is
+    # judgement either way.
+    record = _try_claude(prompt, allow_body=False, allow_bowel=True,
+                         allow_workout=False, mode=mode, source=TEXT_NOTE_SOURCE)
     if record is not None:
         return record
 
-    return _run_models([prompt], allow_body=False, allow_bowel=True, **kw)
+    return _run_models([prompt], allow_body=False, allow_bowel=True,
+                       allow_workout=False, **kw)
 
 
 def _max_attempts() -> int:
@@ -1973,6 +2302,94 @@ def apply_template(nut: Dict[str, Any],
     return meal
 
 
+def _ensure_sessions_tab() -> None:
+    """Create the `sessions` tab and pin its header row. Same shape as
+    _ensure_templates_tab: idempotent, and safe to call on every write."""
+    meta = _execute(lambda: _sheets().spreadsheets().get(spreadsheetId=_sid()))
+    titles = {sheet["properties"]["title"] for sheet in meta.get("sheets", [])}
+    if SESSIONS_TAB not in titles:
+        _execute(lambda: _sheets().spreadsheets().batchUpdate(
+            spreadsheetId=_sid(),
+            body={"requests": [{"addSheet": {
+                "properties": {"title": SESSIONS_TAB}}}]}))
+    rng = f"{SESSIONS_TAB}!A1:{SESSIONS_LAST_COL}1"
+    current = _execute(lambda: _sheets().spreadsheets().values().get(
+        spreadsheetId=_sid(), range=rng)).get("values", [[]])
+    if not current or current[0] != SESSIONS_HEADERS:
+        _execute(lambda: _sheets().spreadsheets().values().update(
+            spreadsheetId=_sid(), range=f"{SESSIONS_TAB}!A1",
+            valueInputOption="RAW", body={"values": [SESSIONS_HEADERS]}))
+
+
+def _all_session_rows() -> List[Dict[str, Any]]:
+    """Every session row as a dict, or [] if the tab doesn't exist yet."""
+    try:
+        return _rows_as_dicts(_execute(
+            lambda: _sheets().spreadsheets().values().get(
+                spreadsheetId=_sid(),
+                range=f"{SESSIONS_TAB}!A1:{SESSIONS_LAST_COL}",
+                valueRenderOption="UNFORMATTED_VALUE")).get("values", []))
+    except Exception:  # tab not created yet
+        return []
+
+
+def _session_history(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Sheet rows reshaped into what `workouts.baseline_e1rms` reads: a date and
+    the session's cached best e1RM per exercise. A row whose cache is unreadable is
+    skipped rather than re-derived — a missing baseline blanks one index, while a
+    wrong one silently rescores every session after it."""
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        day = str(row.get("date") or "").strip()
+        if not day:
+            continue
+        try:
+            e1rms = json.loads(row.get("e1rms_json") or "{}")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(e1rms, dict) and e1rms:
+            out.append({"date": day, "e1rms": e1rms})
+    return out
+
+
+def _session_exists(image_sha: str, rows: List[Dict[str, Any]]) -> bool:
+    """Whether this exact screenshot was already logged. The queue retries after a
+    successful write often enough that this is the difference between one session
+    and four."""
+    return bool(image_sha) and any(
+        str(row.get("image_sha") or "") == image_sha for row in rows)
+
+
+def append_session(rec: Dict[str, Any], sets: List[Dict[str, Any]],
+                   e1rms: Dict[str, float], index: Optional[float],
+                   performed: datetime, image_sha: str, photo_url: str,
+                   note: str) -> None:
+    """Append one training session to the `sessions` tab."""
+    _ensure_sessions_tab()
+    exercises = len({entry["exercise"] for entry in workouts.working_sets(sets)})
+    row = [
+        performed.isoformat(timespec="minutes"),
+        performed.date().isoformat(),
+        rec.get("title") or "",
+        rec.get("duration_min") if rec.get("duration_min") is not None else "",
+        exercises,
+        len(workouts.working_sets(sets)),
+        len(workouts.hard_sets(sets)),
+        json.dumps(sets, ensure_ascii=False),
+        json.dumps(e1rms, ensure_ascii=False),
+        index if index is not None else "",
+        image_sha,
+        photo_url,
+        "",
+        rec.get("model") or "",
+        note,
+    ]
+    _execute(idempotent=False, build=lambda: _sheets().spreadsheets().values().append(
+        spreadsheetId=_sid(), range=f"{SESSIONS_TAB}!A1",
+        valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+        body={"values": [row]}))
+
+
 def _ensure_templates_tab() -> None:
     meta = _execute(lambda: _sheets().spreadsheets().get(spreadsheetId=_sid()))
     titles = {s["properties"]["title"] for s in meta.get("sheets", [])}
@@ -2018,7 +2435,7 @@ def save_template(name: str, nut: Dict[str, Any], when: datetime) -> None:
             range=f"{TEMPLATES_TAB}!A{idx}:{TEMPLATES_LAST_COL}{idx}",
             valueInputOption="RAW", body={"values": [row]}))
     else:
-        _execute(lambda: _sheets().spreadsheets().values().append(
+        _execute(idempotent=False, build=lambda: _sheets().spreadsheets().values().append(
             spreadsheetId=_sid(), range=f"{TEMPLATES_TAB}!A1",
             valueInputOption="RAW", insertDataOption="INSERT_ROWS",
             body={"values": [row]}))
@@ -2060,7 +2477,7 @@ def append_meal(nut: Dict[str, Any], photo_url: str, when: datetime,
             spreadsheetId=_sid(), range=f"{MEALS_TAB}!A{idx}:{LAST_COL}{idx}",
             valueInputOption="RAW", body={"values": [row]}))
     else:
-        _execute(lambda: _sheets().spreadsheets().values().append(
+        _execute(idempotent=False, build=lambda: _sheets().spreadsheets().values().append(
             spreadsheetId=_sid(), range=f"{MEALS_TAB}!A1",
             valueInputOption="RAW", insertDataOption="INSERT_ROWS",
             body={"values": [row]}))
@@ -2185,7 +2602,7 @@ def write_daily(day: str, values: Dict[str, Any]) -> None:
     new_row[0] = day
     for name, value in values.items():
         new_row[header.index(name)] = value
-    _execute(lambda: _sheets().spreadsheets().values().append(
+    _execute(idempotent=False, build=lambda: _sheets().spreadsheets().values().append(
         spreadsheetId=_sid(), range=f"{DAILY_TAB}!A1",
         valueInputOption="RAW", insertDataOption="INSERT_ROWS",
         body={"values": [new_row]}))
@@ -2219,11 +2636,12 @@ def _latest(rows: List[Dict[str, Any]], key: str) -> Optional[float]:
 
 
 def _fixed_targets() -> Dict[str, Dict[str, Any]]:
-    """The daily plan: 2000 kcal at a ~700 kcal deficit, protein-forward to hold
-    muscle (165 g, ~2.4 g/kg). Fixed every day, on purpose — see conversation
-    2026-08-01. Fibre/added-sugar/saturated-fat ceilings still derive from the
-    calorie number (14 g fibre per 1000 kcal, 10% of energy each), they just no
-    longer move day to day since the calorie number they derive from doesn't."""
+    """The daily plan: 2550 kcal at maintenance (measured TDEE ~2570), protein-forward
+    to build (170 g, ~2.6 g/kg). Fixed every day, on purpose — see conversation
+    2026-08-01, and the constants above for why the numbers changed on 2026-08-20.
+    Fibre/added-sugar/saturated-fat ceilings still derive from the calorie number
+    (14 g fibre per 1000 kcal, 10% of energy each), they just no longer move day to
+    day since the calorie number they derive from doesn't."""
     fiber = round(FIBER_G_PER_1000KCAL * FIXED_CALORIES_KCAL / 1000)
     added_sugar = round(LIMIT_ENERGY_FRACTION * FIXED_CALORIES_KCAL / 4)
     sat_fat = round(LIMIT_ENERGY_FRACTION * FIXED_CALORIES_KCAL / 9)
@@ -2357,6 +2775,45 @@ _TAXONOMY_TTL_S = 60
 _taxonomy_cached: Tuple[float, Optional[Dict[str, Any]]] = (0.0, None)
 
 
+# How long a read of `config.llm_mode` is held. This is a switch the user flips by
+# hand on their phone and then expects to matter for the rest of the day, so a
+# minute of staleness is invisible — and it keeps a sheet read off every call.
+_LLM_MODE_TTL_S = 60
+_llm_mode_cached: Tuple[float, str] = (0.0, "")
+
+
+def _llm_mode() -> str:
+    """Which routing mode the user has asked for, from the sheet's `config` tab.
+
+    "auto" (Claude first, agy behind it), "economy" (agy only — the deliberate
+    "I need my Claude window for something else today" switch) or "quality" (the
+    first provider, no silent downgrade). See llm_cli.chain_for.
+
+    Unreadable config, a missing key or a typo all read as "auto": routing is not
+    worth failing an ingest over, and the default is the behaviour the system had
+    before this switch existed.
+    """
+    global _llm_mode_cached
+    cached_at, value = _llm_mode_cached
+    now = time.time()
+    if value and now - cached_at < _LLM_MODE_TTL_S:
+        return value
+    mode = "auto"
+    try:
+        # LAST occurrence wins, matching capabilities.from_config — the live tab
+        # carries 20+ duplicate copies of every key from a seeding bug that has
+        # since been fixed (see _read_config_grid), and two readers disagreeing
+        # about which copy is authoritative is a bug waiting for the day someone
+        # edits the wrong row.
+        for row in _rows_as_dicts(_read_config_grid() or []):
+            if str(row.get("key") or "").strip().lower() == "llm_mode":
+                mode = str(row.get("value") or "").strip().lower() or mode
+    except Exception:
+        app.logger.warning("llm_mode read failed; using %s", mode, exc_info=True)
+    _llm_mode_cached = (now, mode)
+    return mode
+
+
 def _display_taxonomy() -> Optional[Dict[str, Any]]:
     """The taxonomy blob for display lookups, cached briefly. Returns None rather
     than raising — `display_pt` treats that as "curated table only"."""
@@ -2450,12 +2907,21 @@ _CAPS_TTL_S = 120
 _caps_cache: Dict[str, Any] = {"at": 0.0, "value": None}
 
 
-def _read_config_grid() -> List[List[Any]]:
-    """The raw `config` tab, or [] if it hasn't been created yet."""
+def _read_config_grid() -> Optional[List[List[Any]]]:
+    """The raw `config` tab, or **None if it could not be read**.
+
+    None and [] must stay distinguishable, or a transient Sheets error (a 429, a
+    network blip) looks like "tab is genuinely empty" and `_seed_config`
+    re-appends the whole seed set. This is exactly what happened here before the
+    fix: 21-23 duplicate copies of every config key piled up in the sheet. Callers
+    must treat None as "unknown, change nothing"; only [] may be seeded.
+    """
     try:
         return _read_tab(CONFIG_TAB)
     except Exception:
-        return []
+        app.logger.warning("config tab unreadable — skipping seed this run",
+                           exc_info=True)
+        return None
 
 
 def _ensure_config_tab() -> None:
@@ -2477,11 +2943,16 @@ def _ensure_config_tab() -> None:
             valueInputOption="RAW", body={"values": [headers]}))
 
 
-def _seed_config(grid: List[List[Any]]) -> None:
+def _seed_config(grid: Optional[List[List[Any]]]) -> None:
     """Materialise any missing config key into the sheet. Idempotent, so it is
     cheap to call on every read, and the result is that a fresh sheet gains an
     editable, self-documenting description of what this user measures instead of
-    an empty grid."""
+    an empty grid.
+
+    `grid is None` means the read failed, not that the tab is empty — change
+    nothing this run rather than re-seeding over a blip."""
+    if grid is None:
+        return
     existing = {str(r.get("key") or "").strip().lower()
                 for r in _rows_as_dicts(grid)}
     rows = [list(seed) for seed in caps_mod.CONFIG_SEED
@@ -2489,7 +2960,7 @@ def _seed_config(grid: List[List[Any]]) -> None:
     if not rows:
         return
     _ensure_config_tab()
-    _execute(lambda: _sheets().spreadsheets().values().append(
+    _execute(idempotent=False, build=lambda: _sheets().spreadsheets().values().append(
         spreadsheetId=_sid(), range=f"{CONFIG_TAB}!A1",
         valueInputOption="RAW", insertDataOption="INSERT_ROWS",
         body={"values": rows}))
@@ -2512,7 +2983,7 @@ def _capabilities() -> "caps_mod.Capabilities":
             _seed_config(grid)
         except Exception:
             app.logger.warning("config seed skipped (non-fatal)", exc_info=True)
-        caps = caps_mod.from_config(_rows_as_dicts(grid))
+        caps = caps_mod.from_config(_rows_as_dicts(grid or []))
     except Exception:
         app.logger.warning("config read failed; assuming full capabilities",
                            exc_info=True)
@@ -2590,18 +3061,51 @@ def _jpeg_end(data: bytes, start: int) -> int:
     return n
 
 
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def _png_end(data: bytes, start: int) -> int:
+    """Index just past this PNG's IEND chunk.
+
+    Walks the chunk table (length | type | data | crc) rather than searching for
+    the next PNG signature, because those eight bytes can legitimately occur
+    inside compressed pixel data. Falls back to end-of-data if malformed."""
+    n = len(data)
+    i = start + len(PNG_MAGIC)
+    while i + 8 <= n:
+        length = int.from_bytes(data[i:i + 4], "big")
+        tag = data[i + 4:i + 8]
+        i += 8 + length + 4                 # header + payload + crc
+        if tag == b"IEND":
+            return min(i, n)
+    return n
+
+
 def _split_jpegs(data: bytes) -> List[bytes]:
-    """Split a buffer of one-or-more concatenated JPEGs into individual images.
-    A single JPEG (even with an embedded thumbnail) returns unchanged; non-JPEG
-    data (e.g. HEIC/PNG) is returned as-is."""
-    if not data.startswith(b"\xff\xd8"):
+    """Split a buffer of one-or-more concatenated images into individual ones.
+
+    Both JPEG and PNG, because the two arrive by different routes: meal photos
+    are JPEG/HEIC off the camera, while a scale or gym **screenshot is PNG** —
+    and iOS Shortcuts packs several images into ONE part with the files simply
+    concatenated. Without the PNG half, sending three screenshots in one go
+    delivers one unreadable blob and two silently lost images.
+
+    A single image returns unchanged, and anything not JPEG or PNG (HEIC) is
+    returned as-is — HEIC is a single-file container off the camera, never
+    concatenated."""
+    if data.startswith(b"\xff\xd8"):
+        magic, end_of = b"\xff\xd8", _jpeg_end
+    elif data.startswith(PNG_MAGIC):
+        magic, end_of = PNG_MAGIC, _png_end
+    else:
         return [data]
+
     parts: List[bytes] = []
     i, n = 0, len(data)
-    while i < n and data[i:i + 2] == b"\xff\xd8":
-        end = _jpeg_end(data, i)
+    while i < n and data[i:i + len(magic)] == magic:
+        end = end_of(data, i)
         parts.append(data[i:end])
-        nxt = data.find(b"\xff\xd8", end)
+        nxt = data.find(magic, end)
         if nxt == -1:
             break
         i = nxt
@@ -2610,17 +3114,97 @@ def _split_jpegs(data: bytes) -> List[bytes]:
 
 def _sniff_mime(data: bytes) -> str:
     """Best-effort image mime from magic bytes; defaults to jpeg."""
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+    if data.startswith(PNG_MAGIC):
         return "image/png"
     if data[4:12] in (b"ftypheic", b"ftypheix", b"ftypmif1", b"ftypmsf1"):
         return "image/heic"
     return "image/jpeg"
 
 
+# Smaller than any real photo or screenshot. Its job is to reject truncated
+# headers, not to judge image quality, so it is deliberately far below anything
+# a camera or a screen grab produces.
+MIN_IMAGE_BYTES = 1024
+# A PNG's IEND is the last chunk; 32 bytes of tail covers it plus any trailing
+# newline a transport added.
+_PNG_TAIL_SCAN = 32
+
+
+def _looks_like_image(data: bytes) -> bool:
+    """Whether these bytes actually begin like an image file.
+
+    Only the JSON/base64 path uses this, and deliberately so: there the bytes are
+    the result of guessing (we decode whatever the client called `images` and sniff
+    a mime from it), whereas a multipart part is a real file arriving with its own
+    declared content type.
+
+    It exists because the failure it prevents is silent and expensive. If a
+    Shortcut sends the photo variable WITHOUT base64-encoding it first, Shortcuts
+    coerces it to text — and any 12-character string decodes to 9 bytes that
+    `_sniff_mime` happily calls image/jpeg. That nine-byte "photo" is then archived
+    to Drive, sent to the model, and written as a row. Refusing it turns a wrong
+    row into a 400 with a log line naming the cause.
+    """
+    if len(data) < MIN_IMAGE_BYTES:
+        # A truncated header still starts like an image, which is exactly how six
+        # 57-byte stubs of a 1290x2796 screenshot reached the model on 2026-08-21.
+        # No real photo or screenshot is this small.
+        return False
+    if data.startswith(PNG_MAGIC):
+        # Require the terminating chunk: "starts like a PNG" and "is a whole PNG"
+        # are different claims, and only the second one is worth archiving.
+        return b"IEND" in data[-_PNG_TAIL_SCAN:]
+    return (data.startswith(b"\xff\xd8\xff")                    # JPEG
+            or data[4:8] == b"ftyp"                              # HEIC/HEIF
+            or data.startswith(b"GIF8")                          # GIF
+            or (data[:4] == b"RIFF" and data[8:12] == b"WEBP"))  # WEBP
+
+
+# One base64 unit ends at its padding, and the next starts on the character after.
+# Used to rescue several images that arrived glued into one string.
+_B64_RUN = re.compile(r"[A-Za-z0-9+/]+={0,2}")
+
+
+def _b64_units(text: str) -> List[str]:
+    """Split a string that may hold SEVERAL concatenated base64 payloads.
+
+    iOS Shortcuts is the reason this exists. Putting a repeat's results into a JSON
+    body field does not always produce a JSON array — it can flatten the list into
+    one string, joined by newlines or by nothing at all. Decoded naively that is a
+    silent 2-out-of-3 data loss, because `b64decode` stops making sense at the first
+    embedded `=` pad:
+
+        ["<png1>", "<png2>", "<png3>"]  -> 3 images
+        "<png1>\n<png2>\n<png3>"        -> 1 image, the rest gone
+        "<png1><png2><png3>"            -> 1 image, the rest gone
+
+    ⚠️ **Whitespace is NOT a payload boundary, and assuming it was cost a real
+    ingest** (2026-08-21). Shortcuts emits MIME base64, wrapped at 76 characters
+    per line — so splitting on whitespace turned every 76-char *line* into its own
+    "image", each decoding to 57 bytes: a PNG signature, an IHDR, and the first
+    bytes of an iCCP chunk. `_looks_like_image` waved the first line of each photo
+    through, because a truncated PNG header still starts like a PNG, and the model
+    was handed six 57-byte stubs of a 1290x2796 screenshot.
+
+    So: strip whitespace first (which is what `b64decode` does internally anyway),
+    then split only on **padding** — the one thing that genuinely marks the end of
+    a payload. A run with no padding at all is left whole: it decodes to
+    concatenated image files, which `_split_jpegs` separates.
+    """
+    joined = "".join(text.split())
+    if not joined:
+        return []
+    if "=" not in joined:
+        return [joined]
+    return [m.group(0) for m in _B64_RUN.finditer(joined) if m.group(0)]
+
+
 def _images_from_json() -> List[Tuple[bytes, str]]:
-    """Decode a JSON `images` array of base64 strings (the reliable multi-photo
-    path — Shortcuts' multipart file-list only sends the first item). Empty when
-    the body isn't JSON or carries no images."""
+    """Decode a JSON `images` array of base64 strings — the reliable multi-photo
+    path, since Shortcuts' multipart file-list only sends the first item. Empty when
+    the body isn't JSON or carries no images.
+
+    Tolerant of the list arriving as one joined string; see `_b64_units`."""
     if not request.is_json:
         return []
     raw = (request.get_json(silent=True) or {}).get("images")
@@ -2632,12 +3216,20 @@ def _images_from_json() -> List[Tuple[bytes, str]]:
     for entry in raw:
         if not isinstance(entry, str) or not entry:
             continue
-        try:
-            data = base64.b64decode(entry, validate=False)
-        except (binascii.Error, ValueError):
-            continue
-        for seg in _split_jpegs(data):
-            if seg:
+        for unit in _b64_units(entry):
+            try:
+                data = base64.b64decode(unit, validate=False)
+            except (binascii.Error, ValueError):
+                continue
+            for seg in _split_jpegs(data):
+                if not seg:
+                    continue
+                if not _looks_like_image(seg):
+                    app.logger.warning(
+                        "dropping %d byte(s) from `images` that are not an image "
+                        "— is the Shortcut base64-encoding the photo before "
+                        "putting it in the JSON body?", len(seg))
+                    continue
                 out.append((seg, _sniff_mime(seg)))
     return out
 
@@ -2649,6 +3241,20 @@ def _extract_note() -> str:
     if not note and request.is_json:
         note = (request.get_json(silent=True) or {}).get("note", "") or ""
     return str(note).strip()[:2000]
+
+
+# Said once at startup, because the failure it names is invisible at runtime: a
+# pinned model makes the whole routing layer dead code while every other log line
+# still looks healthy. See claude_estimator.routing_status.
+#
+# WARNING, not INFO, whenever something is actually wrong — at import time Flask's
+# app.logger has no handler yet and inherits the root logger's WARNING threshold,
+# so an INFO line here is swallowed and the check would be worth nothing exactly
+# when it matters. The healthy line stays INFO: visible with --log-level info,
+# and queryable any time via claude_estimator.routing_status().
+_routing = claude_estimator.routing_status()
+(app.logger.warning if "⚠️" in _routing else app.logger.info)(
+    "model routing: %s", _routing)
 
 
 @app.get("/")
@@ -2699,6 +3305,108 @@ def _resolve_templates(nut: Dict[str, Any], note: str, when: datetime,
             "note=%r known=%s", note[:120], [t["name"] for t in templates])
 
     return apply_template(nut, templates)
+
+
+def _recent_bodyweight(day: str) -> Optional[float]:
+    """The weigh-in for `day`, falling back to the most recent one before it.
+
+    Bodyweight work needs this to score at all: a pull-up is not a 0 kg lift. The
+    fallback matters more than it looks — weighing is a morning ritual and lifting
+    is not, so insisting on a same-day reading would drop every back session logged
+    on a day the scale was skipped. Returns None when there is no weigh-in at all,
+    and `effective_load_kg` then leaves those sets out of the index rather than
+    inventing a body.
+    """
+    try:
+        rows = _rows_as_dicts(_read_tab(DAILY_TAB))
+    except Exception:
+        app.logger.warning("could not read daily_summary for bodyweight", exc_info=True)
+        return None
+    best: Optional[Tuple[str, float]] = None
+    for row in rows:
+        date_cell = str(row.get("date") or "").strip()
+        if not date_cell or date_cell > day:
+            continue
+        weight = row.get("weight_kg")
+        if not isinstance(weight, (int, float)) or isinstance(weight, bool):
+            continue
+        if float(weight) <= 0:
+            continue
+        if best is None or date_cell > best[0]:
+            best = (date_cell, float(weight))
+    return best[1] if best else None
+
+
+def _finalize_workout(rec: Dict[str, Any], now: datetime, image_sha: str,
+                      photo_url: str, note: str):
+    """Write a training session: one `sessions` row, then the day's `lift_*` roll-up.
+
+    Keyed on the session's own printed date, not on `now` — the same self-dating
+    property the scale screenshot has, and what makes scrolling the app's history
+    and screenshotting old sessions a working backfill.
+
+    Unlike the scale path this does NOT wake the daily sync: a workout screenshot
+    says nothing about whether the night has been scored, and a trigger on it would
+    fire `upsert_daily` at an arbitrary hour for no gain.
+    """
+    sets = rec.get("sets") or []
+    if not workouts.working_sets(sets):
+        return jsonify({
+            "summary": "That looks like a workout screenshot, but no readable "
+                       "sets were found — nothing logged.",
+            "kind": "workout", "not_read": True,
+        }), 200
+
+    performed = _resolve_measured_at(rec.get("performed_at"), now)
+    day = performed.date().isoformat()
+
+    rows = _all_session_rows()
+    if _session_exists(image_sha, rows):  # idempotent: a retry after a good write
+        return jsonify({"status": "already-logged", "kind": "workout"}), 200
+
+    history = _session_history(rows)
+    bodyweight = _recent_bodyweight(day)
+    e1rms = workouts.best_e1rm_by_exercise(sets, bodyweight)
+    index = workouts.load_index(
+        e1rms, workouts.baseline_e1rms(history, upto_date=day))
+
+    append_session(rec, sets, e1rms, index, performed, image_sha, photo_url, note)
+
+    # The day is scored as a whole: an evening session must not overwrite the
+    # morning's, the same rule biometrics.daily_exercise applies to the tracker's
+    # own sessions. Sessions already on the sheet for this day are re-read from
+    # their stored sets rather than re-derived from the screenshot.
+    same_day = [{"title": str(row.get("title") or ""),
+                 "sets": _parse_sets_cell(row.get("sets_json"))}
+                for row in rows if str(row.get("date") or "") == day]
+    same_day.append({"title": rec.get("title") or "", "sets": sets})
+
+    row = workouts.daily_row(same_day, bodyweight_kg=bodyweight,
+                             history=history, date=day)
+    if row:
+        try:
+            write_daily(day, row)
+        except Exception:
+            # The session itself is already safe on the sheet; a failed roll-up is
+            # recoverable (re-send the screenshot) and must not 5xx the queue into
+            # writing the session a second time.
+            app.logger.exception("session logged but the daily roll-up failed")
+
+    return jsonify({
+        "summary": (f"Treino registado: {row.get('lift_sets', 0)} séries"
+                    + (f", índice de carga {row['lift_load_index']:g}"
+                       if row.get("lift_load_index") is not None else "")),
+        "kind": "workout", "date": day, "sets": len(workouts.working_sets(sets)),
+    }), 200
+
+
+def _parse_sets_cell(raw: Any) -> List[Dict[str, Any]]:
+    """A `sessions.sets_json` cell back into a list. Mirrors _parse_items_cell."""
+    try:
+        parsed = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
 
 
 def _finalize_body(rec: Dict[str, Any], now: datetime):
@@ -2943,8 +3651,10 @@ def process():
         # Budgeted from the top of the request, so the reads above are charged to
         # the same deadline that keeps us inside Cloud Run's 180 s timeout.
         kw["deadline_s"] = _analysis_budget(started)
-        nut = (analyze_text(note, when, templates, **kw) if text_only
-               else analyze(images, note, now=when, templates=templates, **kw))
+        mode = _llm_mode()
+        nut = (analyze_text(note, when, templates, mode=mode, **kw) if text_only
+               else analyze(images, note, now=when, templates=templates,
+                            mode=mode, **kw))
     except Exception as err:
         if attempt + 1 >= max_attempts:  # give up: leave an auditable stub
             app.logger.exception("worker exhausted after %d attempts; stub", attempt + 1)
@@ -2962,6 +3672,8 @@ def process():
         return _finalize_body(nut, when)
     if nut.get("kind") == "bowel":
         return _finalize_bowel(when)
+    if nut.get("kind") == "workout":
+        return _finalize_workout(nut, when, image_sha, photo_url, note)
 
     nut = _resolve_templates(nut, note, when, templates)
     return _finalize(nut, photo_url, when, image_sha, note, text_only, todays)
@@ -3301,15 +4013,20 @@ def nutrients():
 
 
 # =============================================================================
-# Weekly insights & next-meal coach (Phase 2)
+# Next-meal coach (Phase 2 remnant)
 #
-# The DETERMINISTIC analysis (the Diagnosis, the food vocabulary, the portion math)
-# lives in ingest/insights.py and is served read-only here — this is the single
-# source of truth for the nutrition science, reused instead of re-derived. The
-# STRONG-model narration runs on the local Mac (automation/insights/), which fetches
-# `/insights/diagnose` + `/insights/food-profile`, writes the narrative and plates to
-# the `weekly_reports` / `next_meal` tabs, and those are what `/insights/weekly` and
-# `/insights/next-meal` serve back. No model ever runs on a request path here.
+# The weekly review + diagnose/food-profile trio that used to live here
+# (`/insights/weekly`, `/insights/diagnose`, `/insights/food-profile`, the
+# `weekly_reports` tab, `automation/insights/generate.py`) was retired: the coach's
+# own `/coach/report` (period=weekly) replaced it, reading meals/cards/events
+# directly and storing reports in Cloud Storage, not Sheets. `WEEKLY_TAB` and
+# `_get_current_focus` remain only because `/insights/generate-next-meal` below
+# still reads it for continuity.
+#
+# What's left: the DETERMINISTIC analysis (food vocabulary, portion math) lives in
+# ingest/insights.py and is served read-only here. `/insights/next-meal` reads the
+# `next_meal` Sheets tab (also now unwritten); `/insights/generate-next-meal` +
+# `/insights/next-meal/v2` are the newer Gemini on-demand, cache-based pair.
 # =============================================================================
 
 WEEKLY_TAB = "weekly_reports"
@@ -3367,60 +4084,6 @@ def _window_meals(all_rows: List[Dict[str, Any]], start: str, end: str
     return [r for r in all_rows if start <= str(r.get("datetime", ""))[:10] <= end]
 
 
-def _diagnosis_for(ref_day: str, window_days: int) -> Dict[str, Any]:
-    """The deterministic Diagnosis for the `window_days` completed days before
-    `ref_day`, reusing the tested `_history_window` for the per-day intake and the raw
-    window meals for attribution/coverage. `prev_days` is the window before it, so the
-    Diagnosis can read each nutrient's week-over-week trend."""
-    all_rows = _all_meal_rows()
-    ref = datetime.fromisoformat(ref_day).date()
-    start = (ref - timedelta(days=window_days)).isoformat()
-    end = (ref - timedelta(days=1)).isoformat()
-    days = _history_window(all_rows, ref_day, window_days)
-    prev_ref = (ref - timedelta(days=window_days)).isoformat()
-    prev_days = _history_window(all_rows, prev_ref, window_days)
-    targets, basis = _resolved_targets_and_basis()
-    return _insights_mod().build_diagnosis(
-        ref_day=ref_day, window_days=window_days, days=days, prev_days=prev_days,
-        window_meals=_window_meals(all_rows, start, end),
-        targets=targets, basis=basis, policy=_nutrient_policy())
-
-
-@app.get("/insights/diagnose")
-def insights_diagnose():
-    """The Diagnosis JSON for a window (default: the last 7 completed days). The local
-    generator's data source, and the debug view for eyeballing the deterministic
-    analysis against a real week before any model call. `?date=` reviews another week's
-    end; `?window=` overrides the length."""
-    if not _authorized(request):
-        return jsonify({"error": "unauthorized"}), 401
-    day = request.args.get("date") or datetime.now(_tz()).date().isoformat()
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
-        return jsonify({"error": "date must be YYYY-MM-DD"}), 400
-    try:
-        window = max(1, min(31, int(request.args.get("window", NUTRIENT_HISTORY_DAYS))))
-    except (TypeError, ValueError):
-        window = NUTRIENT_HISTORY_DAYS
-    return jsonify(_diagnosis_for(day, window)), 200
-
-
-@app.get("/insights/food-profile")
-def insights_food_profile():
-    """The user's food vocabulary over the last four weeks: what they eat, when, a
-    typical portion, and each food's per-gram nutrient density. Powers both the swap
-    suggestions and the next-meal portion math."""
-    if not _authorized(request):
-        return jsonify({"error": "unauthorized"}), 401
-    all_rows = _all_meal_rows()
-    ref = datetime.now(_tz()).date()
-    start = (ref - timedelta(days=PROFILE_WINDOW_DAYS)).isoformat()
-    profile = _insights_mod().build_food_profile(
-        _window_meals(all_rows, start, ref.isoformat()), NUTRIENT_KEYS,
-        _display_taxonomy())
-    return jsonify({"generated_for": ref.isoformat(),
-                    "window_days": PROFILE_WINDOW_DAYS, "foods": profile}), 200
-
-
 @app.get("/insights/next-meal-context")
 def insights_next_meal_context():
     """The deterministic inputs for a next-meal suggestion: the day's remaining budget,
@@ -3476,31 +4139,6 @@ def _loads_or(raw: Any, default: Any) -> Any:
         return json.loads(raw) if raw else default
     except (TypeError, ValueError):
         return default
-
-
-@app.get("/insights/weekly")
-def insights_weekly():
-    """The latest cached weekly report for the app. Read-only — the strong model wrote
-    it on the Mac. `status: pending` until the first Sunday run has landed."""
-    if not _authorized(request):
-        return jsonify({"error": "unauthorized"}), 401
-    rows = [r for r in _read_cached_rows(WEEKLY_TAB) if str(r.get("week_start") or "")]
-    if not rows:
-        return jsonify({"status": "pending", "report": None}), 200
-    latest = max(rows, key=lambda r: str(r.get("week_start")))
-    return jsonify({
-        "status": str(latest.get("status") or "generated"),
-        "week_start": latest.get("week_start"),
-        "generated_at": latest.get("generated_at"),
-        "window_start": latest.get("window_start"),
-        "window_end": latest.get("window_end"),
-        "focus_key": latest.get("focus_key") or None,
-        "prior_focus_key": latest.get("prior_focus_key") or None,
-        "prior_focus_delta": _loads_or(latest.get("prior_focus_delta"), None),
-        "coverage_note": latest.get("coverage_note") or "",
-        "report": _loads_or(latest.get("report_json"), None),
-        "diagnosis": _loads_or(latest.get("diagnosis_json"), None),
-    }), 200
 
 
 @app.get("/insights/next-meal")
@@ -3590,99 +4228,6 @@ def _today_meal_rows() -> List[Dict[str, Any]]:
     today = _today_key()
     return [r for r in _all_meal_rows()
             if str(r.get("datetime", "")).startswith(today)]
-
-
-@app.post("/insights/generate-weekly")
-def insights_generate_weekly():
-    """On-demand weekly report generation via Gemini API.
-
-    Generates the Sunday coaching review with diagnosis + food profile + continuity.
-    Uses the Gemini narrator (not local claude) so this works without the Mac.
-    Can be called by Cloud Scheduler on Sundays at 09:00.
-
-    Returns the generated report, or errors if Gemini API is not configured.
-    """
-    if not _authorized(request):
-        return jsonify({"error": "unauthorized"}), 401
-    if not _gemini_available():
-        return jsonify({"error": "GEMINI_API_KEY not configured"}), 503
-
-    now = datetime.now(_tz())
-    week_start = (now - timedelta(days=(now.weekday() + 1) % 7)).date().isoformat()
-
-    try:
-        diagnosis = _diagnosis_for(week_start, 7)
-        profile = _insights_mod().build_food_profile(
-            _window_meals(_all_meal_rows(),
-                          (datetime.fromisoformat(week_start).date() -
-                           timedelta(days=_PROFILE_WINDOW_DAYS_NARRATOR)).isoformat(),
-                          week_start),
-            NUTRIENT_KEYS, _display_taxonomy())
-
-        if diagnosis.get("window", {}).get("days_logged", 0) < 4:
-            return jsonify({
-                "status": "skipped",
-                "reason": f"only {diagnosis['window']['days_logged']} logged days — "
-                          f"too thin for a confident report",
-            }), 200
-
-        # Resolve continuity: compare this week's value against last report's focus.
-        continuity = None
-        prior_rows = [r for r in _read_cached_rows(WEEKLY_TAB) if r.get("week_start")]
-        if prior_rows:
-            last = max(prior_rows, key=lambda r: str(r.get("week_start")))
-            pk = str(last.get("focus_key") or "").strip()
-            try:
-                prev_val = float(last.get("focus_value"))
-            except (TypeError, ValueError):
-                prev_val = None
-            if pk and prev_val and prev_val > 0:
-                # Find current value for this key in the diagnosis nutrients.
-                now_val = None
-                kind = "reach"
-                for n in diagnosis.get("nutrients", []):
-                    if n.get("key") == pk:
-                        now_val = n.get("mean")
-                        kind = n.get("kind", "reach")
-                        break
-                if not now_val:
-                    # Maybe it's in the adherence block (a macro like protein, fiber).
-                    adh = diagnosis.get("adherence", {}).get(pk, {})
-                    now_val = adh.get("mean") if isinstance(adh, dict) else None
-
-                if now_val and now_val > 0:
-                    pct = round(100 * (now_val - prev_val) / prev_val)
-                    up = now_val > prev_val
-                    toward = (up and kind != "limit") or (not up and kind == "limit")
-                    continuity = {
-                        "key": pk, "prev": prev_val, "now": now_val,
-                        "pct": pct,
-                        "direction": "up" if up else "down" if now_val < prev_val else "flat",
-                        "toward_target": toward,
-                    }
-
-        narrator = _narrator_mod()
-        report = narrator.narrate_weekly(diagnosis, profile, continuity)
-
-        # Build the full response and cache it.
-        result = {
-            "status": "generated",
-            "week_start": week_start,
-            "generated_at": now.isoformat(timespec="seconds"),
-            "window_start": diagnosis.get("window", {}).get("start"),
-            "window_end": diagnosis.get("window", {}).get("end"),
-            "focus_key": (report.get("focus", {}) or {}).get("key")
-                         or (diagnosis.get("ranked_issues") or [""])[0],
-            "prior_focus_delta": continuity,
-            "coverage_note": diagnosis.get("coverage_note", ""),
-            "report": report,
-        }
-        _write_cache("weekly_report", result)
-        return jsonify(result), 200
-
-    except Exception as exc:
-        app.logger.exception("weekly generation failed")
-        return jsonify({"status": "error", "error": str(exc)}), 500
 
 
 @app.post("/insights/generate-next-meal")

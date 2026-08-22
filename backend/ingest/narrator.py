@@ -700,7 +700,8 @@ def _blind_spots(facts: Dict[str, Any]) -> str:
     missing = list(caps.get("blind_spots") or ())
     if not missing:
         return ""
-    labels = {"sleep": "sono e recuperação", "activity": "atividade e treino",
+    labels = {"sleep": "sono e recuperação", "activity": "atividade e movimento",
+              "training": "treino de força (cargas, séries, RIR)",
               "body": "composição corporal (peso, massa gorda, massa magra)",
               "digestion": "digestão", "nutrition": "alimentação"}
     named = ", ".join(labels.get(d, d) for d in missing)

@@ -123,19 +123,25 @@ def test_required_item_keys_match_the_gemini_schema():
 
 
 # -- transport -----------------------------------------------------------------
-class _FakeCLI:
-    """Stands in for automation/nutrition-audit/claude_cli.py."""
+class _FakeLLM:
+    """Stands in for automation/nutrition-audit/llm_cli.py."""
+
+    # model()/effort() read these off the module when no env override is set,
+    # same as the real llm_cli.PRIMARY_MODEL/PRIMARY_EFFORT.
+    PRIMARY_MODEL = "claude-sonnet-5"
+    PRIMARY_EFFORT = "high"
 
     def __init__(self, answer=None, raises=None):
         self.answer = answer or {"kind": "meal", "items": [], "confidence": 0.5}
         self.raises = raises
         self.calls = []
 
-    def call_claude_json(self, prompt, *, model, effort, timeout_s, require_key,
-                         tools, source):
+    def call_json(self, prompt, *, model, effort, timeout_s, require_key,
+                  tools, source, cwd=None, mode=None):
         self.calls.append({"prompt": prompt, "model": model, "effort": effort,
                            "timeout_s": timeout_s, "require_key": require_key,
-                           "tools": tools, "source": source})
+                           "tools": tools, "source": source, "cwd": cwd,
+                           "mode": mode})
         if self.raises:
             raise self.raises
         return dict(self.answer)
@@ -144,8 +150,8 @@ class _FakeCLI:
 def test_requires_kind_not_items(monkeypatch):
     """A scale screenshot legitimately returns no items, so requiring "items"
     would make every weigh-in fail to parse."""
-    fake = _FakeCLI()
-    monkeypatch.setattr(claude_estimator, "_cli", lambda: fake)
+    fake = _FakeLLM()
+    monkeypatch.setattr(claude_estimator, "_llm", lambda: fake)
     claude_estimator.analyze("prompt")
     assert fake.calls[0]["require_key"] == "kind"
 
@@ -154,23 +160,23 @@ def test_text_only_call_gets_no_tools(monkeypatch):
     """A prompt that needs no tools must be given none: a model that CAN write a
     file may answer by writing one, which is how the coach's first run through this
     wrapper returned prose instead of JSON."""
-    fake = _FakeCLI()
-    monkeypatch.setattr(claude_estimator, "_cli", lambda: fake)
+    fake = _FakeLLM()
+    monkeypatch.setattr(claude_estimator, "_llm", lambda: fake)
     claude_estimator.analyze("prompt")
     assert fake.calls[0]["tools"] == ""
 
 
 def test_image_call_is_locked_to_read(monkeypatch):
-    fake = _FakeCLI()
-    monkeypatch.setattr(claude_estimator, "_cli", lambda: fake)
+    fake = _FakeLLM()
+    monkeypatch.setattr(claude_estimator, "_llm", lambda: fake)
     claude_estimator.analyze("prompt", [(b"\x89PNG-ish", "image/png")])
     assert fake.calls[0]["tools"] == "Read"
 
 
 def test_images_are_written_named_and_then_cleaned_up(monkeypatch):
     """The CLI opens paths, not bytes, and dispatches on the extension."""
-    fake = _FakeCLI()
-    monkeypatch.setattr(claude_estimator, "_cli", lambda: fake)
+    fake = _FakeLLM()
+    monkeypatch.setattr(claude_estimator, "_llm", lambda: fake)
     claude_estimator.analyze("prompt", [(b"jpg-bytes", "image/jpeg"),
                                         (b"png-bytes", "image/png")])
     prompt = fake.calls[0]["prompt"]
@@ -193,22 +199,25 @@ def test_temp_images_are_cleaned_up_even_when_the_call_fails(monkeypatch):
                 leaked["dir"] = pathlib.Path(s).parent
         raise RuntimeError("usage limit reached")
 
-    fake = _FakeCLI()
-    fake.call_claude_json = capture
-    monkeypatch.setattr(claude_estimator, "_cli", lambda: fake)
+    fake = _FakeLLM()
+    fake.call_json = capture
+    monkeypatch.setattr(claude_estimator, "_llm", lambda: fake)
     with pytest.raises(RuntimeError):
         claude_estimator.analyze("prompt", [(b"x", "image/jpeg")])
     assert leaked and not leaked["dir"].exists()
 
 
 def test_missing_cli_raises_so_the_caller_falls_back(monkeypatch):
-    monkeypatch.setattr(claude_estimator, "_cli", lambda: None)
+    monkeypatch.setattr(claude_estimator, "_llm", lambda: None)
     with pytest.raises(RuntimeError):
         claude_estimator.analyze("prompt")
 
 
 # -- integration with the record assembly --------------------------------------
 def test_successful_claude_answer_becomes_a_meal_record(monkeypatch):
+    # Pinned independently of llm_cli.PRIMARY_MODEL: this test is about record
+    # assembly, not about which model is the current shared default.
+    monkeypatch.setenv("CLAUDE_MEAL_MODEL", "claude-sonnet-5")
     monkeypatch.setattr(claude_estimator, "analyze", lambda *a, **k: {
         "kind": "meal", "confidence": 0.8,
         "items": [{"name": "oats", "portion_g": 80, "calories": 300,
@@ -279,3 +288,138 @@ def test_answer_that_breaks_record_assembly_falls_through(monkeypatch):
     record = ingest._try_claude("prompt")
     # Either a degraded-but-valid record or a clean fallback; never an exception.
     assert record is None or record["kind"] == "meal"
+
+
+# -- the workout fork ----------------------------------------------------------
+def _workout_answer(**overrides):
+    payload = {
+        "kind": "workout",
+        "workout": {
+            "title": "Tronco A",
+            "performed_at": "2026-08-21T18:42",
+            "duration_min": 62,
+            "unit": "kg",
+            "sets": [
+                {"exercise": "barbell bench press", "exercise_pt": "supino",
+                 "set_type": "warmup", "load_type": "external",
+                 "weight_kg": 20, "reps": 10},
+                {"exercise": "barbell bench press", "exercise_pt": "supino",
+                 "set_type": "normal", "load_type": "external",
+                 "weight_kg": 60, "reps": 8, "rir": 2},
+                {"exercise": "pull up", "set_type": "normal",
+                 "load_type": "bodyweight", "weight_kg": 0, "reps": 8, "rir": 1},
+            ],
+        },
+        "items": [],
+    }
+    payload["workout"].update(overrides)
+    return payload
+
+
+def test_claude_can_return_a_training_session(monkeypatch):
+    """The third router fork has to work through the Claude path too — it is the
+    primary estimator on the laptop, so a fork it can't produce is a fork that
+    never fires in production."""
+    monkeypatch.setattr(claude_estimator, "analyze",
+                        lambda *a, **k: _workout_answer())
+    record = ingest._try_claude("prompt", allow_workout=True)
+    assert record["kind"] == "workout"
+    assert record["title"] == "Tronco A"
+    assert record["performed_at"] == "2026-08-21T18:42"
+    assert record["duration_min"] == 62
+    assert len(record["sets"]) == 3          # the warm-up is kept, not dropped
+    assert len(ingest.workouts.working_sets(record["sets"])) == 2   # …just not scored
+
+
+def test_a_misread_load_never_reaches_the_session(monkeypatch):
+    """The same guarantee `_normalize_body` gives the scale. A wrong load is worse
+    than a missing one here: it becomes a baseline every later session is scored
+    against."""
+    monkeypatch.setattr(claude_estimator, "analyze", lambda *a, **k: _workout_answer(
+        sets=[{"exercise": "barbell bench press", "set_type": "normal",
+               "load_type": "external", "weight_kg": 6000, "reps": 8}]))
+    record = ingest._try_claude("prompt", allow_workout=True)
+    assert record["sets"] == []
+
+
+def test_pounds_are_converted_on_the_way_in(monkeypatch):
+    monkeypatch.setattr(claude_estimator, "analyze", lambda *a, **k: _workout_answer(
+        unit="lb",
+        sets=[{"exercise": "barbell bench press", "set_type": "normal",
+               "load_type": "external", "weight_kg": 100, "reps": 5}]))
+    record = ingest._try_claude("prompt", allow_workout=True)
+    assert record["sets"][0]["weight_kg"] == pytest.approx(45.36, abs=0.01)
+
+
+def test_workout_verdict_is_refused_on_a_text_note(monkeypatch):
+    """A note has no screen to read, so "workout" is a hallucination there and must
+    degrade to a meal — the same rule that already protects the body fork."""
+    monkeypatch.setattr(claude_estimator, "analyze",
+                        lambda *a, **k: _workout_answer())
+    record = ingest._try_claude("prompt", allow_body=False, allow_bowel=True,
+                                allow_workout=False)
+    assert record["kind"] == "meal"
+
+
+def test_the_users_routing_mode_reaches_the_router(monkeypatch):
+    """The `config` tab switch is only worth having if it survives the trip from
+    the sheet down to the CLI — every layer in between defaults it to None."""
+    fake = _FakeLLM()
+    monkeypatch.setattr(claude_estimator, "_llm", lambda: fake)
+    claude_estimator.analyze("prompt", mode="economy")
+    assert fake.calls[0]["mode"] == "economy"
+
+
+def test_the_row_records_who_actually_answered_not_who_was_asked(monkeypatch):
+    """With a provider chain those differ exactly when it matters — a spent Claude
+    window that fell through to agy. The meals tab's `model` column is the audit
+    trail for which estimates came from where."""
+    monkeypatch.setattr(claude_estimator, "analyze", lambda *a, **k: {
+        "kind": "meal", "items": [], "confidence": 0.4,
+        "_model_id": "agy:gemini-3.6-flash-high",
+    })
+    record = ingest._try_claude("prompt")
+    assert record["model"] == "agy:gemini-3.6-flash-high"
+
+
+def test_a_missing_model_id_still_names_something(monkeypatch):
+    monkeypatch.setattr(claude_estimator, "_llm", lambda: None)
+    assert claude_estimator.answered_by({}) == claude_estimator.DEFAULT_MODEL
+
+
+# -- the silent-bypass guard ---------------------------------------------------
+def test_a_pinned_meal_model_is_reported_as_a_bypass(monkeypatch):
+    """This is how routing died in production on 2026-08-21: a leftover
+    CLAUDE_MEAL_MODEL from the single-switch era pinned every call, and nothing in
+    any log said so."""
+    monkeypatch.setenv("CLAUDE_MEAL_MODEL", "claude-sonnet-5")
+    status = claude_estimator.routing_status()
+    assert "BYPASSED" in status and "CLAUDE_MEAL_MODEL" in status
+
+
+def test_a_pinned_primary_model_is_reported_as_a_bypass(monkeypatch):
+    monkeypatch.delenv("CLAUDE_MEAL_MODEL", raising=False)
+
+    class _Pinned:
+        PRIMARY_MODEL = "claude-sonnet-5"
+        PRIMARY_EFFORT = "high"
+
+    monkeypatch.setattr(claude_estimator, "_llm", lambda: _Pinned())
+    assert "BYPASSED" in claude_estimator.routing_status()
+
+
+def test_unpinned_reports_routing_as_active(monkeypatch):
+    monkeypatch.delenv("CLAUDE_MEAL_MODEL", raising=False)
+
+    class _Routed:
+        PRIMARY_MODEL = ""
+        PRIMARY_EFFORT = "high"
+
+    monkeypatch.setattr(claude_estimator, "_llm", lambda: _Routed())
+    status = claude_estimator.routing_status()
+    assert "ACTIVE" in status and "BYPASSED" not in status
+
+
+def test_the_disabled_estimator_says_so_rather_than_claiming_routing(monkeypatch):
+    monkeypatch.delenv("MEAL_ESTIMATOR", raising=False)
+    assert "OFF" in claude_estimator.routing_status()

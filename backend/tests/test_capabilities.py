@@ -113,7 +113,14 @@ class TestReadingTheConfigTab:
     def test_the_seed_covers_every_key_the_reader_understands(self):
         # A key the reader supports but never seeds is one a user can't discover.
         seeded = {row[0] for row in caps.CONFIG_SEED}
-        assert seeded == {"blocks"}
+        assert "blocks" in seeded
+        # `llm_mode` is not a capability and `from_config` ignores it — it is
+        # seeded here anyway because this tab is the one surface where the user can
+        # change the system's behaviour from their phone, and an unseeded key is an
+        # invisible one. Read by ingest/main.py:_llm_mode.
+        assert seeded == {"blocks", "llm_mode"}
+        assert caps.from_config([{"key": "llm_mode", "value": "economy"}]
+                                ).preset == caps.DEFAULT_PRESET
 
     def test_the_api_shape_carries_what_the_app_draws_from(self):
         payload = caps.from_preset("nutrition").to_api()
