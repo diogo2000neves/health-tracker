@@ -19,3 +19,6 @@ ios/Config.swift
 # Local automation (personal machine only)
 automation/**/logs/
 automation/**/__pycache__/
+
+# Build artifact: a zip of the ios/ tree, rebuilt on demand.
+ios.zip
