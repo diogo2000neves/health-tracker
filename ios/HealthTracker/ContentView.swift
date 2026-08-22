@@ -32,13 +32,47 @@ final class TodayStore {
     /// Meals logged the usual way — through the Shortcut — are picked up server-side.
     private(set) var editCount = 0
 
+    /// The reload currently in flight, if any. See `load()`. Not observed: it is
+    /// bookkeeping, and no view should redraw because a fetch started.
+    @ObservationIgnored private var inFlight: Task<Void, Never>?
+
     init() {
         response = APIClient.shared.cachedToday()
     }
 
     func noteEdit() { editCount += 1 }
 
+    /// Reload today, coalescing concurrent callers onto ONE round trip.
+    ///
+    /// Three separate `.task` modifiers ask for this payload on launch — RootView's,
+    /// TodayView's, and NutrientsView's (Hoje and Nutrientes share this store) — and
+    /// before the coalescing they were three real, concurrent `GET /today`s. The
+    /// server logs show all three arriving inside the same second, and because
+    /// gunicorn runs `--threads 8` each one landed on a *different* thread with its
+    /// own Google API connection, so they multiplied the very stall that made this
+    /// screen slow rather than sharing one answer.
+    ///
+    /// A caller that arrives mid-flight now awaits the running fetch and returns
+    /// with the same data, so pull-to-refresh still feels immediate.
     func load() async {
+        if let existing = inFlight {
+            await existing.value
+            return
+        }
+        // The task clears its own slot, so it does not matter how many callers
+        // ended up awaiting it. Assigning `inFlight` after creating the task is
+        // safe because a Task is never run eagerly at creation: this one is
+        // MainActor-isolated and we are already on the MainActor, so its body
+        // cannot begin until `await` below suspends us.
+        let task = Task { @MainActor in
+            defer { self.inFlight = nil }
+            await self.fetch()
+        }
+        inFlight = task
+        await task.value
+    }
+
+    private func fetch() async {
         let hadResponse = response != nil
         if hadResponse { isRefreshing = true } else { isLoading = true }
         defer { isLoading = false; isRefreshing = false }
@@ -63,11 +97,28 @@ final class TrendsStore {
     var isLoading = false
     var isRefreshing = false
 
+    /// The reload currently in flight, if any. See `TodayStore.load()` — RootView
+    /// and TrendsView both ask for this one on launch, for the same reason.
+    @ObservationIgnored private var inFlight: Task<Void, Never>?
+
     init() {
         response = APIClient.shared.cachedDaily()
     }
 
     func load() async {
+        if let existing = inFlight {
+            await existing.value
+            return
+        }
+        let task = Task { @MainActor in
+            defer { self.inFlight = nil }
+            await self.fetch()
+        }
+        inFlight = task
+        await task.value
+    }
+
+    private func fetch() async {
         let hadResponse = response != nil
         if hadResponse { isRefreshing = true } else { isLoading = true }
         defer { isLoading = false; isRefreshing = false }

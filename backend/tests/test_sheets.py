@@ -172,3 +172,97 @@ def test_heal_daily_duplicates_is_a_noop_without_duplicates():
     assert svc.sheet_batch_bodies == []
 
 
+
+# -- transient-failure resilience: the 2026-08-19/20 lost daily syncs ----------
+#
+# Both runs died on the FIRST call (`spreadsheets.get`) with a 503 from Google,
+# before a single row had been touched. Nothing retried it. The ingest service
+# survives the same blip only because every sheet call there sits inside a task
+# the queue re-runs 8 times; the daily job has no outer net at all, so one blip
+# was a lost run — invisible, because the trailing reconcile window healed the
+# data the next morning while the alert fired both times.
+
+class _FlakySvc:
+    """Fails the first `fails` attempts with `err`, then succeeds."""
+
+    def __init__(self, err, fails=1, reply=None):
+        self._err, self._fails, self._reply = err, fails, reply or {}
+        self.attempts = 0
+
+    def spreadsheets(self):
+        return self
+
+    def values(self):
+        return self
+
+    def get(self, **kwargs):
+        return self
+
+    def append(self, **kwargs):
+        return self
+
+    def batchUpdate(self, **kwargs):
+        return self
+
+    def execute(self):
+        self.attempts += 1
+        if self.attempts <= self._fails:
+            raise self._err
+        return self._reply
+
+
+def _http_error(status):
+    from googleapiclient.errors import HttpError
+    return HttpError(type("R", (), {"status": status, "reason": "x"})(), b"{}")
+
+
+def _sheet_over(svc):
+    client = SheetClient.__new__(SheetClient)
+    client.svc = svc
+    client.sid = "sid"
+    client._titles = None
+    return client
+
+
+def test_a_503_no_longer_loses_the_whole_daily_sync(monkeypatch):
+    monkeypatch.setattr("src.sheets.time.sleep", lambda _s: None)
+    svc = _FlakySvc(_http_error(503), fails=2,
+                    reply={"sheets": [{"properties": {"title": DAILY_TAB}}]})
+    assert _sheet_over(svc).tab_titles() == {DAILY_TAB}
+    assert svc.attempts == 3
+
+
+def test_a_dead_socket_is_retried_on_a_read(monkeypatch):
+    """The daily job reads, then spends minutes on Google Health and the model,
+    then writes — by which point its connection is long gone. See
+    `ingest/main.py:_per_thread` for the measurements."""
+    monkeypatch.setattr("src.sheets.time.sleep", lambda _s: None)
+    svc = _FlakySvc(ConnectionResetError("socket died"), fails=1,
+                    reply={"values": [["date"], ["2026-08-22"]]})
+    client = _sheet_over(svc)
+    client._titles = {DAILY_TAB}          # so the read is the only call measured
+    assert client.read_rows(DAILY_TAB) == [{"date": "2026-08-22"}]
+    assert svc.attempts == 2
+
+
+def test_a_permanent_error_is_not_retried(monkeypatch):
+    """A 403 is a misconfiguration, not a blip — retrying it just delays the alert."""
+    import pytest
+    monkeypatch.setattr("src.sheets.time.sleep", lambda _s: None)
+    svc = _FlakySvc(_http_error(403), fails=99)
+    with pytest.raises(Exception):
+        _sheet_over(svc).tab_titles()
+    assert svc.attempts == 1
+
+
+def test_an_append_is_never_retried_however_transient_the_failure(monkeypatch):
+    """THE rule. A connection error means the response could not be READ, never
+    that the row was not written — so a retry is how one lunch becomes two rows
+    (2026-08-21). Appends fail fast and let the caller decide."""
+    import pytest
+    monkeypatch.setattr("src.sheets.time.sleep", lambda _s: None)
+    for err in (ConnectionResetError("died"), _http_error(503)):
+        svc = _FlakySvc(err, fails=1, reply={})
+        with pytest.raises(Exception):
+            _sheet_over(svc).append_row(DAILY_TAB, ["2026-08-22"])
+        assert svc.attempts == 1, f"{err!r} must not be retried on an append"

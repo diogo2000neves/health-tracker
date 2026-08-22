@@ -2199,6 +2199,76 @@ def test_clearing_a_client_only_affects_the_calling_thread():
     assert other["after"] is other["before"]    # theirs was untouched
 
 
+# -- stale keep-alive sockets: the "/today takes a minute" root cause ----------
+def test_an_idle_client_is_rebuilt_before_it_is_ever_used(monkeypatch):
+    """Google closes an idle keep-alive socket without telling us, and httplib2
+    only finds out by reading from it — which blocks for the WHOLE socket timeout.
+    Measured live on 2026-08-22: idle 30 s answered in 0.29 s, idle 60 s blocked
+    60.05 s. `/today` is the app's opening screen and the phone is idle far longer
+    than a minute between meals, so every visit paid that. Rebuilding first costs
+    ~2 ms, so the client is thrown away once it has sat unused past the threshold."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(ingest.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setenv("GOOGLE_CLIENT_MAX_IDLE_S", "25")
+
+    @ingest._per_thread
+    def client():
+        return object()
+
+    first = client()
+    clock["t"] += 24.0                      # inside the window: still warm
+    assert client() is first
+    clock["t"] += 24.0                      # each use re-arms it, so still warm
+    assert client() is first
+    clock["t"] += 26.0                      # idle past the threshold: presumed dead
+    assert client() is not first
+
+
+def test_a_busy_client_is_never_rebuilt_mid_burst(monkeypatch):
+    """The app fires several requests at once when it opens. Those must share one
+    connection — recycling is for the gap between visits, not for a burst."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(ingest.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setenv("GOOGLE_CLIENT_MAX_IDLE_S", "25")
+    made = []
+
+    @ingest._per_thread
+    def client():
+        made.append(1)
+        return object()
+
+    for _ in range(20):
+        client()
+        clock["t"] += 1.0
+    assert len(made) == 1
+
+
+def test_client_idle_threshold_survives_a_bad_env_value(monkeypatch):
+    """A typo in the deployment env must not make every request rebuild (or, worse,
+    crash the read path) — it falls back to the measured default."""
+    monkeypatch.setenv("GOOGLE_CLIENT_MAX_IDLE_S", "banana")
+    assert ingest._client_max_idle_s() == ingest.DEFAULT_CLIENT_MAX_IDLE_S
+    monkeypatch.setenv("GOOGLE_CLIENT_MAX_IDLE_S", "")
+    assert ingest._client_max_idle_s() == ingest.DEFAULT_CLIENT_MAX_IDLE_S
+    monkeypatch.setenv("GOOGLE_CLIENT_MAX_IDLE_S", "5")
+    assert ingest._client_max_idle_s() == 5.0
+
+
+def test_the_sheets_transport_caps_how_long_a_dead_socket_can_block():
+    """googleapiclient's default is 60 s, and that is exactly what a stale
+    connection burned. Sheets reads here are 0.3-0.8 s, so the cap is generous —
+    it exists so a socket that dies *inside* the idle window costs 30 s, not 60."""
+    http = ingest._timed_http(ingest._sheets_timeout_s())
+    assert http.timeout == ingest.DEFAULT_SHEETS_TIMEOUT_S
+    assert http.timeout < 60                    # the default this replaces
+
+
+def test_the_sheets_transport_keeps_308_out_of_the_redirect_codes():
+    """Copied from googleapiclient's own build_http(): Drive answers 308 to mean
+    "resume this upload", so treating it as a redirect breaks resumable uploads."""
+    assert 308 not in ingest._timed_http(30.0).redirect_codes
+
+
 # -- never blind-retry a write that isn't idempotent --------------------------
 def test_an_append_is_not_retried_because_the_row_may_already_exist():
     """A connection error means the RESPONSE could not be read, never that the

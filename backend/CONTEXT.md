@@ -558,6 +558,39 @@ mean `total_cals_out`, which requires activity to vary.
   Deploying is `git pull && ./deploy/install.sh --start`, and **running
   `backend/tests` is now the only gate between an edit and production** — the same
   suite Cloud Build used to run, with nothing enforcing it but you.
+- **The read API keeps no idle Google connection** (`ingest/main.py:_per_thread`).
+  This is what made the app feel broken, so it is worth knowing before "optimising"
+  it away. Google (and WSL2's NAT) closes an idle keep-alive socket without saying
+  so, and httplib2 only discovers it by *reading* — which blocks for the entire
+  socket timeout first. Measured live on 2026-08-22:
+
+  | connection idle for | next Sheets read |
+  |---|---|
+  | 30 s | 0.29 s |
+  | 60 s | **60.05 s**, then `TimeoutError` |
+  | 240 s | **60.06 s**, then `TimeoutError` |
+
+  `_execute` then rebuilt and succeeded in ~1 s, so no data was ever at risk — only
+  latency, in the worst possible place. `/today` is the app's opening screen and a
+  phone is idle far longer than a minute between meals, so **every** visit paid it;
+  with `--threads 8` each thread holds its own dead socket, and the app fired three
+  concurrent `/today`s on launch, so two back-to-back requests both measured 63 s.
+  That was the "minutes of loading", and none of it was the data: the `meals` tab
+  is 167 rows and `daily_summary` 37, read in 0.80 s + 0.34 s.
+
+  The fix is to **throw the client away once it has sat unused for 25 s** rather
+  than find out the hard way. That threshold is under the 30 s proven *alive*, not
+  halfway to the first one proven dead: the real cutoff is Google's to move, being
+  early costs 0.3 s and being late costs 60 s. Rebuilding is what makes this cheap
+  — `build()` is ~2 ms because the discovery document ships with the library (hence
+  the explicit `static_discovery=True`; do not let a rebuild become a network
+  fetch). The Sheets client also carries its own 30 s socket timeout via
+  `_timed_http`, so a socket that dies *inside* the window costs 30 s, not 60. The
+  **Drive** client deliberately keeps the 60 s default: it moves whole photos, and
+  `/ingest` holds the Shortcut open while it uploads.
+
+  Measured after the fix: `/today` **0.6-1.5 s cold, warm and after a 5-minute
+  idle gap alike**.
 - **Day grain:** every `date` is the **local civil day** (Europe/Lisbon / the
   device's own utcOffset) — never the UTC day. **Nutrition** uses a **waking-day**
   grain instead (`NUTRITION_DAY_CUTOFF_HOUR`, 05:00): a meal before the cutoff

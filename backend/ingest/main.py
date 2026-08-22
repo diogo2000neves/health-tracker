@@ -97,12 +97,14 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 import google.auth
+import httplib2
 from flask import Flask, Response, abort, jsonify, request
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
 from google.auth.transport.requests import Request as AuthRequest
 from google.oauth2.credentials import Credentials
+from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
@@ -292,6 +294,24 @@ DEFAULT_TASKS_MAX_ATTEMPTS = 8
 # The Cloud Run Job a weigh-in wakes (see _trigger_daily_sync). Override with the
 # DAILY_JOB env var.
 DEFAULT_DAILY_JOB = "health-tracker-daily"
+
+# How long a cached Google API client may sit idle before `_per_thread` throws it
+# away. 25 s is deliberately under the 30 s that measured *alive* on this
+# deployment — read the long version in `_per_thread`, it is the fix for `/today`
+# taking a minute. Override with GOOGLE_CLIENT_MAX_IDLE_S.
+DEFAULT_CLIENT_MAX_IDLE_S = 25.0
+
+# Socket timeout for the SHEETS client only. googleapiclient's default is 60 s
+# (`googleapiclient.http.DEFAULT_HTTP_TIMEOUT_SEC`), which is what a stale
+# connection used to burn before anyone noticed it was dead. Sheets reads here are
+# 0.3-0.8 s against tabs of a few hundred rows, so 30 s is ~40x the measured worst
+# case and still halves the damage when a socket dies inside the idle window above.
+# Nothing is lost by hitting it: `_execute` rebuilds and retries, and the one call
+# that must not be retried blindly (the append) already fails fast by design.
+#
+# The DRIVE client keeps the 60 s default on purpose — it moves whole photos, not
+# a few hundred cells, and `/ingest` holds the Shortcut open while it uploads.
+DEFAULT_SHEETS_TIMEOUT_S = 30.0
 
 # Full per-ingredient micronutrient set, stored in each item's `nutrients` map.
 # Grouped by unit (suffix _g/_mg/_ug) so values map cleanly to a future relational
@@ -1121,14 +1141,31 @@ def _sid() -> str:
     return os.environ["HEALTH_SPREADSHEET_ID"]
 
 
-def _per_thread(factory):
-    """One API client per THREAD, not one per process.
+def _client_max_idle_s() -> float:
+    """How long a cached Google API client may sit unused before it is rebuilt.
 
-    httplib2 says it of itself (`__init__.py`: "Not thread-safe, requires external
-    synchronization against concurrent requests"), and the googleapiclient service
-    object owns one of its connections. Under `--threads 8` a single cached client
-    means eight threads interleaving reads and writes on one TLS socket, and the
-    symptoms are exactly what the logs showed on 2026-08-20/21:
+    See `_per_thread` for why this exists at all. Read per call so a deployment can
+    tune it without a code change, and so the tests can drive both branches.
+    """
+    try:
+        return float(os.environ.get("GOOGLE_CLIENT_MAX_IDLE_S", "").strip()
+                     or DEFAULT_CLIENT_MAX_IDLE_S)
+    except ValueError:
+        app.logger.warning("GOOGLE_CLIENT_MAX_IDLE_S is not a number; using %s",
+                           DEFAULT_CLIENT_MAX_IDLE_S)
+        return DEFAULT_CLIENT_MAX_IDLE_S
+
+
+def _per_thread(factory):
+    """One API client per THREAD, rebuilt whenever it has been idle long enough
+    that its keep-alive socket is probably already dead.
+
+    **Per thread, not per process.** httplib2 says it of itself (`__init__.py`:
+    "Not thread-safe, requires external synchronization against concurrent
+    requests"), and the googleapiclient service object owns one of its connections.
+    Under `--threads 8` a single cached client means eight threads interleaving
+    reads and writes on one TLS socket, and the symptoms are exactly what the logs
+    showed on 2026-08-20/21:
 
         ssl.SSLError: WRONG_VERSION_NUMBER
         http.client.IncompleteRead(0 bytes read)
@@ -1138,6 +1175,34 @@ def _per_thread(factory):
     …and, because `_execute` retries on connection errors, a meal appended TWICE
     when the row landed but the scrambled response could not be read.
 
+    **Rebuilt when idle, because nothing reports a closed keep-alive socket.**
+    Google's frontend (and WSL2's NAT) drops an idle HTTP/1.1 connection without
+    telling us, and httplib2 only finds out by *reading* from it — which blocks for
+    the full socket timeout before failing. Measured against the live Sheets API on
+    2026-08-22, on this deployment:
+
+        idle  30 s -> answered in 0.29 s
+        idle  60 s -> blocked 60.05 s, then TimeoutError
+        idle 240 s -> blocked 60.06 s, then TimeoutError
+
+    `_execute` then cleared the client, rebuilt and succeeded in ~1 s, so the data
+    was never at risk — only the latency was, and only in the worst possible place.
+    `/today` is the app's opening screen and the phone is idle far longer than a
+    minute between meals, so *every* visit paid ~60 s per stale thread. With
+    `--threads 8` two back-to-back requests land on two different threads holding
+    two different dead sockets: both curls above measured 63 s, and the app fires
+    three concurrent `/today`s on launch. That is the "minutes of loading".
+
+    Rebuilding is the cheap side of the trade and that is what makes this safe:
+    `build()` costs ~2 ms (the discovery document ships with the library — no
+    network), `google.auth.default()` ~35 ms, and the fresh TLS handshake ~0.3 s on
+    the next call. So we spend ~0.3 s to avoid a 60 s stall, and only after a real
+    idle gap — a burst of requests keeps its connection warm and pays nothing.
+
+    The threshold sits *below* the last idle time proven alive (30 s), not halfway
+    to the first one proven dead: the true cutoff is somewhere in (30 s, 60 s], it
+    is Google's to change, and being early costs 0.3 s while being late costs 60 s.
+
     `cache_clear()` deliberately drops only the CALLING thread's client: a thread
     that hit a broken socket should rebuild its own, not yank one out from under
     seven others mid-request.
@@ -1145,10 +1210,16 @@ def _per_thread(factory):
     store = threading.local()
 
     def get():
+        now = time.monotonic()
         client = getattr(store, "value", None)
+        # `used_at` is when the client was last handed out, which is immediately
+        # before it is used — a good enough proxy for last activity on the socket.
+        if client is not None and now - getattr(store, "used_at", 0.0) > _client_max_idle_s():
+            client = None
         if client is None:
             client = factory()
-            store.value = client
+        store.value = client
+        store.used_at = now
         return client
 
     def cache_clear():
@@ -1160,12 +1231,49 @@ def _per_thread(factory):
     return get
 
 
+def _timed_http(timeout_s: float) -> httplib2.Http:
+    """An httplib2 connection with an explicit socket timeout.
+
+    `build(credentials=...)` would call `googleapiclient.http.build_http()`, which
+    hard-codes 60 s unless you reach for the process-global
+    `socket.setdefaulttimeout()` — and that would also retime every Gemini call,
+    every Drive upload and the queue's own HTTP. Building the transport here keeps
+    the timeout attached to the one client that needs it.
+
+    The 308 exclusion is copied from `build_http()` and is not optional: Drive and
+    YouTube answer 308 to mean "resume this upload", so treating it as a redirect
+    breaks resumable uploads.
+    """
+    http = httplib2.Http(timeout=timeout_s)
+    try:
+        http.redirect_codes = http.redirect_codes - {308}
+    except AttributeError:  # older httplib2 has no redirect_codes
+        pass
+    return http
+
+
+def _sheets_timeout_s() -> float:
+    try:
+        return float(os.environ.get("SHEETS_TIMEOUT_S", "").strip()
+                     or DEFAULT_SHEETS_TIMEOUT_S)
+    except ValueError:
+        app.logger.warning("SHEETS_TIMEOUT_S is not a number; using %s",
+                           DEFAULT_SHEETS_TIMEOUT_S)
+        return DEFAULT_SHEETS_TIMEOUT_S
+
+
 @_per_thread
 def _sheets():
     creds, _ = google.auth.default(
         scopes=["https://www.googleapis.com/auth/spreadsheets"]
     )
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    # `static_discovery=True` is explicit because passing `http=` changes the
+    # default: we want the discovery document that ships with the library, so
+    # rebuilding a client after an idle gap stays a ~2 ms local operation instead
+    # of a network fetch on the request the user is waiting for.
+    return build("sheets", "v4",
+                 http=AuthorizedHttp(creds, http=_timed_http(_sheets_timeout_s())),
+                 cache_discovery=False, static_discovery=True)
 
 
 @_per_thread
