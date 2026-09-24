@@ -91,9 +91,6 @@ markdown fence. Emit the keys in exactly this order:
   "body"                object  — ONLY when kind is "body"; {} otherwise
   "workout"             object  — ONLY when kind is "workout"; {} otherwise
   "meal_time"           string  — "HH:MM" 24h local, or "" when unknown
-  "template"            string  — a known template's name verbatim, or ""
-  "template_scale"      number  — fraction of the template eaten (1 = all), or null
-  "save_template_name"  string  — name to save this meal under, or ""
   "items"               array   — one object per ingredient; [] when kind is "body"
   "confidence"          number  — 0.1-1.0 per the rubric above; 0 when kind is "body"
 

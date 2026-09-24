@@ -364,145 +364,25 @@ def test_sha12_stable():
     assert ingest._sha12(b"abc") != ingest._sha12(b"abd")
 
 
-# -- measured meal templates ---------------------------------------------------
-_TPL = [{
-    "name": "Sandes mista PA",
-    "description": "baguette, ham, cheese, butter",
-    "items": ingest._normalize_items([
-        {"name": "baguette", "portion_g": 80, "calories": 200,
-         "protein_g": 7, "carbs_g": 40, "fat_g": 1,
-         "nutrients": {"fiber_g": 2.0, "sodium_mg": 300}},
-        {"name": "ham", "portion_g": 40, "calories": 60,
-         "protein_g": 8, "carbs_g": 1, "fat_g": 3},
-    ]),
-}]
-
-
-def test_apply_template_swaps_estimate_for_measured_values():
-    est = ingest._meal_from_items(ingest._normalize_items(
-        [{"name": "sandwich", "portion_g": 150, "calories": 400,
-          "protein_g": 20, "carbs_g": 45, "fat_g": 12}]), 0.6, "m1")
-    est["template"], est["template_scale"] = "Sandes mista PA", 1
-    out = ingest.apply_template(est, _TPL)
-    assert out["calories"] == 260.0            # 200 + 60, the MEASURED values
-    assert out["portion_g"] == 120.0           # 80 + 40
-    assert out["confidence"] == ingest.TEMPLATE_CONFIDENCE   # measured, not guessed
-    assert out["template"] == "Sandes mista PA"
-    assert out["model"] == "m1"                # which model matched (audit)
-
-
-def test_apply_template_scales_when_only_part_eaten():
-    est = ingest._meal_from_items([], 0.5, "m1")
-    est["template"], est["template_scale"] = "sandes  mista pa", 0.5  # loose name
-    out = ingest.apply_template(est, _TPL)
-    assert out["calories"] == 130.0            # half of 260
-    assert out["portion_g"] == 60.0
-    assert out["template"] == "Sandes mista PA (x0.5)"
-    assert out["items"][0]["nutrients"]["fiber_g"] == 1.0   # nutrients scale too
-
-
-def test_apply_template_ignores_a_hallucinated_name():
-    est = ingest._meal_from_items(ingest._normalize_items(
-        [{"name": "rice", "portion_g": 100, "calories": 130,
-          "protein_g": 3, "carbs_g": 28, "fat_g": 0}]), 0.7, "m1")
-    est["template"] = "A Template That Does Not Exist"
-    out = ingest.apply_template(est, _TPL)
-    assert out["calories"] == 130.0            # the ESTIMATE is kept
-    assert out["template"] == ""               # and the bogus name is dropped
-
-
-def test_apply_template_is_a_noop_without_a_match():
-    est = ingest._meal_from_items(ingest._normalize_items(
-        [{"name": "rice", "portion_g": 100, "calories": 130,
-          "protein_g": 3, "carbs_g": 28, "fat_g": 0}]), 0.7, "m1")
-    est["template"] = ""
-    assert ingest.apply_template(est, _TPL) is est
-
-
-def test_forced_template_honours_a_note_that_names_one():
-    # naming a template in the note is an instruction, not a hint — deterministic
-    assert ingest._forced_template(
-        "usa o template Sandes mista PA", _TPL)["name"] == "Sandes mista PA"
-    assert ingest._forced_template(
-        "this is my template  sandes   MISTA pa", _TPL)["name"] == "Sandes mista PA"
-    # the word "template" alone isn't enough — a name must be present
-    assert ingest._forced_template("we have a template for this", _TPL) is None
-    # and the name alone, without the word "template", doesn't force it
-    assert ingest._forced_template("sandes mista pa", _TPL) is None
-    assert ingest._forced_template("", _TPL) is None
-
-
-def test_forced_template_prefers_the_longest_matching_name():
-    tpls = _TPL + [{"name": "Sandes mista PA com ovo", "description": "",
-                    "items": _TPL[0]["items"]}]
-    got = ingest._forced_template("template Sandes mista PA com ovo hoje", tpls)
-    assert got["name"] == "Sandes mista PA com ovo"   # not shadowed by the shorter
-
-
-def test_resolve_templates_forces_the_named_one_over_the_models_guess(monkeypatch):
-    from datetime import datetime
-    est = ingest._meal_from_items(ingest._normalize_items(
-        [{"name": "sandwich", "portion_g": 150, "calories": 400,
-          "protein_g": 20, "carbs_g": 45, "fat_g": 12}]), 0.6, "m1")
-    est["template"] = ""            # the model FAILED to recognise it
-    est["save_template_name"] = ""
-    out = ingest._resolve_templates(
-        est, "usa o template Sandes mista PA", datetime.now(), _TPL)
-    assert out["template"] == "Sandes mista PA"
-    assert out["calories"] == 260.0                  # measured values won anyway
-    assert out["confidence"] == ingest.TEMPLATE_CONFIDENCE
-
-
-def test_template_catalogue_lists_measured_ingredients():
-    cat = ingest._template_catalogue(_TPL)
-    assert '"Sandes mista PA"' in cat and "baguette 80g" in cat and "ham 40g" in cat
-    assert "260 kcal" in cat
-
-
-def test_maybe_save_template_requires_the_note_to_mention_one(monkeypatch):
-    saved = {}
-    monkeypatch.setattr(ingest, "save_template",
-                        lambda n, nut, when: saved.update(name=n))
-    from datetime import datetime
-    nut = ingest._meal_from_items([], 1, "m1")
-    nut["save_template_name"] = "Sandes mista PA"
-    # the model named one but the note never asked -> refuse to persist
-    assert ingest.maybe_save_template(nut, "just a normal meal", datetime.now()) == ""
-    assert not saved
-    # note genuinely asks -> saved
-    assert ingest.maybe_save_template(
-        nut, "guarda como template Sandes mista PA", datetime.now()) == "Sandes mista PA"
-    assert saved["name"] == "Sandes mista PA"
-
-
-def test_templates_block_has_match_rules_only_when_templates_exist():
-    with_tpl = ingest._templates_block(_TPL)
-    assert "KNOWN MEAL TEMPLATES" in with_tpl and "Sandes mista PA" in with_tpl
-    assert "SAVING A TEMPLATE" in with_tpl
-    # no templates yet: no match rules, but you can still create the first one
-    empty = ingest._templates_block([])
-    assert "KNOWN MEAL TEMPLATES" not in empty
-    assert "SAVING A TEMPLATE" in empty
-
-
-def test_template_fields_are_optional_in_the_schema():
+def test_retired_template_fields_are_gone_from_the_contract():
+    # Templates were replaced by repeating past meals from the app (see
+    # meal_library.py). The model must no longer be asked to match or save one —
+    # a field left in the schema is a question the model keeps answering.
     props = ingest.RESPONSE_SCHEMA.properties
     for field in ("template", "template_scale", "save_template_name"):
-        assert field in props
-        assert field not in ingest.RESPONSE_SCHEMA.required
+        assert field not in props
+    assert "TEMPLATE" not in ingest._build_prompt(1, "o meu template do costume")
 
 
 def test_meals_headers_mirror_maintenance():
-    # `note` (user's text), `template` (which measured template supplied the
-    # numbers) and `edited_at` (set by a user's hand correction) are provenance
-    # columns. The two copies (ingest + maintenance) must stay identical or the
-    # schema sync corrupts existing rows.
+    # `note` (user's text), `template` (retired, but history still carries it)
+    # and `edited_at` (set by an edit in the app) are provenance columns. The two
+    # copies (ingest + maintenance) must stay identical or the schema sync
+    # corrupts existing rows.
     from src import maintenance
     assert ingest.MEALS_HEADERS[-3:] == ["note", "template", "edited_at"]
     assert ingest.MEALS_HEADERS == maintenance.MEALS_HEADERS
     assert ingest.LAST_COL == "O"
-    # the templates tab schema is mirrored too
-    assert ingest.TEMPLATES_HEADERS == maintenance.TEMPLATES_HEADERS
 
 
 def test_note_suffix_and_text_prompt_are_authoritative():
@@ -615,12 +495,11 @@ def test_extract_images_collects_every_multipart_file_in_order():
 
 
 def test_build_prompt_adds_multi_and_note_blocks_only_when_relevant():
-    # one photo, no note => router + base rubric (+ the always-on save-template
-    # rule) + the body and workout sections, which every image prompt carries
+    # one photo, no note => router + base rubric + the body and workout
+    # sections, which every image prompt carries
     plain = ingest._build_prompt(1, "")
     assert plain == (ingest.ROUTER_PREFIX + ingest.PROMPT
-                     + ingest.TEMPLATE_SAVE_SUFFIX + ingest.BODY_SECTION
-                     + ingest.WORKOUT_SECTION)
+                     + ingest.BODY_SECTION + ingest.WORKOUT_SECTION)
     assert "MULTIPLE IMAGES" not in plain and "NOTE:" not in plain
     # several photos => the multi-image block, carrying the count
     multi = ingest._build_prompt(3, "")
@@ -1331,78 +1210,6 @@ def test_meals_totals_match_the_listed_meals(monkeypatch):
         "/meals?date=2026-07-18", headers=_HDR).get_json()
     assert body["totals"] == {"calories": 800.0, "protein_g": 50.0,
                               "carbs_g": 60.0, "fat_g": 25.0}
-
-
-# -- /meals/edit: hand-correcting one ingredient's numbers -----------------------
-_EDIT_ITEMS = [
-    {"name": "chicken", "portion_g": 120, "calories": 198,
-     "protein_g": 37, "carbs_g": 0, "fat_g": 4.3},
-    {"name": "white rice", "portion_g": 150, "calories": 195,
-     "protein_g": 4, "carbs_g": 42, "fat_g": 0.4},
-]
-_EDIT_GRID = [
-    ingest.MEALS_HEADERS,
-    ["2026-07-18T13:00:00+01:00", "chicken, white rice",
-     json.dumps(_EDIT_ITEMS), 393, 41, 42, 4.7,
-     0.9, "claude-audit:m | was:g", "http://photo", 270, "sha2", "", "", ""],
-]
-
-
-def _edit_api(monkeypatch, svc, grid=None):
-    monkeypatch.setattr(ingest, "_read_tab", lambda tab: grid or _EDIT_GRID)
-    monkeypatch.setattr(ingest, "_sheets", lambda: svc)
-    monkeypatch.setattr(ingest, "_sid", lambda: "sid")
-    monkeypatch.setenv("INGEST_TOKEN", "t")
-    return ingest.app.test_client()
-
-
-def test_edit_meal_requires_the_token():
-    assert ingest.app.test_client().post("/meals/edit", json={}).status_code == 401
-
-
-def test_edit_meal_404s_on_unknown_datetime(monkeypatch):
-    svc = _FakeSheetsSvc()
-    r = _edit_api(monkeypatch, svc).post("/meals/edit", headers=_HDR, json={
-        "datetime": "2099-01-01T00:00:00+01:00", "item_index": 0, "protein_g": 1,
-    })
-    assert r.status_code == 404
-    assert svc.value_batch_bodies == []
-
-
-def test_edit_meal_400s_on_out_of_range_item_index(monkeypatch):
-    svc = _FakeSheetsSvc()
-    r = _edit_api(monkeypatch, svc).post("/meals/edit", headers=_HDR, json={
-        "datetime": "2026-07-18T13:00:00+01:00", "item_index": 5, "protein_g": 1,
-    })
-    assert r.status_code == 400
-    assert svc.value_batch_bodies == []
-
-
-def test_edit_meal_recomputes_totals_and_stamps_edited_at(monkeypatch):
-    svc = _FakeSheetsSvc()
-    r = _edit_api(monkeypatch, svc).post("/meals/edit", headers=_HDR, json={
-        "datetime": "2026-07-18T13:00:00+01:00", "item_index": 0, "protein_g": 25,
-    })
-    assert r.status_code == 200
-    body = r.get_json()
-    assert body["protein_g"] == 29.0          # 25 (corrected) + 4 (rice, untouched)
-    assert body["calories"] == 393.0          # untouched field stays the same
-    assert body["edited"] is True
-    assert body["items"][0]["protein_g"] == 25.0
-    assert body["items"][1]["protein_g"] == 4.0   # other item untouched
-
-
-def test_edit_meal_only_writes_the_touched_columns(monkeypatch):
-    # model/image_sha/photo_url/note/template must never be part of this write —
-    # a hand correction must never be able to resurrect a stub or break dedup.
-    svc = _FakeSheetsSvc()
-    _edit_api(monkeypatch, svc).post("/meals/edit", headers=_HDR, json={
-        "datetime": "2026-07-18T13:00:00+01:00", "item_index": 0, "protein_g": 25,
-    })
-    assert len(svc.value_batch_bodies) == 1
-    data = svc.value_batch_bodies[0]["data"]
-    touched_cols = {d["range"].split("!")[1].rstrip("0123456789") for d in data}
-    assert touched_cols == {"C", "D", "E", "F", "G", "K", "O"}
 
 
 # -- targets: the per-metric goals (the foundation of the whole app) ------------
@@ -2419,7 +2226,7 @@ def test_split_by_meal_time_leaves_an_ordinary_meal_as_one_row():
     assert len(parts) == 1
     stamp, meal = parts[0]
     assert stamp == _lisbon(24, 13, 0)
-    assert meal["foods"] == "rice, chicken" and meal["template"] == ""
+    assert meal["foods"] == "rice, chicken"
 
 
 def test_split_by_meal_time_falls_back_to_capture_time_without_a_hint():
@@ -2427,18 +2234,6 @@ def test_split_by_meal_time_falls_back_to_capture_time_without_a_hint():
         {"kind": "meal", "confidence": 0.7, "items": [_item("soup")]}, "m1")
     when = _lisbon(24, 19, 30)
     assert ingest._split_by_meal_time(nut, when) == [(when, nut)]
-
-
-def test_split_by_meal_time_drops_the_template_when_it_splits():
-    # A template is one measured dish at one sitting. Three sittings are not it,
-    # and labelling all three with the name would claim measured numbers for each.
-    nut = ingest._record_from({
-        "kind": "meal", "confidence": 0.5, "template": "o meu almoço",
-        "items": [_item("rice", "13:00"), _item("oats", "08:00")],
-    }, "m1")
-    parts = ingest._split_by_meal_time(nut, _lisbon(24, 20, 0))
-    assert len(parts) == 2
-    assert all(meal["template"] == "" for _, meal in parts)
 
 
 def test_part_sha_suffixes_only_a_split_note():

@@ -95,8 +95,7 @@ def test_json_instructions_demand_reasoning_before_the_numbers():
 
 def test_json_instructions_cover_every_key_the_record_needs():
     block = claude_estimator.JSON_INSTRUCTIONS
-    for key in ("kind", "body", "meal_time", "template", "template_scale",
-                "save_template_name", "items", "confidence"):
+    for key in ("kind", "body", "meal_time", "items", "confidence"):
         assert f'"{key}"' in block, f"{key} missing from the output contract"
 
 

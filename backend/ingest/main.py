@@ -117,6 +117,7 @@ from schema.registry import (
 # is pure stdlib and touches nothing at import time — importing main.py must stay
 # possible with no env and no credentials (test_ingest.py asserts it).
 import claude_estimator
+import meal_library
 import workouts
 
 app = Flask(__name__)
@@ -130,7 +131,6 @@ app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
 
 MEALS_TAB = "meals"
 DAILY_TAB = "daily_summary"
-TEMPLATES_TAB = "templates"
 SESSIONS_TAB = "sessions"
 # What this user measures. One row per setting; see schema/capabilities.py.
 CONFIG_TAB = "config"
@@ -138,9 +138,12 @@ CONFIG_TAB = "config"
 # One row per meal. `items` is a JSON array breaking the plate into ingredients,
 # each with its own portion, macros and a `nutrients` map; the flat columns are
 # the row totals the daily job rolls up. `model` records which AI analysed the
-# photo (audit); `image_sha` powers de-duplication; `template` records which
-# measured template supplied the numbers (blank = estimated from the photo).
-# `edited_at` is set the moment a user hand-corrects an item via /meals/edit — it
+# photo (audit) — or "app" for a meal logged in the app from past ones;
+# `image_sha` powers de-duplication. `template` is RETIRED: it recorded which
+# measured template supplied a meal's numbers, and is kept only because history
+# still carries it (the audit job skips those rows as kitchen-scale truth). Nothing
+# writes it any more — see meal_library.py for what replaced templates.
+# `edited_at` is set the moment a user edits a meal in the app (/meals/save) — it
 # marks the row so the local audit job (automation/nutrition-audit/audit.py) skips
 # it instead of clobbering the correction with a fresh photo re-estimate.
 # Schema changes (add/remove a column) must be mirrored in src/maintenance.py and
@@ -153,10 +156,10 @@ MEALS_HEADERS = [
 ]
 LAST_COL = chr(ord("A") + len(MEALS_HEADERS) - 1)  # "O"
 
-# Meals the user has weighed on a real scale. `items` holds the SAME
-# per-ingredient JSON shape as meals, so a template is just a canonical, measured
-# items array. Matching a photo to one of these replaces the vision estimate with
-# these exact numbers, so a repeat meal gets identical values every time.
+# What `model` says on a meal the user logged in the app by repeating past ones:
+# no model looked at it, the numbers are the source meals' own.
+APP_MODEL = "app"
+
 # One row per training session — the event-grain table for lifting, exactly as
 # `meals` is for food. `sets_json` carries the per-set array for the same reason
 # `meals.items` carries the per-ingredient one: that is where cardinality genuinely
@@ -172,14 +175,6 @@ SESSIONS_HEADERS = [
     "photo_url", "confidence", "model", "note",
 ]
 SESSIONS_LAST_COL = chr(ord("A") + len(SESSIONS_HEADERS) - 1)  # "O"
-
-TEMPLATES_HEADERS = [
-    "name", "description", "items", "portion_g",
-    "calories", "protein_g", "carbs_g", "fat_g", "created_at", "updated_at",
-]
-TEMPLATES_LAST_COL = chr(ord("A") + len(TEMPLATES_HEADERS) - 1)  # "J"
-# A template's numbers are measured, not guessed — so a matched meal is confident.
-TEMPLATE_CONFIDENCE = 0.95
 
 # Rows excluded from all totals (kept in sync with src/run_daily.py NON_MEALS).
 NON_MEALS = {"not food", "analysis failed"}
@@ -374,7 +369,7 @@ NUTRIENT_HISTORY_DAYS = 7
 
 # -- targets: the per-metric goals every number is shown against --------------
 # A number without a target is trivia. The `targets` tab is the source of truth,
-# user-visible and editable in the sheet (like `meals`/`templates`, it is created
+# user-visible and editable in the sheet (like `meals`, it is created
 # and seeded on demand). One row per metric: metric, kind, floor, ceiling, unit,
 # source.
 #
@@ -722,46 +717,6 @@ plate is normally one sitting, so only do this when the note actually says so.
 The current local time is {now_hhmm}. Never return a later time — UNLESS {now_hhmm}
 is before 05:00, in which case the note is logging the day that has just ended and
 any hour is legitimate. The server places the time on the correct calendar day."""
-
-# Injected whenever the user has saved templates. A template's weights come from a
-# real kitchen scale, so matching one replaces the vision estimate with measured
-# numbers — the whole point is that the same meal yields IDENTICAL values every
-# day. A wrong match would overwrite measured data with a guess, so the bar for
-# matching is deliberately high and the server re-validates the name afterwards.
-TEMPLATE_MATCH_SUFFIX = """
-
-KNOWN MEAL TEMPLATES — dishes this user has already weighed on a real scale, so
-their ingredient weights and nutrition are MEASURED, not estimated:
-{catalogue}
-
-If what you see IS one of these dishes, set `template` to its name copied VERBATIM
-and explain the match in `reasoning`. The stored measured values are then used
-instead of your estimate, so a repeat meal always gets identical numbers. (Still
-fill `items` with your own estimate as a fallback — it is discarded on a match.)
-THE NOTE OVERRULES YOUR EYES. If the note says this meal IS one of the templates
-(names it, or says "the usual X", "we have a template for this"), that is
-AUTHORITATIVE — match it even if the photo is ambiguous or looks a little
-different. The user knows what they ate. Only refuse when the NOTE ITSELF says it
-differs (an extra/missing ingredient, a different size, "not my usual").
-
-Otherwise, judging from the photo alone, match ONLY when you are confident it is
-the same dish with the same components. If anything material differs — a
-different bread or protein, an extra or missing ingredient, a clearly different
-size — leave `template` EMPTY and estimate normally. A wrong match replaces
-measured data with a guess; when in doubt, don't.
-If the user ate only part of it, still match and set `template_scale` to the
-fraction eaten (e.g. 0.5 for half). Otherwise leave `template_scale` at 1."""
-
-# Always injected: lets the user create a template by simply saying so in the note
-# (no extra step in the phone Shortcut). The server only honours this when the note
-# genuinely mentions a template, so a stray field can't silently persist one.
-TEMPLATE_SAVE_SUFFIX = """
-
-SAVING A TEMPLATE — if the NOTE asks to save/remember this meal as a template
-(any phrasing, any language), put the name the user gives it in
-`save_template_name`, and fill `items` using the EXACT weights stated in the note
-(they weighed them on a scale — those grams are ground truth, never override
-them). Otherwise leave `save_template_name` empty."""
 
 # Appended last to every image prompt, as the other half of the ROUTER_PREFIX fork.
 #
@@ -1118,7 +1073,6 @@ WORKOUT_RESPONSE_SCHEMA = types.Schema(
 RESPONSE_SCHEMA = types.Schema(
     type=types.Type.OBJECT,
     property_ordering=["kind", "reasoning", "body", "workout", "meal_time",
-                       "template", "template_scale", "save_template_name",
                        "items", "confidence"],
     properties={
         # The ROUTER_PREFIX fork: "meal" or "body". Decided first, before any
@@ -1133,13 +1087,6 @@ RESPONSE_SCHEMA = types.Schema(
         # Optional "HH:MM" (24h local) inferred from a text note ("breakfast",
         # "lunch", or an explicit time). Empty when unknown / for photo meals.
         "meal_time": types.Schema(type=types.Type.STRING),
-        # Name of a KNOWN template this meal is, verbatim (empty = estimate it).
-        # The server validates it and swaps in the measured items.
-        "template": types.Schema(type=types.Type.STRING),
-        # Fraction of the template actually eaten (1 = all of it, 0.5 = half).
-        "template_scale": types.Schema(type=types.Type.NUMBER),
-        # Set only when the note asks to save this meal as a reusable template.
-        "save_template_name": types.Schema(type=types.Type.STRING),
         "items": types.Schema(
             type=types.Type.ARRAY,
             items=types.Schema(
@@ -1574,6 +1521,10 @@ def _normalize_items(raw: Any) -> List[Dict[str, Any]]:
     strips it back off before anything is written. Keeping it per-item rather than
     nesting a `meals` array is what lets one note carry a whole day without
     duplicating the ~30-field item schema inside itself.
+
+    `status` marks an ingredient the app asked the model to estimate that has not
+    been estimated yet (or could not be) — see meal_library.PENDING. It is stored,
+    unlike `meal_time`, because the meal is saved before the estimate exists.
     """
     items: List[Dict[str, Any]] = []
     for entry in raw or []:
@@ -1602,6 +1553,8 @@ def _normalize_items(raw: Any) -> List[Dict[str, Any]]:
         meal_time = str(entry.get("meal_time", "")).strip()
         if re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", meal_time):
             item["meal_time"] = meal_time
+        if entry.get("status") in meal_library.STATUSES:
+            item["status"] = entry["status"]
         items.append(item)
     return items
 
@@ -1677,7 +1630,7 @@ def _body_row(body: Dict[str, float], measured: datetime) -> Dict[str, Any]:
 def _meal_totals(items: List[Dict[str, Any]]) -> Dict[str, float]:
     """A meal row's flat columns = the sum of its items, for every numeric column a
     row carries. Shared by fresh ingest (_meal_from_items) and a user's later
-    hand-correction (/meals/edit) so both derive totals the same way."""
+    edit in the app (/meals/save) so both derive totals the same way."""
     def total(key: str) -> float:
         return round(sum(i[key] for i in items), 1)
 
@@ -1728,7 +1681,7 @@ def _split_by_meal_time(nut: Dict[str, Any],
         item = dict(item)
         # Strips the key as it goes: `meal_time` is routing information, and the
         # `items` JSON in the sheet is the meal's composition. Nothing downstream
-        # (the app, /meals/edit, the audit job) expects to find it there.
+        # (the app, /meals/save, the audit job) expects to find it there.
         stamp = _resolve_meal_time(item.pop("meal_time", "") or default, when)
         groups.setdefault(stamp, []).append(item)
 
@@ -1744,10 +1697,6 @@ def _split_by_meal_time(nut: Dict[str, Any],
                                 str(nut.get("model") or ""))
         meal["kind"] = "meal"
         meal["meal_time"] = stamp.strftime("%H:%M")
-        # A template is one dish at one sitting; a note that split into several
-        # meals is not one. Carrying the name onto every part would label three
-        # different meals as the same measured dish.
-        meal["template"] = ""
         parts.append((stamp, meal))
     app.logger.info("note describes %d meals: %s", len(parts),
                     ", ".join(s.strftime("%H:%M") for s, _ in parts))
@@ -1839,7 +1788,7 @@ def _meal_row_index(values: List[List[Any]], image_sha: str) -> Optional[int]:
 
 def _meal_row_index_by_datetime(values: List[List[Any]], when: str) -> Optional[int]:
     """1-based sheet row of the meal with this exact `datetime` (a meal's id, as
-    shown to and sent back by the app), or None. Used by /meals/edit — unlike
+    shown to and sent back by the app), or None. Used by the app's edits — unlike
     _meal_row_index this looks up by the meal's own identity, not a photo hash."""
     if not values:
         return None
@@ -2058,31 +2007,16 @@ def _record_from(data: Dict[str, Any], model: str, *, allow_body: bool = True,
     meal = _meal_from_items(items, data.get("confidence"), model)
     meal["kind"] = "meal"
     meal["meal_time"] = str(data.get("meal_time") or "").strip()
-    meal["template"] = str(data.get("template") or "").strip()
-    meal["template_scale"] = data.get("template_scale")
-    meal["save_template_name"] = str(
-        data.get("save_template_name") or "").strip()
     return meal
 
 
-def _templates_block(templates: Optional[List[Dict[str, Any]]]) -> str:
-    """The template rules appended to every prompt: how to MATCH a saved dish
-    (only when the user has any) and how to SAVE one from the note (always)."""
-    block = ""
-    if templates:
-        block += TEMPLATE_MATCH_SUFFIX.format(
-            catalogue=_template_catalogue(templates))
-    return block + TEMPLATE_SAVE_SUFFIX
-
-
-def _build_prompt(num_images: int, note: str, now: Optional[datetime] = None,
-                  templates: Optional[List[Dict[str, Any]]] = None) -> str:
+def _build_prompt(num_images: int, note: str, now: Optional[datetime] = None) -> str:
     """Assemble the vision prompt: ROUTER + SECTION A (meal) + B (body) + C (workout).
 
     Section A is the meal rubric plus its conditional blocks: a multi-image block
     when the log has several photos, the authoritative note block when given, a
     meal-time block (with `now`) so a photo logged after the fact lands at the right
-    hour, and the template match/save rules. Sections B (transcribing a scale
+    hour. Sections B (transcribing a scale
     screenshot) and C (transcribing a training session) are constant and always
     last. The router at the top picks exactly one."""
     prompt = ROUTER_PREFIX + PROMPT
@@ -2092,7 +2026,7 @@ def _build_prompt(num_images: int, note: str, now: Optional[datetime] = None,
         prompt += NOTE_SUFFIX.format(note=note)
         if now is not None:
             prompt += MEAL_TIME_SUFFIX.format(now_hhmm=now.strftime("%H:%M"))
-    return prompt + _templates_block(templates) + BODY_SECTION + WORKOUT_SECTION
+    return prompt + BODY_SECTION + WORKOUT_SECTION
 
 
 def _try_claude(prompt: str, images: Optional[List[Tuple[bytes, str]]] = None,
@@ -2174,7 +2108,6 @@ def _classify_images(images: List[Tuple[bytes, str]],
 
 def analyze(images: List[Tuple[bytes, str]], note: str = "",
             now: Optional[datetime] = None,
-            templates: Optional[List[Dict[str, Any]]] = None,
             mode: Optional[str] = None, **kw) -> Dict[str, Any]:
     """Analyse the image(s) the phone sent — either a meal or a scale screenshot;
     the model decides which (see ROUTER_PREFIX) and the returned record's `kind`
@@ -2183,10 +2116,9 @@ def analyze(images: List[Tuple[bytes, str]], note: str = "",
     For a meal, all images are reasoned across together. A `note`, if given, is
     appended as authoritative context that overrides the visual estimate where the
     two conflict; with `now` it can also infer the meal's hour from the note.
-    `templates` lets the model recognise a dish the user has weighed and hand back
-    its name instead of estimating. `kw` overrides (models/retries/timeout_ms/
+    `kw` overrides (models/retries/timeout_ms/
     deadline_s) carry the worker's per-attempt patience policy (_worker_kwargs)."""
-    prompt = _build_prompt(len(images), note, now, templates)
+    prompt = _build_prompt(len(images), note, now)
 
     record = _try_claude(prompt, images=images, allow_body=True, mode=mode,
                          source=_classify_images(images, mode))
@@ -2200,16 +2132,13 @@ def analyze(images: List[Tuple[bytes, str]], note: str = "",
 
 
 def analyze_text(note: str, now: datetime,
-                 templates: Optional[List[Dict[str, Any]]] = None,
                  mode: Optional[str] = None, **kw) -> Dict[str, Any]:
     """Classify a text-only note and act on it: a bowel-movement log
     (`kind` == "bowel", see TEXT_ROUTER_PREFIX), or otherwise a meal estimated from
     the description alone. `now` is the current local time, injected so the model
-    can infer a meal's hour and never place it in the future. Templates match here
-    too ("o meu pequeno-almoço do costume")."""
+    can infer a meal's hour and never place it in the future."""
     prompt = (TEXT_ROUTER_PREFIX
-              + TEXT_PROMPT.format(note=note, now_hhmm=now.strftime("%H:%M"))
-              + _templates_block(templates))
+              + TEXT_PROMPT.format(note=note, now_hhmm=now.strftime("%H:%M")))
     # A text note can be a meal or a bowel log, never a scale reading (no screen to
     # OCR) — so open the bowel fork and close the body one.
     # A text note is never a screenshot, so there is nothing to classify: it is a
@@ -2459,7 +2388,7 @@ def _sort_daily_by_date() -> None:
         }}]}))
 
 
-# -- templates (measured, reusable meals) --------------------------------------
+# -- meal items -------------------------------------------------------------------
 def _parse_items_cell(raw: Any) -> List[Dict[str, Any]]:
     """The `items` cell holds a JSON array of per-ingredient objects."""
     if isinstance(raw, list):
@@ -2471,119 +2400,9 @@ def _parse_items_cell(raw: Any) -> List[Dict[str, Any]]:
     return parsed if isinstance(parsed, list) else []
 
 
-def read_templates() -> List[Dict[str, Any]]:
-    """The user's measured meal templates. Never fatal: a missing/broken tab just
-    means no templates, and analysis falls back to estimating."""
-    try:
-        rows = _rows_as_dicts(_read_tab(TEMPLATES_TAB))
-    except Exception:
-        return []
-    out: List[Dict[str, Any]] = []
-    for row in rows:
-        name = str(row.get("name") or "").strip()
-        items = _normalize_items(_parse_items_cell(row.get("items")))
-        if name and items:
-            out.append({"name": name,
-                        "description": str(row.get("description") or "").strip(),
-                        "items": items})
-    return out
-
-
-def _template_catalogue(templates: List[Dict[str, Any]]) -> str:
-    """Compact listing injected into the prompt so the model can recognise a
-    saved dish: name, what it is, and its measured ingredients."""
-    lines = []
-    for t in templates:
-        parts = ", ".join(f"{i['name']} {int(i['portion_g'])}g" for i in t["items"])
-        kcal = int(sum(i["calories"] for i in t["items"]))
-        desc = f" — {t['description']}" if t["description"] else ""
-        lines.append(f'- "{t["name"]}"{desc} [{parts}] ~{kcal} kcal')
-    return "\n".join(lines)
-
-
-def _forced_template(note: str,
-                     templates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """A note that says "template" AND spells out a known template's name is an
-    explicit instruction, not a hint — honour it deterministically instead of
-    leaving recognition to the model's eyes. This is the user's 100%-reliable
-    lever when they don't want a repeat meal re-estimated.
-
-    (Save-requests are resolved before this, so "save as template X" can't be
-    mistaken for "use template X". The longest matching name wins, so a template
-    called "Sandes mista" can't shadow "Sandes mista com ovo".)"""
-    text = " ".join(str(note or "").lower().split())
-    if "template" not in text:
-        return None
-    best: Optional[Dict[str, Any]] = None
-    for tpl in templates:
-        name = " ".join(tpl["name"].lower().split())
-        if name and name in text:
-            if best is None or len(name) > len(" ".join(best["name"].lower().split())):
-                best = tpl
-    return best
-
-
-def _find_template(templates: List[Dict[str, Any]],
-                   name: str) -> Optional[Dict[str, Any]]:
-    """Look a template up by name, case/space-insensitively. Returns None for a
-    name the model invented — the estimate is then kept instead."""
-    key = " ".join(str(name or "").lower().split())
-    for t in templates:
-        if " ".join(t["name"].lower().split()) == key:
-            return t
-    return None
-
-
-def _scale_items(items: List[Dict[str, Any]], factor: float) -> List[Dict[str, Any]]:
-    """Scale a template's measured items (portion, macros and every nutrient) by
-    the fraction actually eaten."""
-    if factor == 1:
-        return [dict(i) for i in items]
-    out: List[Dict[str, Any]] = []
-    for item in items:
-        scaled = dict(item)
-        for key in ("portion_g", "calories", "protein_g", "carbs_g", "fat_g"):
-            scaled[key] = _round_num(item.get(key, 0) * factor)
-        if item.get("nutrients"):
-            scaled["nutrients"] = {
-                k: round(v * factor, 2 if k.endswith("_g") else 1)
-                for k, v in item["nutrients"].items()
-            }
-        out.append(scaled)
-    return out
-
-
-def apply_template(nut: Dict[str, Any],
-                   templates: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Swap the model's *estimate* for a template's *measured* values when it
-    recognised a saved dish. An unknown name (a hallucination) is ignored and the
-    estimate kept, so a bad match can never invent numbers."""
-    name = str(nut.get("template") or "").strip()
-    if not name:
-        return nut
-    tpl = _find_template(templates, name)
-    if not tpl:
-        app.logger.warning("model returned unknown template %r — keeping estimate",
-                           name)
-        nut["template"] = ""
-        return nut
-
-    scale = _round_num(nut.get("template_scale"), 2)
-    if scale <= 0:
-        scale = 1.0
-    scale = min(scale, 3.0)  # a sane cap; the note drives fractions, not multiples
-
-    meal = _meal_from_items(_scale_items(tpl["items"], scale),
-                            TEMPLATE_CONFIDENCE, nut.get("model", ""))
-    meal["meal_time"] = nut.get("meal_time", "")
-    meal["template"] = tpl["name"] if scale == 1 else f"{tpl['name']} (x{scale:g})"
-    app.logger.info("template %r applied (scale %s)", tpl["name"], scale)
-    return meal
-
-
 def _ensure_sessions_tab() -> None:
-    """Create the `sessions` tab and pin its header row. Same shape as
-    _ensure_templates_tab: idempotent, and safe to call on every write."""
+    """Create the `sessions` tab and pin its header row. Idempotent, and safe to
+    call on every write."""
     meta = _execute(lambda: _sheets().spreadsheets().get(spreadsheetId=_sid()))
     titles = {sheet["properties"]["title"] for sheet in meta.get("sheets", [])}
     if SESSIONS_TAB not in titles:
@@ -2669,79 +2488,6 @@ def append_session(rec: Dict[str, Any], sets: List[Dict[str, Any]],
         body={"values": [row]}))
 
 
-def _ensure_templates_tab() -> None:
-    meta = _execute(lambda: _sheets().spreadsheets().get(spreadsheetId=_sid()))
-    titles = {s["properties"]["title"] for s in meta.get("sheets", [])}
-    if TEMPLATES_TAB not in titles:
-        _execute(lambda: _sheets().spreadsheets().batchUpdate(
-            spreadsheetId=_sid(),
-            body={"requests": [{"addSheet": {
-                "properties": {"title": TEMPLATES_TAB}}}]}))
-    rng = f"{TEMPLATES_TAB}!A1:{TEMPLATES_LAST_COL}1"
-    current = _execute(lambda: _sheets().spreadsheets().values().get(
-        spreadsheetId=_sid(), range=rng)).get("values", [[]])
-    if not current or current[0] != TEMPLATES_HEADERS:
-        _execute(lambda: _sheets().spreadsheets().values().update(
-            spreadsheetId=_sid(), range=f"{TEMPLATES_TAB}!A1",
-            valueInputOption="RAW", body={"values": [TEMPLATES_HEADERS]}))
-
-
-def save_template(name: str, nut: Dict[str, Any], when: datetime) -> None:
-    """Upsert a template from an analysed meal (its items carry the exact weights
-    the user stated in the note). Re-saving the same name updates it in place."""
-    _ensure_templates_tab()
-    values = _read_tab(TEMPLATES_TAB)
-    # `meal_time` says which sitting an item came from; a template is a recipe and
-    # has no sitting. Stripped here so it can't ride back out through
-    # `apply_template` into some future meal's items.
-    items = [{k: v for k, v in i.items() if k != "meal_time"}
-             for i in nut["items"]]
-    row = [
-        name, nut["foods"], json.dumps(items, ensure_ascii=False),
-        nut["portion_g"], nut["calories"], nut["protein_g"], nut["carbs_g"],
-        nut["fat_g"], when.isoformat(timespec="seconds"),
-        when.isoformat(timespec="seconds"),
-    ]
-    idx = None
-    if values:
-        header = values[0]
-        if "name" in header:
-            n_i = header.index("name")
-            key = " ".join(name.lower().split())
-            for i, r in enumerate(values[1:], start=2):
-                if len(r) > n_i and " ".join(str(r[n_i]).lower().split()) == key:
-                    idx = i
-                    break
-    if idx is not None:
-        row[8] = values[idx - 1][8] if len(values[idx - 1]) > 8 else row[8]  # keep created_at
-        _execute(lambda: _sheets().spreadsheets().values().update(
-            spreadsheetId=_sid(),
-            range=f"{TEMPLATES_TAB}!A{idx}:{TEMPLATES_LAST_COL}{idx}",
-            valueInputOption="RAW", body={"values": [row]}))
-    else:
-        _execute(idempotent=False, build=lambda: _sheets().spreadsheets().values().append(
-            spreadsheetId=_sid(), range=f"{TEMPLATES_TAB}!A1",
-            valueInputOption="RAW", insertDataOption="INSERT_ROWS",
-            body={"values": [row]}))
-
-
-def maybe_save_template(nut: Dict[str, Any], note: str,
-                        when: datetime) -> str:
-    """Persist this meal as a template when the note asked for it. Guarded twice:
-    the model must name it AND the note must actually mention a template, so a
-    stray field can never silently create one. Returns the saved name (or "")."""
-    name = str(nut.get("save_template_name") or "").strip()
-    if not name or "template" not in note.lower():
-        return ""
-    try:
-        save_template(name, nut, when)
-    except Exception:
-        app.logger.exception("saving template %r failed", name)
-        return ""
-    app.logger.info("template %r saved", name)
-    return name
-
-
 def _meal_row_values(nut: Dict[str, Any], photo_url: str, when: datetime,
                      image_sha: str, note: str) -> List[Any]:
     """One meal as the `meals` tab's cells, in MEALS_HEADERS order."""
@@ -2751,7 +2497,7 @@ def _meal_row_values(nut: Dict[str, Any], photo_url: str, when: datetime,
         json.dumps(nut["items"], ensure_ascii=False),
         nut["calories"], nut["protein_g"], nut["carbs_g"], nut["fat_g"],
         nut["confidence"], nut["model"], photo_url, nut["portion_g"],
-        image_sha, note, str(nut.get("template") or ""),
+        image_sha, note, "",  # `template`: retired, see MEALS_HEADERS
     ]
 
 
@@ -2789,6 +2535,16 @@ def _orphaned_part_rows(values: List[List[Any]], image_sha: str,
     return out
 
 
+# One lock around every read-modify-write of the meals tab. Rows are addressed by
+# number, and a number is only true until the next insert, sort or delete: a
+# back-dated meal appended and sorted between an edit's read and its write would
+# land that edit — or a delete — on the neighbouring meal. Everything that moves
+# rows runs in this one gunicorn process (the queue reaches /process over HTTP), so
+# a process-local lock closes the window. The audit job writes from outside it, but
+# only ever rewrites cells in place; it never inserts, sorts or deletes.
+_MEALS_LOCK = threading.RLock()
+
+
 def append_meals(parts: Sequence[Tuple[datetime, Dict[str, Any]]], photo_url: str,
                  image_sha: str, note: str = "") -> None:
     """Write every meal one note/photo produced — usually one row, several when a
@@ -2799,56 +2555,57 @@ def append_meals(parts: Sequence[Tuple[datetime, Dict[str, Any]]], photo_url: st
     photo's identity and excludes the note). The grid is read once and sorted once
     for the whole set: N separate appends would each re-read and re-sort the tab,
     and the sort between two appends is what would let the second one land before
-    the first."""
-    meals_id = _ensure_meals_tab()
-    values = _read_tab(MEALS_TAB)
-    total = len(parts)
-    written: List[str] = []
-    updates: List[Dict[str, Any]] = []
-    appends: List[List[Any]] = []
-    for i, (when, nut) in enumerate(parts):
-        sha = _part_sha(image_sha, i, total)
-        written.append(sha)
-        row = _meal_row_values(nut, photo_url, when, sha, note)
-        idx = _meal_row_index(values, sha)
-        if idx is not None:
-            updates.append({"range": f"{MEALS_TAB}!A{idx}:{LAST_COL}{idx}",
-                            "values": [row]})
-        else:
-            appends.append(row)
+    the first. Runs under _MEALS_LOCK, like every other meals-tab mutation."""
+    with _MEALS_LOCK:
+        meals_id = _ensure_meals_tab()
+        values = _read_tab(MEALS_TAB)
+        total = len(parts)
+        written: List[str] = []
+        updates: List[Dict[str, Any]] = []
+        appends: List[List[Any]] = []
+        for i, (when, nut) in enumerate(parts):
+            sha = _part_sha(image_sha, i, total)
+            written.append(sha)
+            row = _meal_row_values(nut, photo_url, when, sha, note)
+            idx = _meal_row_index(values, sha)
+            if idx is not None:
+                updates.append({"range": f"{MEALS_TAB}!A{idx}:{LAST_COL}{idx}",
+                                "values": [row]})
+            else:
+                appends.append(row)
 
-    if updates:
-        _execute(lambda: _sheets().spreadsheets().values().batchUpdate(
-            spreadsheetId=_sid(),
-            body={"valueInputOption": "RAW", "data": updates}))
-    if appends:
-        _execute(idempotent=False, build=lambda: _sheets().spreadsheets().values().append(
-            spreadsheetId=_sid(), range=f"{MEALS_TAB}!A1",
-            valueInputOption="RAW", insertDataOption="INSERT_ROWS",
-            body={"values": appends}))
+        if updates:
+            _execute(lambda: _sheets().spreadsheets().values().batchUpdate(
+                spreadsheetId=_sid(),
+                body={"valueInputOption": "RAW", "data": updates}))
+        if appends:
+            _execute(idempotent=False, build=lambda: _sheets().spreadsheets().values().append(
+                spreadsheetId=_sid(), range=f"{MEALS_TAB}!A1",
+                valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+                body={"values": appends}))
 
-    # After the writes, never before: a row is only orphaned once its replacement
-    # exists, and deleting first would lose meals outright if the append failed.
-    # Descending, so each delete leaves the rows above it where they were.
-    orphans = _orphaned_part_rows(values, image_sha, written)
-    if orphans and meals_id is not None:
-        try:
-            _execute(lambda: _sheets().spreadsheets().batchUpdate(
-                spreadsheetId=_sid(), body={"requests": [
-                    {"deleteDimension": {"range": {
-                        "sheetId": meals_id, "dimension": "ROWS",
-                        "startIndex": n - 1, "endIndex": n}}}
-                    for n in sorted(orphans, reverse=True)]}))
-            app.logger.info("removed %d stale row(s) from an earlier split of %s",
-                            len(orphans), image_sha)
-        except Exception:
-            app.logger.warning("stale-row cleanup failed (non-fatal)", exc_info=True)
+        # After the writes, never before: a row is only orphaned once its replacement
+        # exists, and deleting first would lose meals outright if the append failed.
+        # Descending, so each delete leaves the rows above it where they were.
+        orphans = _orphaned_part_rows(values, image_sha, written)
+        if orphans and meals_id is not None:
+            try:
+                _execute(lambda: _sheets().spreadsheets().batchUpdate(
+                    spreadsheetId=_sid(), body={"requests": [
+                        {"deleteDimension": {"range": {
+                            "sheetId": meals_id, "dimension": "ROWS",
+                            "startIndex": n - 1, "endIndex": n}}}
+                        for n in sorted(orphans, reverse=True)]}))
+                app.logger.info("removed %d stale row(s) from an earlier split of %s",
+                                len(orphans), image_sha)
+            except Exception:
+                app.logger.warning("stale-row cleanup failed (non-fatal)", exc_info=True)
 
-    if meals_id is not None:
-        try:  # the meals are already saved; ordering must never fail the request
-            _sort_meals_by_datetime(meals_id)
-        except Exception:
-            app.logger.warning("meals sort failed (non-fatal)", exc_info=True)
+        if meals_id is not None:
+            try:  # the meals are already saved; ordering must never fail the request
+                _sort_meals_by_datetime(meals_id)
+            except Exception:
+                app.logger.warning("meals sort failed (non-fatal)", exc_info=True)
 
 
 def append_meal(nut: Dict[str, Any], photo_url: str, when: datetime,
@@ -3209,12 +2966,15 @@ def _display_items(items: List[Dict[str, Any]],
     `name_pt` is consumed here rather than passed through: the app renders one name
     per item, and every client-side path (the drill-down, the nutrient attribution,
     the share sheet) should show the same string without having to know which field
-    to prefer.
+    to prefer. The English name rides along as `key`, because the app sends items
+    back when a meal is edited or repeated (`_items_from_payload`) and the sheet
+    keys on the English name.
     """
     tax = _coach("food_taxonomy")
     out: List[Dict[str, Any]] = []
     for item in items:
         item = dict(item)
+        item["key"] = item.get("name", "")
         item["name"] = tax.display_pt(item.get("name", ""), taxonomy,
                                       name_pt=item.pop("name_pt", None))
         out.append(item)
@@ -3235,19 +2995,37 @@ def _display_foods(items: List[Dict[str, Any]], fallback: str) -> str:
                      for i in items if str(i.get("name", "")).strip()) or fallback
 
 
+def _is_listed(row: Dict[str, Any]) -> bool:
+    """Whether a meal row is a meal the app shows: not a stub, and carrying
+    something — macros, a micronutrient (a supplement is all micros), or an
+    ingredient still being estimated (a meal logged only as "banana 120 g" is all
+    placeholder until the estimate lands, and must not vanish meanwhile)."""
+    if _is_stub(row):
+        return False
+    if max(_round_num(row.get(k)) for k in meal_library.MACRO_KEYS) > 0:
+        return True
+    return _has_any_nutrients(row) or any(
+        meal_library.is_placeholder(i) for i in _parse_items_cell(row.get("items")))
+
+
+def _meal_rev(row: Dict[str, Any]) -> str:
+    """A meal's version: a hash of its items cell. Sent with every meal and checked
+    when the app saves an edit, so an edit made against a stale copy (the model
+    finished estimating an ingredient while the editor was open) is refused rather
+    than silently overwriting what arrived in between."""
+    return _sha12(str(row.get("items") or "").encode("utf-8"))
+
+
 def _today_meals_out(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """The day's meals for /today: the same shape as /meals but WITH each meal's
     per-ingredient `items` (each carrying its `nutrients` map), so the app can show,
     for any nutrient, exactly which foods contributed it — the drill-down feature —
-    without a second request."""
-    macro_keys = ("calories", "protein_g", "carbs_g", "fat_g")
+    without a second request. `rev` and `confidence` are what the app needs to edit
+    a meal or log it again."""
     taxonomy = _display_taxonomy()
     out: List[Dict[str, Any]] = []
     for row in rows:
-        if _is_stub(row):
-            continue
-        macros = {k: _round_num(row.get(k)) for k in macro_keys}
-        if max(macros.values()) <= 0 and not _has_any_nutrients(row):
+        if not _is_listed(row):
             continue
         when = str(row.get("datetime") or "")
         items = _display_items(
@@ -3257,10 +3035,11 @@ def _today_meals_out(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "time": when[11:16],
             "foods": _display_foods(items, str(row.get("foods") or "").strip()),
             "note": str(row.get("note") or "").strip(),
-            "template": str(row.get("template") or "").strip(),
             "photo_url": str(row.get("photo_url") or "").strip(),
             "edited": bool(str(row.get("edited_at") or "").strip()),
-            **macros,
+            "confidence": _round_num(row.get("confidence"), 2),
+            "rev": _meal_rev(row),
+            **{k: _round_num(row.get(k)) for k in meal_library.MACRO_KEYS},
             "items": items,
         })
     out.sort(key=lambda m: m["datetime"])
@@ -3645,37 +3424,6 @@ def meal_photo(file_id: str):
         abort(404)
 
 
-def _resolve_templates(nut: Dict[str, Any], note: str, when: datetime,
-                       templates: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Settle the template question for this meal.
-
-    Saving and matching are mutually exclusive: a note asking to SAVE is defining
-    a template (its items are the weights the user stated), so it must not also be
-    overwritten by a match. Otherwise, if the note explicitly names a template we
-    honour that outright (deterministic — no reliance on the model recognising the
-    photo); failing that, we use the model's own match. Either way the measured
-    values then replace the estimate."""
-    saved = maybe_save_template(nut, note, when)
-    if saved:
-        nut["template"] = saved  # this meal *is* that dish — record it
-        return nut
-
-    forced = _forced_template(note, templates)
-    if forced:
-        if forced["name"] != nut.get("template"):
-            app.logger.info("note names template %r — forcing it (model said %r)",
-                            forced["name"], nut.get("template") or "nothing")
-        nut["template"] = forced["name"]
-    elif "template" in note.lower() and not nut.get("template"):
-        # The user mentioned a template but nothing matched — surface it rather
-        # than silently falling back to an estimate.
-        app.logger.warning(
-            "note mentions a template but none matched; estimating instead. "
-            "note=%r known=%s", note[:120], [t["name"] for t in templates])
-
-    return apply_template(nut, templates)
-
-
 def _recent_bodyweight(day: str) -> Optional[float]:
     """The weigh-in for `day`, falling back to the most recent one before it.
 
@@ -3879,13 +3627,11 @@ def _finalize(nut: Dict[str, Any], photo_url: str, when: datetime,
         running[key] = round(running[key] + nut[key], 1)
 
     def one_line(meal: Dict[str, Any]) -> str:
-        tpl = str(meal.get("template") or "")
         return (
             f"{meal['foods']} (~{int(meal['portion_g'])} g) — "
             f"~{int(meal['calories'])} kcal "
             f"({int(meal['protein_g'])}P/{int(meal['carbs_g'])}C/"
             f"{int(meal['fat_g'])}F)"
-            + (f" · 📐 {tpl}" if tpl else "")  # measured template, not an estimate
         )
 
     day_total = (f"Today: {int(running['calories'])} kcal "
@@ -4021,26 +3767,29 @@ def process():
         when = datetime.fromisoformat(body["when_iso"])
     except (KeyError, ValueError):
         when = datetime.now(_tz())
+    # Cloud Tasks counts the first attempt as 0.
+    attempt = int(request.headers.get("X-CloudTasks-TaskRetryCount", "0"))
+
+    # An ingredient the app asked to have estimated, into a meal that already
+    # exists — not a meal of its own. See _process_estimate.
+    if body.get("merge_into"):
+        return _process_estimate(body, attempt, started)
 
     todays = _todays_meals(today)
     if _exact_duplicate(image_sha, note, todays):  # idempotent: retry after success
         return jsonify({"status": "already-logged"}), 200
 
-    # Cloud Tasks counts the first attempt as 0.
-    attempt = int(request.headers.get("X-CloudTasks-TaskRetryCount", "0"))
     max_attempts = _max_attempts()
 
     kw = _worker_kwargs(attempt)
-    templates = read_templates()
     try:
         images = download_photos(refs) if not text_only else []
         # Budgeted from the top of the request, so the reads above are charged to
         # the same deadline that keeps us inside Cloud Run's 180 s timeout.
         kw["deadline_s"] = _analysis_budget(started)
         mode = _llm_mode()
-        nut = (analyze_text(note, when, templates, mode=mode, **kw) if text_only
-               else analyze(images, note, now=when, templates=templates,
-                            mode=mode, **kw))
+        nut = (analyze_text(note, when, mode=mode, **kw) if text_only
+               else analyze(images, note, now=when, mode=mode, **kw))
     except Exception as err:
         if attempt + 1 >= max_attempts:  # give up: leave an auditable stub
             app.logger.exception("worker exhausted after %d attempts; stub", attempt + 1)
@@ -4061,7 +3810,6 @@ def process():
     if nut.get("kind") == "workout":
         return _finalize_workout(nut, when, image_sha, photo_url, note)
 
-    nut = _resolve_templates(nut, note, when, templates)
     return _finalize(nut, photo_url, when, image_sha, note, text_only, todays)
 
 
@@ -4195,74 +3943,443 @@ def daily():
                     "capabilities": caps.to_api()}), 200
 
 
-# Item fields a hand correction may overwrite. portion_g is informational only in
-# v1 — editing it does not rescale the other fields, it's just another number the
-# user can type a correction into.
-_EDITABLE_ITEM_FIELDS = ("calories", "protein_g", "carbs_g", "fat_g", "portion_g")
+# -- editing and repeating meals (the app) ----------------------------------------
+# The app edits a meal as a whole: it holds the item list, the user changes grams,
+# removes or adds ingredients, and one save sends the list back. The server never
+# trusts the numbers it is sent for a changed portion — it rescales the item it was
+# given from that item's own values (meal_library.rescale), so macros AND every
+# micronutrient move with the grams. That is the difference from the endpoint this
+# replaced (/meals/edit), where a new portion only changed the label.
+#
+# Repeating a past meal is the same save without a `datetime`: a new row built from
+# items the app took from history (GET /meals/library). No model is involved, so it
+# is written instantly. An ingredient nobody has logged before can still be added
+# as free text (`describe`); it is saved as a placeholder and estimated in the
+# background by the queue (see _process_estimate), exactly like a note.
+
+# How far back the library's "recent" list reaches. The habits and the ingredient
+# list are drawn from the whole history; this only bounds the plain chronology.
+LIBRARY_RECENT_DAYS = 30
+# Longest free-text ingredient the app may ask the model to estimate. It is stored
+# as the placeholder's name, which _normalize_items caps at 120 characters.
+DESCRIBE_MAX_CHARS = 120
 
 
-@app.post("/meals/edit")
-def edit_meal():
-    """Hand-correct one ingredient of an already-logged meal (e.g. the AI
-    overestimated a food's protein). The meal's row totals are re-derived from its
-    items afterwards (_meal_totals) so they never drift from what the item list
-    actually adds up to.
+def _meal_cells(rownum: int, updates: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """One values-batchUpdate entry per column, so only those cells are touched —
+    model, image_sha, photo_url and note are never rewritten by an edit, which is
+    what keeps an edit from resurrecting a stub or breaking de-duplication."""
+    return [{"range": f"{MEALS_TAB}!{_col_letter(MEALS_HEADERS.index(col))}{rownum}",
+             "values": [[value]]}
+            for col, value in updates.items()]
 
-    Only the touched columns are written (items + the 5 macro/portion totals +
-    edited_at) — model, image_sha, photo_url, note and template are left completely
-    alone, so this can never resurrect a stub or break de-duplication.
 
-    Stamps `edited_at`, which marks the row so the local audit job
-    (nutrition-audit/audit.py) skips it instead of overwriting the correction with a
-    fresh photo re-estimate next time it runs.
-
-    Body: {"datetime": "<meal id, as returned by /today>", "item_index": <int>,
-           "calories"?, "protein_g"?, "carbs_g"?, "fat_g"?, "portion_g"?}
-    — each numeric field is optional; only the ones given change.
-    """
-    if not _authorized(request):
-        return jsonify({"error": "unauthorized"}), 401
-
-    body = request.get_json(silent=True) or {}
-    when = str(body.get("datetime") or "").strip()
-    if not when:
-        return jsonify({"error": "datetime is required"}), 400
-    try:
-        item_index = int(body.get("item_index"))
-    except (TypeError, ValueError):
-        return jsonify({"error": "item_index must be an integer"}), 400
-
-    values = _read_tab(MEALS_TAB)
-    rownum = _meal_row_index_by_datetime(values, when)
-    if rownum is None:
-        return jsonify({"error": f"no meal at datetime={when}"}), 404
-    row = dict(zip(values[0], values[rownum - 1]))
-
-    items = _parse_items_cell(row.get("items"))
-    if not 0 <= item_index < len(items):
-        return jsonify({"error": f"item_index {item_index} out of range "
-                                  f"(meal has {len(items)} item(s))"}), 400
-
-    for key in _EDITABLE_ITEM_FIELDS:
-        if key in body:
-            items[item_index][key] = _round_num(body[key])
-    items = _normalize_items(items)
-
-    updates: Dict[str, Any] = {
+def _items_columns(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Every column an item list determines: the list, the food line, the totals."""
+    return {
+        "foods": ", ".join(i["name"] for i in items),
         "items": json.dumps(items, ensure_ascii=False),
         **_meal_totals(items),
-        "edited_at": datetime.now(_tz()).isoformat(timespec="seconds"),
     }
-    data = [
-        {"range": f"{MEALS_TAB}!{_col_letter(MEALS_HEADERS.index(col))}{rownum}",
-         "values": [[value]]}
-        for col, value in updates.items()
-    ]
-    _execute(lambda: _sheets().spreadsheets().values().batchUpdate(
-        spreadsheetId=_sid(), body={"valueInputOption": "RAW", "data": data}))
 
-    meal_out = _today_meals_out([{**row, **updates}])
-    return jsonify(meal_out[0] if meal_out else {"datetime": when, **updates}), 200
+
+def _write_meal_columns(rownum: int, updates: Dict[str, Any]) -> None:
+    _execute(lambda: _sheets().spreadsheets().values().batchUpdate(
+        spreadsheetId=_sid(),
+        body={"valueInputOption": "RAW", "data": _meal_cells(rownum, updates)}))
+
+
+def _describe_text(raw: Any) -> str:
+    """A free-text ingredient, whitespace-collapsed and capped — the exact string
+    the placeholder is stored and later found under."""
+    return " ".join(str(raw or "").split())[:DESCRIBE_MAX_CHARS]
+
+
+def _items_from_payload(raw: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """The item list the app sent, as stored items — or an error message.
+
+    Each entry is {"base": <an item exactly as the API served it>, "portion_g"?,
+    "override"?}. The base comes back in the display shape (`name` pt-PT, `key`
+    English — see _display_items) and is turned back into the stored shape here.
+    `portion_g` rescales the base (macros and nutrients, from its OWN values) and
+    `override` then applies hand-typed macros on top. A placeholder is passed
+    through untouched; the caller decides whether it may stay."""
+    if not isinstance(raw, list):
+        return [], "items must be a list"
+    out: List[Dict[str, Any]] = []
+    for entry in raw:
+        base = entry.get("base") if isinstance(entry, dict) else None
+        if not isinstance(base, dict):
+            return [], "each item needs a `base` object"
+        base = dict(base)
+        key = str(base.pop("key", "") or "").strip()
+        if key:
+            # The sheet keys on the English name; the display name becomes name_pt
+            # (dropped again by _normalize_items when the two are the same).
+            base["name_pt"] = str(base.get("name") or "").strip()
+            base["name"] = key
+        normalized = _normalize_items([base])
+        if not normalized:
+            return [], "every item needs a name"
+        item = normalized[0]
+        item.pop("meal_time", None)
+        if not meal_library.is_placeholder(item):
+            if "portion_g" in entry:
+                grams = _to_float(entry["portion_g"])
+                if grams is None or grams <= 0:
+                    return [], f"{item['name']}: grams must be a positive number"
+                item = meal_library.rescale(item, grams)
+            if "override" in entry:
+                item = meal_library.override(item, entry["override"])
+            item = _normalize_items([item])[0]
+        out.append(item)
+    return out, None
+
+
+def _keep_live_placeholders(items: List[Dict[str, Any]],
+                            stored: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Placeholders survive an edit only if the stored meal still has them. The app
+    may send back one that was estimated (or created) after it last loaded the
+    meal; re-inserting it would leave a "pending" item nothing will ever fill. Real
+    items always pass — and removing a placeholder is how the user cancels it."""
+    live = {(i["name"], i.get("status")) for i in stored
+            if meal_library.is_placeholder(i)}
+    return [i for i in items if not meal_library.is_placeholder(i)
+            or (i["name"], i.get("status")) in live]
+
+
+def _enqueue_estimate(meal_id: str, text: str) -> bool:
+    """Queue the model estimate of one free-text ingredient of `meal_id`. Returns
+    False if the queue is unreachable — the caller then marks it failed rather than
+    leave a placeholder that says "a estimar" forever."""
+    try:
+        _enqueue_process({
+            "merge_into": meal_id, "placeholder": text,
+            "note": text, "text_only": True,
+            "when_iso": datetime.now(_tz()).isoformat(timespec="seconds"),
+        })
+        return True
+    except Exception:
+        app.logger.exception("could not queue the estimate of %r", text)
+        return False
+
+
+def _finish_placeholder(meal_id: str, text: str,
+                        items: Optional[List[Dict[str, Any]]]) -> str:
+    """Swap a meal's placeholder for its estimated items, or mark it failed when
+    `items` is None. Returns "merged", "failed", or "gone" when there is nothing to
+    do — the meal was deleted, the user removed the ingredient, or this is a queue
+    retry of a merge that already landed. That last case is what makes the merge
+    idempotent: the placeholder IS the marker that the work is still owed."""
+    with _MEALS_LOCK:
+        values = _read_tab(MEALS_TAB)
+        rownum = _meal_row_index_by_datetime(values, meal_id)
+        if rownum is None:
+            return "gone"
+        row = dict(zip(values[0], values[rownum - 1]))
+        current = _normalize_items(_parse_items_cell(row.get("items")))
+        index = next((n for n, i in enumerate(current)
+                      if i.get("status") == meal_library.PENDING
+                      and i["name"] == text), None)
+        if index is None:
+            return "gone"
+        if items:
+            merged = current[:index] + items + current[index + 1:]
+            outcome = "merged"
+        else:
+            merged = [dict(i) for i in current]
+            merged[index]["status"] = meal_library.FAILED
+            outcome = "failed"
+        _write_meal_columns(rownum, _items_columns(merged))
+    _refresh_day_nutrition(meal_id)
+    app.logger.info("estimate of %r for %s: %s", text, meal_id, outcome)
+    return outcome
+
+
+def _process_estimate(body: Dict[str, Any], attempt: int, started: float):
+    """The queue worker's half of `describe`: estimate one free-text ingredient and
+    fold it into the meal it was added to. Same patience policy as a note (the
+    retries, the model order and the final-attempt give-up are shared), but the
+    give-up marks the placeholder failed instead of writing a stub row."""
+    meal_id = str(body.get("merge_into") or "")
+    text = _describe_text(body.get("placeholder"))
+    max_attempts = _max_attempts()
+    kw = _worker_kwargs(attempt)
+    try:
+        kw["deadline_s"] = _analysis_budget(started)
+        nut = analyze_text(text, datetime.now(_tz()), mode=_llm_mode(), **kw)
+    except Exception as err:
+        if attempt + 1 >= max_attempts:
+            app.logger.exception("estimate of %r exhausted after %d attempts",
+                                 text, attempt + 1)
+            return jsonify({"status": _finish_placeholder(meal_id, text, None)}), 200
+        app.logger.warning("estimate attempt %d/%d failed, will retry: %s",
+                           attempt + 1, max_attempts, err)
+        return jsonify({"error": str(err)}), 500
+    items = [{k: v for k, v in i.items() if k != "meal_time"}
+             for i in nut.get("items") or []] if nut.get("kind") == "meal" else []
+    return jsonify({"status": _finish_placeholder(meal_id, text, items or None)}), 200
+
+
+def _refresh_day_nutrition(meal_id: str) -> None:
+    """Re-total a CLOSED day's nutrition in daily_summary after one of its meals
+    changed, so an edit to yesterday is reflected everywhere at once rather than at
+    the next daily run — and at all when the day is older than that run's
+    reconcile window.
+
+    The totals come from `src.run_daily.daily_nutrition` itself — the roll-up the
+    daily job writes — so the two can never disagree about what a day adds up to.
+    (The ingest service used to be unable to import `src`: they were separate
+    container images. On the laptop both are on PYTHONPATH.) Every nutrition column
+    is written, blanks included, because a removed ingredient must also be able to
+    REMOVE a nutrient from the day. `energy_balance_kcal` follows; the calibrated
+    `energy_balance_adj_kcal` is refitted by the next daily run.
+
+    The day still in progress is skipped: it is never totalled (/today is live).
+    Never raises — the meal is already saved, and the daily run heals the rest."""
+    try:
+        day = _nutrition_day(datetime.fromisoformat(meal_id))
+        if day >= _nutrition_day(datetime.now(_tz())):
+            return
+        from src.run_daily import daily_nutrition  # lazy: heavy, and rarely needed
+
+        totals = daily_nutrition(_all_meal_rows(), day,
+                                 NUTRITION_DAY_CUTOFF_HOUR).get(day, {})
+        daily_rows = {str(r.get("date")): r
+                      for r in _rows_as_dicts(_read_tab(DAILY_TAB))}
+        if not totals and day not in daily_rows:
+            return  # nothing logged and nothing written: leave the day absent
+        columns: Dict[str, Any] = {c: "" for c in names_in("nutrition")
+                                   if c.startswith("total_")}
+        columns.update(totals)
+        cals_out = _to_float((daily_rows.get(day) or {}).get("total_cals_out"))
+        cals_in = _to_float(columns.get("total_cals_in"))
+        columns["energy_balance_kcal"] = (round(cals_in - cals_out)
+                                          if cals_in is not None and cals_out is not None
+                                          else "")
+        write_daily(day, columns)
+        app.logger.info("re-totalled %s after a meal changed", day)
+    except Exception:
+        app.logger.warning("could not re-total the day of %s (the daily run will)",
+                           meal_id, exc_info=True)
+
+
+def _app_meal_time(body: Dict[str, Any], now: datetime) -> Tuple[Optional[datetime], str]:
+    """When a meal logged from the app was eaten: `date` (default today) at `time`
+    (default now), in the local zone. Refuses the future — you cannot have eaten
+    it yet, and a future row would count towards a day that hasn't happened."""
+    day = str(body.get("date") or now.date().isoformat()).strip()
+    hhmm = str(body.get("time") or now.strftime("%H:%M")).strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        return None, "date must be YYYY-MM-DD"
+    if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", hhmm):
+        return None, "time must be HH:MM"
+    try:
+        when = datetime.fromisoformat(f"{day}T{hhmm}:00").replace(tzinfo=_tz())
+    except ValueError:
+        return None, "not a real date"
+    if when > now + timedelta(minutes=1):
+        return None, "a meal can't be logged in the future"
+    return when, ""
+
+
+def _unique_stamp(when: datetime, values: List[List[Any]]) -> datetime:
+    """`when`, nudged forward a second at a time past any meal already at that
+    exact second. A meal's `datetime` is its id in the app, and two meals logged
+    for "13:00" must stay two meals."""
+    taken = {str(r[0]) for r in values[1:] if r}
+    while when.isoformat(timespec="seconds") in taken:
+        when += timedelta(seconds=1)
+    return when
+
+
+def _meal_response(row: Dict[str, Any]):
+    """A saved meal as /today shows it — or just its id, for the one row /today
+    would not list (nothing left in it that counts). The app only relies on the id;
+    it reloads the day after every save."""
+    shown = _today_meals_out([row])
+    return jsonify(shown[0] if shown else {"datetime": str(row.get("datetime"))}), 200
+
+
+def _after_meal_change(meal_id: str) -> None:
+    """What every change to a meal owes the rest of the app: a closed day is
+    re-totalled, and a change to today tells the coach its cards are stale."""
+    _refresh_day_nutrition(meal_id)
+    try:
+        if _nutrition_day(datetime.fromisoformat(meal_id)) == \
+                _nutrition_day(datetime.now(_tz())):
+            _trigger_coach_refresh("meal_logged")
+    except ValueError:
+        pass
+
+
+@app.post("/meals/save")
+def save_meal():
+    """Save a meal from the app: edit an existing one, or log a new one built from
+    past meals.
+
+    Body:
+      items      [{"base": <item as served>, "portion_g"?: g, "override"?: {macros}}]
+      describe?  free text for an ingredient not in the history ("banana 120 g");
+                 saved as a placeholder and estimated in the background
+      datetime?  the meal to edit (its id, as /today returns it). Absent = new meal
+      rev?       the `rev` the app loaded; a mismatch is a 409, never an overwrite
+      client_id  NEW meals only: one id per meal the user composes, which makes the
+                 save safe to retry (APIClient retries silently — see its `post`)
+      date?, time?, note?   NEW meals only: when it was eaten, and a note
+
+    Returns the meal as /today shows it."""
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    body = request.get_json(silent=True) or {}
+    items, error = _items_from_payload(body.get("items"))
+    if error:
+        return jsonify({"error": error}), 400
+    describe = _describe_text(body.get("describe"))
+    meal_id = str(body.get("datetime") or "").strip()
+    return (_save_existing(meal_id, items, body, describe) if meal_id
+            else _save_new(items, body, describe))
+
+
+def _save_existing(meal_id: str, items: List[Dict[str, Any]], body: Dict[str, Any],
+                   describe: str):
+    with _MEALS_LOCK:
+        values = _read_tab(MEALS_TAB)
+        rownum = _meal_row_index_by_datetime(values, meal_id)
+        if rownum is None:
+            return jsonify({"error": f"no meal at datetime={meal_id}"}), 404
+        row = dict(zip(values[0], values[rownum - 1]))
+        stored = _normalize_items(_parse_items_cell(row.get("items")))
+        items = _keep_live_placeholders(items, stored)
+        if describe:
+            items.append(meal_library.placeholder(describe))
+        if not items:
+            return jsonify({"error": "a meal needs at least one ingredient — "
+                                     "delete it instead"}), 400
+        if body.get("rev") and str(body["rev"]) != _meal_rev(row):
+            # The app retries a POST silently (APIClient.send), so the retry of a
+            # save that already landed arrives carrying the OLD rev. It asks for
+            # exactly what is stored now: answer as the first attempt did.
+            if _items_columns(items)["items"] == str(row.get("items") or ""):
+                return _meal_response(row)
+            return jsonify({"error": "this meal changed since it was loaded",
+                            "stale": True}), 409
+        updates = {**_items_columns(items),
+                   "edited_at": datetime.now(_tz()).isoformat(timespec="seconds")}
+        _write_meal_columns(rownum, updates)
+    if describe and not _enqueue_estimate(meal_id, describe):
+        _finish_placeholder(meal_id, describe, None)
+    _after_meal_change(meal_id)
+    return _meal_response({**row, **updates})
+
+
+def _save_new(items: List[Dict[str, Any]], body: Dict[str, Any], describe: str):
+    client_id = re.sub(r"[^A-Za-z0-9-]", "", str(body.get("client_id") or ""))[:40]
+    if not client_id:
+        return jsonify({"error": "client_id is required for a new meal"}), 400
+    # A placeholder can't be carried over into a NEW meal — only `describe` makes one.
+    items = [i for i in items if not meal_library.is_placeholder(i)]
+    if describe:
+        items.append(meal_library.placeholder(describe))
+    if not items:
+        return jsonify({"error": "a meal needs at least one ingredient"}), 400
+    now = datetime.now(_tz())
+    when, error = _app_meal_time(body, now)
+    if when is None:
+        return jsonify({"error": error}), 400
+    image_sha = f"app:{client_id}"
+    confidence = _round_num(body.get("confidence"), 2) or 0.5
+
+    with _MEALS_LOCK:
+        values = _read_tab(MEALS_TAB)
+        existing = _meal_row_index(values, image_sha)
+        if existing is not None:  # a retry of a save that already landed
+            return _meal_response(dict(zip(values[0], values[existing - 1])))
+        when = _unique_stamp(when, values)
+        note = str(body.get("note") or "").strip()[:2000]
+        meal = _meal_from_items(items, min(confidence, 1.0), APP_MODEL)
+        append_meals([(when, meal)], "", image_sha, note)
+    meal_id = when.isoformat(timespec="seconds")
+    if describe and not _enqueue_estimate(meal_id, describe):
+        _finish_placeholder(meal_id, describe, None)
+    _after_meal_change(meal_id)
+    return _meal_response(
+        dict(zip(MEALS_HEADERS, _meal_row_values(meal, "", when, image_sha, note))))
+
+
+@app.post("/meals/delete")
+def delete_meal():
+    """Delete one meal. Body: {"datetime": <meal id>}.
+
+    Idempotent: a meal that is already gone answers 200 with `deleted: false`,
+    because the app retries silently and the retry of a delete that landed must not
+    read as a failure."""
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    meal_id = str((request.get_json(silent=True) or {}).get("datetime") or "").strip()
+    if not meal_id:
+        return jsonify({"error": "datetime is required"}), 400
+    with _MEALS_LOCK:
+        values = _read_tab(MEALS_TAB)
+        rownum = _meal_row_index_by_datetime(values, meal_id)
+        if rownum is None:
+            return jsonify({"deleted": False, "datetime": meal_id}), 200
+        tab_id = _tab_id(MEALS_TAB)
+        if tab_id is None:
+            return jsonify({"error": "meals tab not found"}), 500
+        _execute(lambda: _sheets().spreadsheets().batchUpdate(
+            spreadsheetId=_sid(), body={"requests": [{"deleteDimension": {"range": {
+                "sheetId": tab_id, "dimension": "ROWS",
+                "startIndex": rownum - 1, "endIndex": rownum}}}]}))
+    app.logger.info("meal %s deleted from the app", meal_id)
+    _after_meal_change(meal_id)
+    return jsonify({"deleted": True, "datetime": meal_id}), 200
+
+
+@app.get("/meals/library")
+def meals_library():
+    """Everything the app offers when logging a meal from history, in one call:
+
+      suggestions  the user's habits (meal_library.families), best first for the
+                   current time of day — each with its latest version as `meal`
+                   and up to a few distinct recent `versions`
+      recent       every meal of the last LIBRARY_RECENT_DAYS, newest first
+      ingredients  every food ever logged, most eaten first, each as its latest
+                   occurrence — what "add an ingredient" searches
+
+    Meals and items are in exactly the /today shape, so the app edits them with
+    the same code and sends them back to /meals/save as they came."""
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    now = datetime.now(_tz())
+    rows = [r for r in _all_meal_rows() if _is_listed(r)]
+    shown = {m["datetime"]: m for m in _today_meals_out(rows)}
+    stored = [{"datetime": str(r.get("datetime") or ""),
+               "items": _normalize_items(_parse_items_cell(r.get("items")))}
+              for r in rows]
+    canonical = _coach("food_taxonomy").canonical_name
+
+    suggestions = []
+    for family in meal_library.families(stored, now=now, canonical=canonical):
+        versions = [shown[m["datetime"]] for m in family["versions"]
+                    if m["datetime"] in shown]
+        if versions:
+            suggestions.append({"id": versions[0]["datetime"], "meal": versions[0],
+                                "versions": versions, "count": family["count"],
+                                "typical_time": family["typical_time"]})
+
+    cutoff = (now - timedelta(days=LIBRARY_RECENT_DAYS)).date().isoformat()
+    recent = sorted((m for m in shown.values() if m["datetime"][:10] >= cutoff),
+                    key=lambda m: m["datetime"], reverse=True)
+
+    taxonomy = _display_taxonomy()
+    ingredients = [{"key": entry["key"], "count": entry["count"],
+                    "last": entry["last"],
+                    "item": _display_items([entry["item"]], taxonomy)[0]}
+                   for entry in meal_library.ingredients(stored, canonical=canonical)]
+
+    return jsonify({"suggestions": suggestions, "recent": recent,
+                    "ingredients": ingredients}), 200
 
 
 @app.get("/meals")
@@ -4286,14 +4403,10 @@ def meals():
         return jsonify({"error": "date must be YYYY-MM-DD"}), 400
 
     rows = _todays_meals(day)  # filters the meals tab by the date prefix
-    macro_keys = ("calories", "protein_g", "carbs_g", "fat_g")
     taxonomy = _display_taxonomy()
     meals_out: List[Dict[str, Any]] = []
     for r in rows:
-        if _is_stub(r):
-            continue
-        macros = {k: _round_num(r.get(k)) for k in macro_keys}
-        if max(macros.values()) <= 0 and not _has_any_nutrients(r):
+        if not _is_listed(r):
             continue
         when = str(r.get("datetime") or "")
         # The items are parsed only to rebuild `foods` in pt-PT — they are not part
@@ -4305,8 +4418,7 @@ def meals():
             "time": when[11:16],  # "HH:MM" off the ISO string
             "foods": _display_foods(items, str(r.get("foods") or "").strip()),
             "note": str(r.get("note") or "").strip(),
-            "template": str(r.get("template") or "").strip(),
-            **macros,
+            **{k: _round_num(r.get(k)) for k in meal_library.MACRO_KEYS},
         })
     meals_out.sort(key=lambda m: m["datetime"])
 

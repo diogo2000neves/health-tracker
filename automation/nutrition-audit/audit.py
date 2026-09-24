@@ -336,7 +336,7 @@ def select_meals(rows: List[Dict[str, Any]], day: str,
     have a photo, are a real meal (parseable non-empty items, not a stub), are not a
     measured template, and have not been audited yet (unless `force`).
 
-    A row the user hand-corrected via /meals/edit (edited_at set) is skipped the
+    A row the user edited in the app via /meals/save (edited_at set) is skipped the
     same as an already-audited one: the ensemble's job is to guess well BEFORE a
     human looks at the plate, not to second-guess a correction the human already
     made by re-estimating from the photo and clobbering it."""
