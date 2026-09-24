@@ -156,21 +156,21 @@ def test_requires_kind_not_items(monkeypatch):
     assert fake.calls[0]["require_key"] == "kind"
 
 
-def test_text_only_call_gets_no_tools(monkeypatch):
-    """A prompt that needs no tools must be given none: a model that CAN write a
-    file may answer by writing one, which is how the coach's first run through this
-    wrapper returned prose instead of JSON."""
+def test_text_only_call_is_locked_to_websearch(monkeypatch):
+    """A text note gets WebSearch (to look up a named branded product's panel) and
+    nothing else: naming the one allowed tool keeps the old guarantee that a model
+    which CAN write a file is not able to answer by writing one."""
     fake = _FakeLLM()
     monkeypatch.setattr(claude_estimator, "_llm", lambda: fake)
     claude_estimator.analyze("prompt")
-    assert fake.calls[0]["tools"] == ""
+    assert fake.calls[0]["tools"] == "WebSearch"
 
 
-def test_image_call_is_locked_to_read(monkeypatch):
+def test_image_call_is_locked_to_read_and_websearch(monkeypatch):
     fake = _FakeLLM()
     monkeypatch.setattr(claude_estimator, "_llm", lambda: fake)
     claude_estimator.analyze("prompt", [(b"\x89PNG-ish", "image/png")])
-    assert fake.calls[0]["tools"] == "Read"
+    assert fake.calls[0]["tools"] == "Read WebSearch"
 
 
 def test_images_are_written_named_and_then_cleaned_up(monkeypatch):

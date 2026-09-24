@@ -577,7 +577,14 @@ plates into separate items ("meat with rice" = two items). Distinguish
 look-alikes by visual cues (tangerine vs orange, sweet potato vs potato, salmon
 vs trout, prosciutto vs bacon, white vs brown rice). Name items in lowercase
 singular English in `name`. If a packaged item shows a nutrition label, READ IT and
-scale to the visible portion — labels beat estimation.
+scale to the visible portion — labels beat estimation. When the note or the
+packaging names a SPECIFIC brand + product (e.g. "iogurte grego Mimosa",
+"tortitas de arroz Continente"), SEARCH THE WEB for that exact product's official
+nutrition panel and use its real per-100 g values scaled to the portion — a panel
+you find this way is as authoritative as a label you can read, and note in
+`reasoning` which product page you used. Only search for named branded products,
+never for generic foods. If the search returns nothing reliable, or you cannot
+tell which product it is, fall back to a generic estimate and lower confidence.
 
 Also give every item a `name_pt`: the SAME food named in European Portuguese
 (pt-PT, not Brazilian), lowercase, as a person in Portugal would say it at the
@@ -935,7 +942,13 @@ DESCRIPTION ALONE — there is no photo. Work through the reasoning FIRST inside
 1) PARSE what was eaten from the description: each distinct food/drink, any stated
 quantities (weights, counts, "a bowl of", "half a", "a handful"), brands, and
 cooking method. Honour every number the user gives — a stated amount overrides
-any assumption.
+any assumption. When the description names a SPECIFIC brand + product (e.g.
+"iogurte grego Mimosa", "leite proteico Mimosa", "tortitas de arroz Continente"),
+SEARCH THE WEB for that exact product's official nutrition panel and base its
+macros and micros on those real values, noting in `reasoning` which product page
+you used. Only search for named branded products, never for generic foods. If
+nothing reliable comes back, or the product is ambiguous, use a generic estimate
+and lower confidence.
 
 2) FILL THE GAPS with typical values. Where the description omits a portion, use a
 realistic single serving for that food and SAY you assumed it (that lowers

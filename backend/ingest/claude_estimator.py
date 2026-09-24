@@ -314,12 +314,16 @@ def analyze(prompt: str, images: Optional[List[Tuple[bytes, str]]] = None,
             listing = "\n".join(f"  {p}" for p in paths)
             full = (f"Read the image file(s) at these paths and analyse them:\n"
                     f"{listing}\n\n" + full)
-            tools = "Read"
+            # WebSearch so the prompt can look up a named branded product's real
+            # nutrition panel (see PROMPT step 3). The allow-list is still closed:
+            # Read + WebSearch only, so a model that wanders to Bash/Write is denied.
+            tools = "Read WebSearch"
         else:
-            # A text-only note needs no tools at all, and a model that CAN write a
-            # file may answer by writing one — which is exactly what happened the
-            # first time the coach's prompt went through this wrapper.
-            tools = ""
+            # A text-only note: WebSearch only, for the same branded-product lookup
+            # (see TEXT_PROMPT step 1). Naming the one allowed tool also keeps the
+            # old guarantee — a model that CAN write a file may answer by writing
+            # one, and with this allow-list it simply cannot.
+            tools = "WebSearch"
 
         called_as = source or DEFAULT_SOURCE
         data = llm.call_json(
