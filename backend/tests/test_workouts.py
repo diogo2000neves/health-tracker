@@ -234,6 +234,18 @@ class TestDailyRow:
         assert row["lift_session"] == "Tronco A + Inferior"
         assert "Tronco A" in row["lift_summary"] and "Inferior" in row["lift_summary"]
 
+    def test_session_minutes_sum_across_sessions_the_same_day(self):
+        sessions = [{"title": "Tronco A", "sets": [s()], "duration_min": 42},
+                    {"title": "Cardio", "sets": [s(exercise="remada")],
+                    "duration_min": 18.7}]
+        assert workouts.daily_row(sessions)["lift_mins"] == 61  # rounded, not floored
+
+    def test_a_missing_duration_is_blank_not_zero(self):
+        # A session screenshot legitimately carries no duration (cropped, or the
+        # app didn't show it) — the column should be ABSENT, not a false 0 min.
+        row = workouts.daily_row([{"title": "A", "sets": [s()]}])
+        assert "lift_mins" not in row
+
     def test_the_index_lands_when_there_is_history_to_compare_against(self):
         sessions = [{"title": "A", "sets": [s(exercise="supino", weight=110.0,
                                               reps=5)]}]

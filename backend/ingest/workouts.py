@@ -390,12 +390,16 @@ def daily_row(sessions: Sequence[Dict[str, Any]], *,
     if not working:
         return {}
 
+    mins = sum(_num(s.get("duration_min")) or 0.0 for s in sessions)
+
     row: Dict[str, Any] = {
         "lift_sets": len(working),
         "lift_hard_sets": len(hard_sets(all_sets)),
         "lift_session": " + ".join(titles),
         "lift_summary": " | ".join(line for line in lines if line),
     }
+    if mins > 0:
+        row["lift_mins"] = round(mins)
 
     today = best_e1rm_by_exercise(all_sets, bodyweight_kg)
     index = load_index(today, baseline_e1rms(history or (), upto_date=date))

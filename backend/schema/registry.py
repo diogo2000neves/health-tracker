@@ -405,6 +405,15 @@ DAILY_COLUMNS: List[Column] = [
            NEUTRAL, tier=2, range=(0, 100),
            description="Working sets performed this day, warm-ups excluded. Blank "
                        "on a day with no logged session."),
+    Column("lift_mins", "training", "integer", "min", "training", CALENDAR_DAY,
+           NEUTRAL, tier=2, range=(1, 300),
+           description="Total session duration this day, as the training app's own "
+                       "screen reported it (summed across sessions if several). A "
+                       "SEPARATE sensor from `workout_mins` (Fitbit's own start/stop "
+                       "timer on the wrist) — the two rarely agree exactly, and that "
+                       "gap is itself informative (e.g. a lot of rest-timer scrolling "
+                       "the wrist doesn't count as 'active'). Blank on a day with no "
+                       "logged session."),
     Column("lift_session", "training", "string", "", "training", CALENDAR_DAY,
            NEUTRAL, tier=2,
            description="The session's name as the training app titled it (e.g. "
