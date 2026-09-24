@@ -196,6 +196,20 @@ NON_MEALS = {"not food", "analysis failed"}
 # exist to catch OCR nonsense, not to police what a body may be.
 BODY_METRICS: Dict[str, Tuple[float, float]] = ocr_ranges()
 
+# The waking-day cutoff, mirroring src/run_daily.DAY_CUTOFF_HOUR. Both images read
+# the same env var, so the two copies cannot be configured apart. Declared up here
+# (it used to live beside the coach helpers) because `_resolve_meal_time` now needs
+# it too: the day a meal's clock time belongs to is the waking day, not the
+# calendar one.
+NUTRITION_DAY_CUTOFF_HOUR = int(os.environ.get("NUTRITION_DAY_CUTOFF_HOUR", "5"))
+
+# Separates a note's own hash from the index of the meal it was split into, when
+# one note describes several meals (see `_split_by_meal_time`). Every row still
+# carries an `image_sha` that is unique to it — which is what keeps the per-row
+# upsert in `append_meals` and the audit job's `locate_row_by_sha` working — while
+# the shared prefix still identifies all the rows one note produced.
+SHA_PART_SEP = "#"
+
 # A plain text note ("fiz cocó", "I just pooped") sets this TRUE on the day's
 # daily_summary row — the whole feature is one boolean. The user goes at most once
 # a day, so yes/no is enough; the note itself is not stored anywhere.
@@ -698,9 +712,16 @@ MEAL_TIME_SUFFIX = """
 MEAL TIME — if the NOTE says WHEN this was eaten (a meal name, or an explicit
 time), set `meal_time` to the local 24h "HH:MM" it was eaten: breakfast ~08:00,
 brunch ~10:30, lunch ~13:00, afternoon snack ~16:30, dinner ~20:00, late/supper
-~22:00, or the explicit time given. The current local time is {now_hhmm} — NEVER
-return a later time. If the note says nothing about timing, leave `meal_time`
-empty (the photo's capture time is used)."""
+~22:00, or the explicit time given. If the note says nothing about timing, leave
+`meal_time` empty (the photo's capture time is used).
+
+If the note attaches the photo to SEVERAL sittings at different times, give every
+item its own `meal_time` as well and each time is logged as its own meal — but a
+plate is normally one sitting, so only do this when the note actually says so.
+
+The current local time is {now_hhmm}. Never return a later time — UNLESS {now_hhmm}
+is before 05:00, in which case the note is logging the day that has just ended and
+any hour is legitimate. The server places the time on the correct calendar day."""
 
 # Injected whenever the user has saved templates. A template's weights come from a
 # real kitchen scale, so matching one replaces the vision estimate with measured
@@ -998,13 +1019,34 @@ CONFIDENCE — CAP AT 0.50 (there is no photo). Use this scale:
   0.20-0.34  foods clear but portions had to be assumed.
   0.10-0.19  vague description with heavy guesswork on identity or amount.
 
-MEAL TIME — set `meal_time` to the local 24h "HH:MM" the meal was eaten TODAY,
-inferred from the note. Use an explicit time if the note gives one; otherwise map
-the meal name to a typical local hour: breakfast ~08:00, brunch ~10:30, lunch
-~13:00, afternoon snack ~16:30, dinner ~20:00, late/supper ~22:00. The current
-local time is {now_hhmm} — NEVER return a time later than that (you cannot log a
-meal in the future). If the note gives no usable time or meal name, leave
-`meal_time` empty and it will default to now.
+MEAL TIME — when the note says WHEN something was eaten, say so: the row is stamped
+with that hour instead of with the moment the note arrived.
+
+ONE MEAL: set the top-level `meal_time` to the local 24h "HH:MM" it was eaten. Use
+an explicit time when the note gives one; otherwise map the meal name to a typical
+local hour: breakfast ~08:00, brunch ~10:30, lunch ~13:00, afternoon snack ~16:30,
+dinner ~20:00, late/supper ~22:00. If the note gives no usable time or meal name,
+leave `meal_time` empty and it will default to now.
+
+SEVERAL MEALS IN ONE NOTE — the end-of-day catch-up log, and the case to get right.
+A note that describes food eaten at DIFFERENT times ("Às 9:20 comi uma sandes
+mista. Às 12:00 comi 250g de massa com almôndegas. Às 20:00 comi bife de peru com
+massa e um ovo") is NOT one meal, and must not be estimated as one plate. Give
+EVERY item its own `meal_time` naming the sitting it belonged to; each distinct
+time is then logged as its own meal, at its own hour.
+  * Use the IDENTICAL string for every item of the same sitting — "09:20" for all
+    three parts of that sandwich, never "09:20" for one and "9:20" for another.
+  * Items that share a time are one plate. Never merge two sittings just because
+    they contained the same food: 300g of pasta at lunch and 300g at dinner are two
+    meals of 300g, not one of 600g.
+  * Portion each sitting on its own. A portion stated for one meal says nothing
+    about the others.
+  * Set the top-level `meal_time` to the FIRST sitting's time.
+
+The current local time is {now_hhmm}. Never invent a time later than that — UNLESS
+{now_hhmm} is before 05:00, in which case the note is logging the day that has just
+ended, so any hour is legitimate ("às 20:00" means yesterday evening, which is in
+the past). The server places each time on the correct calendar day.
 
 Rules:
 - Caloric drinks are items; water, plain tea and black coffee are ignored.
@@ -1102,7 +1144,8 @@ RESPONSE_SCHEMA = types.Schema(
             type=types.Type.ARRAY,
             items=types.Schema(
                 type=types.Type.OBJECT,
-                property_ordering=["name", "name_pt", "cooking_method",
+                property_ordering=["name", "name_pt", "meal_time",
+                                   "cooking_method",
                                    "portion_g", "calories", "protein_g",
                                    "carbs_g", "fat_g", "nutrients"],
                 properties={
@@ -1113,6 +1156,11 @@ RESPONSE_SCHEMA = types.Schema(
                     # dish they named themselves keeps their words instead of
                     # round-tripping through English and back.
                     "name_pt": types.Schema(type=types.Type.STRING),
+                    # Which sitting this item belonged to, "HH:MM", when one note
+                    # logged a whole day's meals at once. Empty for the ordinary
+                    # one-meal log; `_split_by_meal_time` groups on it and strips
+                    # it before the items are written.
+                    "meal_time": types.Schema(type=types.Type.STRING),
                     "cooking_method": types.Schema(type=types.Type.STRING),
                     "portion_g": types.Schema(type=types.Type.NUMBER),
                     "calories": types.Schema(type=types.Type.NUMBER),
@@ -1513,13 +1561,19 @@ def _normalize_nutrients(raw: Any) -> Dict[str, float]:
 
 def _normalize_items(raw: Any) -> List[Dict[str, Any]]:
     """Coerce the model's item list into clean {name, name_pt?, portion_g, macros,
-    cooking_method?, nutrients?} dicts.
+    cooking_method?, nutrients?, meal_time?} dicts.
 
     `name` is the English canonical key — FDC grounding, the food taxonomy and every
     aggregation key off it. `name_pt` is what the app shows. Kept only when the model
     actually gave something different: a name that is identical in both languages
     ("whey protein", a brand) needs no second copy, and the display layer falls back
     to `name` whenever `name_pt` is absent.
+
+    `meal_time` is the one key here that does NOT describe the food: it says which
+    of several meals in one note this item belonged to, and `_split_by_meal_time`
+    strips it back off before anything is written. Keeping it per-item rather than
+    nesting a `meals` array is what lets one note carry a whole day without
+    duplicating the ~30-field item schema inside itself.
     """
     items: List[Dict[str, Any]] = []
     for entry in raw or []:
@@ -1545,6 +1599,9 @@ def _normalize_items(raw: Any) -> List[Dict[str, Any]]:
         nutrients = _normalize_nutrients(entry.get("nutrients"))
         if nutrients:
             item["nutrients"] = nutrients
+        meal_time = str(entry.get("meal_time", "")).strip()
+        if re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", meal_time):
+            item["meal_time"] = meal_time
         items.append(item)
     return items
 
@@ -1645,6 +1702,58 @@ def _meal_from_items(items: List[Dict[str, Any]], confidence: Any,
     }
 
 
+def _split_by_meal_time(nut: Dict[str, Any],
+                        when: datetime) -> List[Tuple[datetime, Dict[str, Any]]]:
+    """Split one analysis into (time, meal) pairs — one per meal the note described.
+
+    The catch-up log is the reason this exists. A day the user was too busy to log
+    meal by meal comes in as a single note at the end of it ("às 9:20 comi uma
+    sandes... às 12:00 comi massa... às 20:00 comi bife"), and folding that into one
+    row is wrong twice over: the day looks like a single 2000 kcal sitting, and
+    every meal-timing feature downstream (the coach's "what to eat next", the
+    late-dinner correlations, the per-meal audit) reads a day that never happened.
+
+    The model tags each item with the `meal_time` it was eaten at; items sharing a
+    resolved time are one meal. Items the model left untagged fall back to the
+    note-level `meal_time` — which is the ordinary single-meal case, and comes back
+    from here as exactly one pair, byte-for-byte what the caller used to get.
+
+    Grouping on the RESOLVED datetime rather than the raw "HH:MM" string is
+    deliberate: it is what makes "9:20" and "09:20" one meal instead of two.
+    Returned oldest first so the rows are appended in the order they were eaten.
+    """
+    default = str(nut.get("meal_time") or "").strip()
+    groups: Dict[datetime, List[Dict[str, Any]]] = {}
+    for item in nut.get("items") or []:
+        item = dict(item)
+        # Strips the key as it goes: `meal_time` is routing information, and the
+        # `items` JSON in the sheet is the meal's composition. Nothing downstream
+        # (the app, /meals/edit, the audit job) expects to find it there.
+        stamp = _resolve_meal_time(item.pop("meal_time", "") or default, when)
+        groups.setdefault(stamp, []).append(item)
+
+    if len(groups) <= 1:
+        stamp = next(iter(groups), None) or _resolve_meal_time(default, when)
+        nut = dict(nut)
+        nut["items"] = next(iter(groups.values()), [])
+        return [(stamp, nut)]
+
+    parts: List[Tuple[datetime, Dict[str, Any]]] = []
+    for stamp in sorted(groups):
+        meal = _meal_from_items(groups[stamp], nut.get("confidence"),
+                                str(nut.get("model") or ""))
+        meal["kind"] = "meal"
+        meal["meal_time"] = stamp.strftime("%H:%M")
+        # A template is one dish at one sitting; a note that split into several
+        # meals is not one. Carrying the name onto every part would label three
+        # different meals as the same measured dish.
+        meal["template"] = ""
+        parts.append((stamp, meal))
+    app.logger.info("note describes %d meals: %s", len(parts),
+                    ", ".join(s.strftime("%H:%M") for s, _ in parts))
+    return parts
+
+
 def _day_totals(meal_rows: List[Dict[str, Any]]) -> Dict[str, float]:
     """Sum a day's meal rows, skipping non-meals and zero-content rows."""
     totals = {"calories": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0}
@@ -1675,6 +1784,24 @@ def _has_any_nutrients(row: Dict[str, Any]) -> bool:
     return False
 
 
+def _part_sha(image_sha: str, index: int, total: int) -> str:
+    """The `image_sha` written to row `index` of the `total` rows one note produced.
+
+    A single-meal note keeps the bare hash, so nothing already in the sheet (or in
+    the audit tab, which upserts on this exact value) has to be migrated. Only a
+    note that genuinely split gets suffixes, and then EVERY row gets one — including
+    the first — so the rows of one note are a set rather than an original plus
+    extras."""
+    return image_sha if total <= 1 else f"{image_sha}{SHA_PART_SEP}{index + 1}"
+
+
+def _from_same_source(row: Dict[str, Any], image_sha: str) -> bool:
+    """True when this row was written from the note/photo that hashes to
+    `image_sha` — whether it was the whole of it or one meal out of it."""
+    row_sha = str(row.get("image_sha") or "")
+    return row_sha == image_sha or row_sha.startswith(image_sha + SHA_PART_SEP)
+
+
 def _exact_duplicate(image_sha: str, note: str,
                      todays: List[Dict[str, Any]]) -> bool:
     """True only if THIS exact photo/text AND note is already logged today — a
@@ -1683,9 +1810,13 @@ def _exact_duplicate(image_sha: str, note: str,
         still succeed instead of being blocked by its own earlier failure;
       * the SAME photo re-sent with a CHANGED note — that's a correction to get a
         better estimate; it must re-analyse and replace the row (photo de-dup
-        keys on the image, which doesn't include the note). See append_meal."""
+        keys on the image, which doesn't include the note). See append_meals.
+
+    Matching by source rather than by exact hash is what keeps a double-tapped
+    catch-up note from being logged twice: its rows carry `<hash>#1`, `<hash>#2`,
+    ... and a bare-hash comparison would find none of them."""
     note = str(note or "")
-    return any(r.get("image_sha") == image_sha and not _is_stub(r)
+    return any(_from_same_source(r, image_sha) and not _is_stub(r)
                and str(r.get("note") or "") == note for r in todays)
 
 
@@ -2139,16 +2270,43 @@ def _worker_kwargs(attempt: int) -> Dict[str, Any]:
             "retries": _int_env("GEMINI_PATIENT_RETRIES", DEFAULT_PATIENT_RETRIES)}
 
 
+def _nutrition_day(stamp: datetime) -> str:
+    """The waking day a moment belongs to (05:00 cutoff), mirroring `_waking_day`
+    for a `datetime` instead of a sheet cell."""
+    return (stamp - timedelta(hours=NUTRITION_DAY_CUTOFF_HOUR)).date().isoformat()
+
+
 def _resolve_meal_time(hhmm: Any, now: datetime) -> datetime:
-    """Map an inferred "HH:MM" onto today's date in the local tz. Falls back to
-    `now` when absent/invalid, and never returns a time in the future (you can't
-    log a meal you haven't eaten yet)."""
+    """Map an inferred "HH:MM" onto the calendar day it actually happened on, in
+    the local tz. Falls back to `now` when absent/invalid, and never returns a time
+    in the future (you can't log a meal you haven't eaten yet).
+
+    The day is the **waking** day, not the calendar one, which is what makes the
+    end-of-day catch-up log work. A note sent at 00:03 saying "às 9:20 comi..." is
+    describing the day that has just closed: on the calendar those hours are still
+    in the future, so the old "clamp to now" rule silently stamped every one of
+    them 00:03. Rolling back a day instead puts them where they were eaten — and
+    since the nutrition roll-up is already 05:00-anchored (`src/run_daily`), the
+    rolled-back row lands in the same day's totals it was always counted in. Only
+    the timestamps change, never which day a meal is charged to.
+
+    The rollback is *only* allowed while it stays inside the current waking day,
+    which is why the guard is a day comparison rather than "always subtract 24 h".
+    At 20:00 a note claiming 23:00 is a mistake, not yesterday's dinner: yesterday
+    23:00 belongs to the previous waking day, so the rollback is refused and we
+    clamp to `now` exactly as before.
+    """
     m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", str(hhmm or "").strip())
     if not m:
         return now
     candidate = now.replace(hour=int(m.group(1)), minute=int(m.group(2)),
                             second=0, microsecond=0)
-    return candidate if candidate <= now else now
+    if candidate <= now:
+        return candidate
+    earlier = candidate - timedelta(days=1)
+    if _nutrition_day(earlier) == _nutrition_day(now):
+        return earlier
+    return now
 
 
 # -- Drive ---------------------------------------------------------------------
@@ -2533,8 +2691,13 @@ def save_template(name: str, nut: Dict[str, Any], when: datetime) -> None:
     the user stated in the note). Re-saving the same name updates it in place."""
     _ensure_templates_tab()
     values = _read_tab(TEMPLATES_TAB)
+    # `meal_time` says which sitting an item came from; a template is a recipe and
+    # has no sitting. Stripped here so it can't ride back out through
+    # `apply_template` into some future meal's items.
+    items = [{k: v for k, v in i.items() if k != "meal_time"}
+             for i in nut["items"]]
     row = [
-        name, nut["foods"], json.dumps(nut["items"], ensure_ascii=False),
+        name, nut["foods"], json.dumps(items, ensure_ascii=False),
         nut["portion_g"], nut["calories"], nut["protein_g"], nut["carbs_g"],
         nut["fat_g"], when.isoformat(timespec="seconds"),
         when.isoformat(timespec="seconds"),
@@ -2579,9 +2742,10 @@ def maybe_save_template(nut: Dict[str, Any], note: str,
     return name
 
 
-def append_meal(nut: Dict[str, Any], photo_url: str, when: datetime,
-                image_sha: str, note: str = "") -> None:
-    row = [
+def _meal_row_values(nut: Dict[str, Any], photo_url: str, when: datetime,
+                     image_sha: str, note: str) -> List[Any]:
+    """One meal as the `meals` tab's cells, in MEALS_HEADERS order."""
+    return [
         when.isoformat(timespec="seconds"),
         nut["foods"],
         json.dumps(nut["items"], ensure_ascii=False),
@@ -2589,24 +2753,108 @@ def append_meal(nut: Dict[str, Any], photo_url: str, when: datetime,
         nut["confidence"], nut["model"], photo_url, nut["portion_g"],
         image_sha, note, str(nut.get("template") or ""),
     ]
+
+
+def _orphaned_part_rows(values: List[List[Any]], image_sha: str,
+                        written: Sequence[str]) -> List[int]:
+    """1-based rows left over from an EARLIER split of this same note/photo.
+
+    Only reachable through the correction path: the same photo re-sent with a new
+    note re-analyses, and if it now describes two meals where it described three,
+    the third row is stale data nobody will ever delete by hand.
+
+    Two rows are deliberately out of reach. A hand-corrected row (`edited_at`) is
+    the user's own work and outranks any re-estimate — the audit job already
+    refuses to touch those. A stub is left alone because removing it is a separate
+    behaviour from the one this function exists for."""
+    if not values:
+        return []
+    header = values[0]
+    try:
+        sha_i = header.index("image_sha")
+    except ValueError:
+        return []
+    edited_i = header.index("edited_at") if "edited_at" in header else None
+    out: List[int] = []
+    for n, r in enumerate(values[1:], start=2):
+        row = _rows_as_dicts([header, r])[0]
+        if not _from_same_source(row, image_sha) or _is_stub(row):
+            continue
+        if str(r[sha_i] if len(r) > sha_i else "") in written:
+            continue
+        if edited_i is not None and str(
+                r[edited_i] if len(r) > edited_i else "").strip():
+            continue
+        out.append(n)
+    return out
+
+
+def append_meals(parts: Sequence[Tuple[datetime, Dict[str, Any]]], photo_url: str,
+                 image_sha: str, note: str = "") -> None:
+    """Write every meal one note/photo produced — usually one row, several when a
+    catch-up note described a whole day (see `_split_by_meal_time`).
+
+    Each row is upserted on its own `image_sha`, so a photo re-sent with a
+    corrected note replaces its rows rather than duplicating them (image_sha is the
+    photo's identity and excludes the note). The grid is read once and sorted once
+    for the whole set: N separate appends would each re-read and re-sort the tab,
+    and the sort between two appends is what would let the second one land before
+    the first."""
     meals_id = _ensure_meals_tab()
-    # Upsert: a photo re-sent with a corrected note replaces its own row rather
-    # than duplicating (image_sha is the photo's identity and excludes the note).
-    idx = _meal_row_index(_read_tab(MEALS_TAB), image_sha)
-    if idx is not None:
-        _execute(lambda: _sheets().spreadsheets().values().update(
-            spreadsheetId=_sid(), range=f"{MEALS_TAB}!A{idx}:{LAST_COL}{idx}",
-            valueInputOption="RAW", body={"values": [row]}))
-    else:
+    values = _read_tab(MEALS_TAB)
+    total = len(parts)
+    written: List[str] = []
+    updates: List[Dict[str, Any]] = []
+    appends: List[List[Any]] = []
+    for i, (when, nut) in enumerate(parts):
+        sha = _part_sha(image_sha, i, total)
+        written.append(sha)
+        row = _meal_row_values(nut, photo_url, when, sha, note)
+        idx = _meal_row_index(values, sha)
+        if idx is not None:
+            updates.append({"range": f"{MEALS_TAB}!A{idx}:{LAST_COL}{idx}",
+                            "values": [row]})
+        else:
+            appends.append(row)
+
+    if updates:
+        _execute(lambda: _sheets().spreadsheets().values().batchUpdate(
+            spreadsheetId=_sid(),
+            body={"valueInputOption": "RAW", "data": updates}))
+    if appends:
         _execute(idempotent=False, build=lambda: _sheets().spreadsheets().values().append(
             spreadsheetId=_sid(), range=f"{MEALS_TAB}!A1",
             valueInputOption="RAW", insertDataOption="INSERT_ROWS",
-            body={"values": [row]}))
+            body={"values": appends}))
+
+    # After the writes, never before: a row is only orphaned once its replacement
+    # exists, and deleting first would lose meals outright if the append failed.
+    # Descending, so each delete leaves the rows above it where they were.
+    orphans = _orphaned_part_rows(values, image_sha, written)
+    if orphans and meals_id is not None:
+        try:
+            _execute(lambda: _sheets().spreadsheets().batchUpdate(
+                spreadsheetId=_sid(), body={"requests": [
+                    {"deleteDimension": {"range": {
+                        "sheetId": meals_id, "dimension": "ROWS",
+                        "startIndex": n - 1, "endIndex": n}}}
+                    for n in sorted(orphans, reverse=True)]}))
+            app.logger.info("removed %d stale row(s) from an earlier split of %s",
+                            len(orphans), image_sha)
+        except Exception:
+            app.logger.warning("stale-row cleanup failed (non-fatal)", exc_info=True)
+
     if meals_id is not None:
-        try:  # the meal is already saved; ordering must never fail the request
+        try:  # the meals are already saved; ordering must never fail the request
             _sort_meals_by_datetime(meals_id)
         except Exception:
             app.logger.warning("meals sort failed (non-fatal)", exc_info=True)
+
+
+def append_meal(nut: Dict[str, Any], photo_url: str, when: datetime,
+                image_sha: str, note: str = "") -> None:
+    """One meal, one row — the single-meal case of `append_meals`."""
+    append_meals([(when, nut)], photo_url, image_sha, note)
 
 
 def _col_letter(index: int) -> str:
@@ -3600,14 +3848,6 @@ def _finalize(nut: Dict[str, Any], photo_url: str, when: datetime,
 
     The sheet write is the point. The JSON is now read only by Cloud Tasks, which
     cares about nothing but the 2xx — it's kept for replaying /process by hand."""
-    # If the note said when the meal was eaten (text-only OR a photo logged after
-    # the fact, e.g. "this yogurt with my lunch"), the model returns meal_time and
-    # the row lands at that hour today, sorting into place. With no timing note
-    # meal_time is empty, so _resolve_meal_time keeps the capture time.
-    resolved = _resolve_meal_time(nut.get("meal_time"), when)
-    time_inferred = resolved != when
-    when = resolved
-
     if not nut["items"]:
         return jsonify({
             "summary": ("No food in the description — nothing logged."
@@ -3617,7 +3857,16 @@ def _finalize(nut: Dict[str, Any], photo_url: str, when: datetime,
             "not_food": True,
         }), 200
 
-    append_meal(nut, photo_url, when, image_sha, note)
+    # If the note said when the meal was eaten (text-only OR a photo logged after
+    # the fact, e.g. "this yogurt with my lunch"), the model returns meal_time and
+    # the row lands at that hour, sorting into place. With no timing note meal_time
+    # is empty, so _resolve_meal_time keeps the capture time. A note that named
+    # several times ("às 9:20... às 12:00... às 20:00") comes back from the split as
+    # one meal per time, each written as its own row.
+    parts = _split_by_meal_time(nut, when)
+    capture = when
+
+    append_meals(parts, photo_url, image_sha, note)
     # The day just changed, so the coach's time-sensitive cards ("what to eat next",
     # the afternoon check-in) are now describing a day that no longer exists.
     # Enqueue a regeneration rather than doing it here: this request is a Cloud Tasks
@@ -3628,24 +3877,40 @@ def _finalize(nut: Dict[str, Any], photo_url: str, when: datetime,
     running = _day_totals(todays)
     for key in running:
         running[key] = round(running[key] + nut[key], 1)
-    if text_only:
-        prefix = f"Logged for {when.strftime('%H:%M')} (from description): "
-    elif time_inferred:
-        prefix = f"Logged for {when.strftime('%H:%M')}: "
+
+    def one_line(meal: Dict[str, Any]) -> str:
+        tpl = str(meal.get("template") or "")
+        return (
+            f"{meal['foods']} (~{int(meal['portion_g'])} g) — "
+            f"~{int(meal['calories'])} kcal "
+            f"({int(meal['protein_g'])}P/{int(meal['carbs_g'])}C/"
+            f"{int(meal['fat_g'])}F)"
+            + (f" · 📐 {tpl}" if tpl else "")  # measured template, not an estimate
+        )
+
+    day_total = (f"Today: {int(running['calories'])} kcal "
+                 f"({int(running['protein_g'])}P/{int(running['carbs_g'])}C/"
+                 f"{int(running['fat_g'])}F)")
+    if len(parts) > 1:
+        summary = (f"Logged {len(parts)} meals from one note:\n"
+                   + "\n".join(f"· {stamp.strftime('%H:%M')} — {one_line(meal)}"
+                               for stamp, meal in parts)
+                   + f"\n{day_total}")
     else:
-        prefix = "Logged: "
-    tpl = str(nut.get("template") or "")
-    summary = (
-        f"{prefix}{nut['foods']} (~{int(nut['portion_g'])} g) — "
-        f"~{int(nut['calories'])} kcal "
-        f"({int(nut['protein_g'])}P/{int(nut['carbs_g'])}C/{int(nut['fat_g'])}F)"
-        + (f" · 📐 {tpl}" if tpl else "")  # measured template, not an estimate
-        + f" · Today: {int(running['calories'])} kcal "
-        f"({int(running['protein_g'])}P/{int(running['carbs_g'])}C/"
-        f"{int(running['fat_g'])}F)"
-    )
+        stamp, meal = parts[0]
+        if text_only:
+            prefix = f"Logged for {stamp.strftime('%H:%M')} (from description): "
+        elif stamp != capture:
+            prefix = f"Logged for {stamp.strftime('%H:%M')}: "
+        else:
+            prefix = "Logged: "
+        summary = f"{prefix}{one_line(meal)} · {day_total}"
+
     return jsonify({"summary": summary, "photo_url": photo_url,
-                    "today": running, **nut}), 200
+                    "today": running,
+                    "meals": [{"datetime": stamp.isoformat(timespec="seconds"),
+                               **meal} for stamp, meal in parts],
+                    **nut}), 200
 
 
 def _log_failure_stub(photo_url: str, when: datetime, image_sha: str,
@@ -4578,11 +4843,6 @@ def _coach_window_meals(now: datetime) -> Tuple[List[Dict[str, Any]], List[Dict[
 # plenty for "you haven't eaten fish in twelve days" but far too short to say
 # anything honest about late dinners and deep sleep.
 COACH_METRIC_WINDOW_DAYS = int(os.environ.get("COACH_METRIC_WINDOW_DAYS", "120"))
-
-# The waking-day cutoff, mirroring src/run_daily.DAY_CUTOFF_HOUR. Both images read
-# the same env var, so the two copies cannot be configured apart.
-NUTRITION_DAY_CUTOFF_HOUR = int(os.environ.get("NUTRITION_DAY_CUTOFF_HOUR", "5"))
-
 
 def _coach_window_days(now: datetime,
                        window_days: int = COACH_METRIC_WINDOW_DAYS

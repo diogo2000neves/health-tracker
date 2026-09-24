@@ -2311,3 +2311,352 @@ def test_every_append_in_the_module_is_marked_non_idempotent():
     for line in src.splitlines():
         if "values().append(" in line and "_execute" in line:
             assert "idempotent=False" in line, f"unguarded append: {line.strip()}"
+
+
+# -- one note, several meals: the end-of-day catch-up log ----------------------
+# The user logs a whole day in one message at midnight ("Às 9:20 comi uma sandes
+# mista. Às 12:00 comi massa com almôndegas. Às 20:00 comi bife de peru"), and it
+# has to come back out as three meals at three hours on the day that just closed —
+# not one 2000 kcal sitting stamped 00:03.
+
+def _lisbon(day, hour, minute):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime(2026, 9, day, hour, minute, tzinfo=ZoneInfo("Europe/Lisbon"))
+
+
+def _item(name, meal_time=None, **macros):
+    item = {"name": name, "portion_g": 100, "calories": 200,
+            "protein_g": 10, "carbs_g": 20, "fat_g": 5}
+    item.update(macros)
+    if meal_time is not None:
+        item["meal_time"] = meal_time
+    return item
+
+
+def test_resolve_meal_time_rolls_back_a_day_for_a_small_hours_catch_up():
+    # 00:03 on the 24th: every hour the note names is still in the FUTURE on the
+    # calendar, but in the past of the waking day that is closing.
+    now = _lisbon(24, 0, 3)
+    for hhmm, hour in (("09:20", 9), ("12:00", 12), ("20:00", 20)):
+        got = ingest._resolve_meal_time(hhmm, now)
+        assert (got.date().isoformat(), got.hour) == ("2026-09-23", hour)
+    # a time that has already happened today is still today
+    assert ingest._resolve_meal_time("00:01", now) == _lisbon(24, 0, 1)
+
+
+def test_resolve_meal_time_refuses_a_rollback_across_the_waking_day():
+    # 20:00: "23:00" is a mistake, not last night's supper. Rolling back would
+    # charge the meal to the PREVIOUS waking day, so it clamps to now as before.
+    now = _lisbon(24, 20, 0)
+    assert ingest._resolve_meal_time("23:00", now) == now
+    # 02:00: "03:00" is likewise still in this night's future, and yesterday 03:00
+    # belongs to the waking day before this one.
+    early = _lisbon(24, 2, 0)
+    assert ingest._resolve_meal_time("03:00", early) == early
+
+
+def test_normalize_items_keeps_a_well_formed_meal_time_only():
+    items = ingest._normalize_items([
+        _item("sandwich", meal_time=" 09:20 "),
+        _item("pasta", meal_time="lunch"),      # not a clock time -> dropped
+        _item("egg", meal_time="25:99"),        # impossible -> dropped
+        _item("tomato"),                        # untagged -> no key
+    ])
+    assert items[0]["meal_time"] == "09:20"
+    assert all("meal_time" not in i for i in items[1:])
+
+
+def test_split_by_meal_time_makes_one_row_per_sitting():
+    nut = ingest._record_from({
+        "kind": "meal", "confidence": 0.45, "meal_time": "09:20",
+        "items": [
+            _item("baguette bread", "09:20", calories=250),
+            _item("cooked ham", "09:20", calories=100),
+            _item("cooked spaghetti", "12:00", calories=400),
+            _item("beef meatball", "12:00", calories=500),
+            _item("cooked turkey steak", "20:00", calories=300),
+        ],
+    }, "m1")
+    parts = ingest._split_by_meal_time(nut, _lisbon(24, 0, 3))
+
+    assert [stamp.isoformat(timespec="minutes") for stamp, _ in parts] == [
+        "2026-09-23T09:20+01:00",
+        "2026-09-23T12:00+01:00",
+        "2026-09-23T20:00+01:00",
+    ]
+    assert [meal["foods"] for _, meal in parts] == [
+        "baguette bread, cooked ham",
+        "cooked spaghetti, beef meatball",
+        "cooked turkey steak",
+    ]
+    # each row's totals are ITS sitting's, not the note's
+    assert [meal["calories"] for _, meal in parts] == [350.0, 900.0, 300.0]
+    assert sum(m["calories"] for _, m in parts) == nut["calories"]
+    # the routing key never reaches the sheet
+    assert all("meal_time" not in i for _, meal in parts for i in meal["items"])
+    # and every row keeps the analysis's own confidence and model
+    assert [meal["confidence"] for _, meal in parts] == [0.45, 0.45, 0.45]
+    assert [meal["model"] for _, meal in parts] == ["m1", "m1", "m1"]
+
+
+def test_split_by_meal_time_groups_equivalent_clock_strings():
+    nut = ingest._record_from({
+        "kind": "meal", "confidence": 0.4,
+        "items": [_item("bread", "9:20"), _item("cheese", "09:20")],
+    }, "m1")
+    parts = ingest._split_by_meal_time(nut, _lisbon(24, 12, 0))
+    assert len(parts) == 1 and parts[0][1]["foods"] == "bread, cheese"
+
+
+def test_split_by_meal_time_leaves_an_ordinary_meal_as_one_row():
+    # The overwhelmingly common case: untagged items, one note-level meal_time.
+    nut = ingest._record_from({
+        "kind": "meal", "confidence": 0.5, "meal_time": "13:00",
+        "items": [_item("rice"), _item("chicken")],
+    }, "m1")
+    parts = ingest._split_by_meal_time(nut, _lisbon(24, 20, 0))
+    assert len(parts) == 1
+    stamp, meal = parts[0]
+    assert stamp == _lisbon(24, 13, 0)
+    assert meal["foods"] == "rice, chicken" and meal["template"] == ""
+
+
+def test_split_by_meal_time_falls_back_to_capture_time_without_a_hint():
+    nut = ingest._record_from(
+        {"kind": "meal", "confidence": 0.7, "items": [_item("soup")]}, "m1")
+    when = _lisbon(24, 19, 30)
+    assert ingest._split_by_meal_time(nut, when) == [(when, nut)]
+
+
+def test_split_by_meal_time_drops_the_template_when_it_splits():
+    # A template is one measured dish at one sitting. Three sittings are not it,
+    # and labelling all three with the name would claim measured numbers for each.
+    nut = ingest._record_from({
+        "kind": "meal", "confidence": 0.5, "template": "o meu almoço",
+        "items": [_item("rice", "13:00"), _item("oats", "08:00")],
+    }, "m1")
+    parts = ingest._split_by_meal_time(nut, _lisbon(24, 20, 0))
+    assert len(parts) == 2
+    assert all(meal["template"] == "" for _, meal in parts)
+
+
+def test_part_sha_suffixes_only_a_split_note():
+    # A single-meal note keeps the bare hash, so nothing already in the sheet (or
+    # in the audit tab, which upserts on this value) needs migrating.
+    assert ingest._part_sha("abc123", 0, 1) == "abc123"
+    # a split gives every row its own hash — including the first
+    assert [ingest._part_sha("abc123", i, 3) for i in range(3)] == [
+        "abc123#1", "abc123#2", "abc123#3"]
+
+
+def test_exact_duplicate_recognises_the_rows_of_a_split_note():
+    sha = "4d2296544c80"
+    note = "Às 9:20 comi uma sandes mista"
+    rows = [{"image_sha": f"{sha}#{i}", "foods": "bread", "note": note}
+            for i in (1, 2, 3)]
+    # a double-tapped catch-up note must not be logged a second time, even though
+    # no row carries the bare hash
+    assert ingest._exact_duplicate(sha, note, rows) is True
+    # a different note through the same path is a new meal
+    assert ingest._exact_duplicate(sha, "outra coisa", rows) is False
+    # and an unrelated hash still matches nothing
+    assert ingest._exact_duplicate("deadbeef", note, rows) is False
+
+
+def _meals_grid(rows):
+    return [ingest.MEALS_HEADERS] + rows
+
+
+def _meal_cells(dt, foods, sha, edited=""):
+    return [dt, foods, "[]", 100, 10, 10, 1, 0.4, "m", "", 100, sha, "n", "",
+            edited]
+
+
+def test_orphaned_part_rows_finds_rows_a_shorter_re_split_left_behind():
+    grid = _meals_grid([
+        _meal_cells("2026-09-23T09:20:00+01:00", "bread", "sha#1"),
+        _meal_cells("2026-09-23T12:00:00+01:00", "pasta", "sha#2"),
+        _meal_cells("2026-09-23T20:00:00+01:00", "steak", "sha#3"),
+        _meal_cells("2026-09-23T21:00:00+01:00", "apple", "other"),
+    ])
+    # the re-analysis wrote only two rows: the third is stale
+    assert ingest._orphaned_part_rows(grid, "sha", ["sha#1", "sha#2"]) == [4]
+    # nothing stale when the same rows were rewritten
+    assert ingest._orphaned_part_rows(
+        grid, "sha", ["sha#1", "sha#2", "sha#3"]) == []
+    # a note that used to be one row and now splits leaves the bare-hash row behind
+    single = _meals_grid([_meal_cells("2026-09-23T00:03:00+01:00", "all", "sha")])
+    assert ingest._orphaned_part_rows(single, "sha", ["sha#1", "sha#2"]) == [2]
+
+
+def test_orphaned_part_rows_spares_hand_corrections_and_stubs():
+    grid = _meals_grid([
+        _meal_cells("2026-09-23T09:20:00+01:00", "bread", "sha#1"),
+        _meal_cells("2026-09-23T12:00:00+01:00", "pasta", "sha#2",
+                    edited="2026-09-24T10:00:00+01:00"),
+        _meal_cells("2026-09-23T20:00:00+01:00", "analysis failed", "sha#3"),
+    ])
+    # the user's own correction outranks a re-estimate, and a stub is somebody
+    # else's business
+    assert ingest._orphaned_part_rows(grid, "sha", ["sha#1"]) == []
+
+
+def test_finalize_writes_one_row_per_meal_of_a_catch_up_note(monkeypatch):
+    written = {}
+    monkeypatch.setattr(ingest, "append_meals",
+                        lambda parts, photo_url, image_sha, note:
+                        written.update(parts=parts, sha=image_sha, note=note))
+    monkeypatch.setattr(ingest, "_trigger_coach_refresh", lambda reason: None)
+
+    nut = ingest._record_from({
+        "kind": "meal", "confidence": 0.45,
+        "items": [_item("sandwich", "09:20", calories=350),
+                  _item("pasta", "12:00", calories=900),
+                  _item("turkey steak", "20:00", calories=300)],
+    }, "m1")
+    note = "Às 9:20 comi uma sandes mista..."
+    with ingest.app.test_request_context():
+        body, status = ingest._finalize(nut, "", _lisbon(24, 0, 3), "abc123",
+                                        note, True, [])
+    body = body.get_json()
+
+    assert status == 200
+    assert [s.isoformat(timespec="minutes") for s, _ in written["parts"]] == [
+        "2026-09-23T09:20+01:00", "2026-09-23T12:00+01:00",
+        "2026-09-23T20:00+01:00"]
+    assert written["sha"] == "abc123" and written["note"] == note
+    # the summary names each meal at its own hour, not one lump
+    assert "Logged 3 meals from one note" in body["summary"]
+    for hhmm in ("09:20", "12:00", "20:00"):
+        assert hhmm in body["summary"]
+    assert [m["datetime"][:16] for m in body["meals"]] == [
+        "2026-09-23T09:20", "2026-09-23T12:00", "2026-09-23T20:00"]
+    # the day total still counts the note once, whole
+    assert body["today"]["calories"] == 1550.0
+
+
+def test_finalize_keeps_the_single_meal_summary_unchanged(monkeypatch):
+    monkeypatch.setattr(ingest, "append_meals", lambda *a, **k: None)
+    monkeypatch.setattr(ingest, "_trigger_coach_refresh", lambda reason: None)
+    nut = ingest._record_from({
+        "kind": "meal", "confidence": 0.5, "meal_time": "13:00",
+        "items": [_item("rice", calories=300)],
+    }, "m1")
+    with ingest.app.test_request_context():
+        body, _ = ingest._finalize(nut, "", _lisbon(24, 20, 0), "abc123", "n",
+                                   True, [])
+    summary = body.get_json()["summary"]
+    assert summary.startswith("Logged for 13:00 (from description): rice")
+    assert "meals from one note" not in summary
+
+
+class _FakeMealWrites:
+    """Records what `append_meals` decides to do, without the Sheets plumbing:
+    which rows it rewrites in place, which it appends, and which it deletes."""
+
+    def __init__(self):
+        self.value_batches = []
+        self.appended = []
+        self.sheet_batches = []
+        self._in_values = False
+
+    def spreadsheets(self):
+        self._in_values = False
+        return self
+
+    def values(self):
+        self._in_values = True
+        return self
+
+    def batchUpdate(self, spreadsheetId, body):
+        (self.value_batches if self._in_values
+         else self.sheet_batches).append(body)
+        return self
+
+    def append(self, spreadsheetId, range, valueInputOption, insertDataOption,
+               body):
+        self.appended.extend(body["values"])
+        return self
+
+    def execute(self):
+        return {}
+
+
+def _write_api(monkeypatch, grid):
+    svc = _FakeMealWrites()
+    monkeypatch.setattr(ingest, "_sheets", lambda: svc)
+    monkeypatch.setattr(ingest, "_sid", lambda: "sid")
+    monkeypatch.setattr(ingest, "_ensure_meals_tab", lambda: 7)
+    monkeypatch.setattr(ingest, "_read_tab", lambda tab: grid)
+    monkeypatch.setattr(ingest, "_sort_meals_by_datetime", lambda meals_id: None)
+    return svc
+
+
+def _nut(foods, calories):
+    return {"items": [{"name": foods}], "foods": foods, "portion_g": 100.0,
+            "calories": calories, "protein_g": 10.0, "carbs_g": 20.0,
+            "fat_g": 5.0, "confidence": 0.45, "model": "m1"}
+
+
+def test_append_meals_appends_one_row_per_part_with_its_own_hash(monkeypatch):
+    svc = _write_api(monkeypatch, _meals_grid([]))
+    ingest.append_meals([
+        (_lisbon(23, 9, 20), _nut("sandwich", 350)),
+        (_lisbon(23, 12, 0), _nut("pasta", 900)),
+        (_lisbon(23, 20, 0), _nut("steak", 300)),
+    ], "", "abc123", "one note")
+
+    sha_i = ingest.MEALS_HEADERS.index("image_sha")
+    dt_i = ingest.MEALS_HEADERS.index("datetime")
+    assert [r[sha_i] for r in svc.appended] == ["abc123#1", "abc123#2", "abc123#3"]
+    assert [r[dt_i][:16] for r in svc.appended] == [
+        "2026-09-23T09:20", "2026-09-23T12:00", "2026-09-23T20:00"]
+    # one append call for the whole set, not one per meal: a sort between two
+    # appends is what would let the second land above the first
+    assert len(svc.appended) == 3 and svc.value_batches == []
+
+
+def test_append_meals_upserts_each_part_onto_its_own_row(monkeypatch):
+    grid = _meals_grid([
+        _meal_cells("2026-09-23T09:20:00+01:00", "old bread", "abc123#1"),
+        _meal_cells("2026-09-23T12:00:00+01:00", "old pasta", "abc123#2"),
+    ])
+    svc = _write_api(monkeypatch, grid)
+    ingest.append_meals([
+        (_lisbon(23, 9, 20), _nut("sandwich", 350)),
+        (_lisbon(23, 12, 0), _nut("pasta", 900)),
+        (_lisbon(23, 20, 0), _nut("steak", 300)),
+    ], "", "abc123", "corrected note")
+
+    # the two known rows are rewritten where they sit; only the new meal appends
+    assert [d["range"] for d in svc.value_batches[0]["data"]] == [
+        "meals!A2:O2", "meals!A3:O3"]
+    assert len(svc.appended) == 1
+    assert svc.appended[0][ingest.MEALS_HEADERS.index("foods")] == "steak"
+    assert svc.sheet_batches == []  # nothing orphaned
+
+
+def test_append_meals_removes_rows_a_shorter_re_split_orphaned(monkeypatch):
+    grid = _meals_grid([
+        _meal_cells("2026-09-23T09:20:00+01:00", "bread", "abc123#1"),
+        _meal_cells("2026-09-23T12:00:00+01:00", "pasta", "abc123#2"),
+        _meal_cells("2026-09-23T20:00:00+01:00", "steak", "abc123#3"),
+    ])
+    svc = _write_api(monkeypatch, grid)
+    ingest.append_meals([
+        (_lisbon(23, 9, 20), _nut("sandwich", 350)),
+        (_lisbon(23, 12, 0), _nut("pasta", 900)),
+    ], "", "abc123", "corrected note")
+
+    assert svc.sheet_batches == [{"requests": [{"deleteDimension": {"range": {
+        "sheetId": 7, "dimension": "ROWS", "startIndex": 3, "endIndex": 4,
+    }}}]}]
+
+
+def test_append_meal_still_writes_exactly_one_bare_hash_row(monkeypatch):
+    svc = _write_api(monkeypatch, _meals_grid([]))
+    ingest.append_meal(_nut("rice", 300), "http://photo", _lisbon(24, 13, 0),
+                       "abc123", "n")
+    assert len(svc.appended) == 1
+    assert svc.appended[0][ingest.MEALS_HEADERS.index("image_sha")] == "abc123"

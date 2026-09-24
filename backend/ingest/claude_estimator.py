@@ -102,6 +102,12 @@ Each object in "items" has exactly these keys:
   "name"            string  — REQUIRED. lowercase singular English
   "name_pt"         string  — the pt-PT display name; omit when it would be
                               identical to "name"
+  "meal_time"       string  — "HH:MM" of the SITTING this item belonged to, when
+                              one note logged several meals at different times (see
+                              MEAL TIME above). Items sharing a time are one meal
+                              and are logged as one row, so use the identical
+                              string across a sitting. Omit it for an ordinary
+                              one-meal log.
   "cooking_method"  string  — e.g. "fried", "grilled", "raw", "air-fried"
   "portion_g"       number  — REQUIRED. edible weight of THIS ingredient in grams.
                               Never omit it and never send 0: the grams are the

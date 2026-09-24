@@ -172,12 +172,49 @@ estimates from the description alone at **capped confidence (≤0.50)**, nothing
 archived to Drive, and the raw note is stored in `meals.note` for provenance.
 
 Whenever a **note says when the meal was eaten** — text-only *or* a photo logged
-after the fact ("this yogurt with my lunch") — Gemini infers the **hour** into a
-`meal_time` field; the server stamps the row with **today's date at that hour**
-(never a future time). The `meals` tab is **sorted by `datetime` after every
-append**, so back-dated rows slot into chronological order. Scope is **today
-only** — other dates aren't parsed yet. A photo with **no timing note** keeps its
-capture time (the model leaves `meal_time` empty).
+after the fact ("this yogurt with my lunch") — the model infers the **hour** into a
+`meal_time` field and the server stamps the row with it, never with a future time.
+The `meals` tab is **sorted by `datetime` after every append**, so back-dated rows
+slot into chronological order. A photo with **no timing note** keeps its capture
+time (the model leaves `meal_time` empty).
+
+The date that hour lands on is the **waking day, not the calendar day**
+(`_resolve_meal_time`). This is what makes the end-of-day catch-up log work: a note
+sent at 00:03 saying "às 20:00 comi..." is describing the day that has just closed,
+and on the calendar 20:00 is still hours away. The clock time is placed on the most
+recent day it actually occurred, and the rollback is **refused when it would cross
+the 05:00 nutrition cutoff** — at 20:00 a note claiming 23:00 is a mistake, not
+yesterday's dinner, and clamps to now as before. So the roll-up never changes which
+day a meal is charged to; only the timestamp moves. Dates further back than the
+current waking day are still **not parsed** — "ontem ao almoço" does not work.
+
+**One note can log several meals.** The day the user was too busy to log meal by
+meal arrives as a single message at the end of it:
+
+> Às 9:20 comi uma sandes mista, num pão baguete dos pequenos.
+> Às 12:00 comi 250g de massa esparguete cozida, 300g de 6 almôndegas…
+> Às 20:00 comi 120g de bife de peru cozinhado, 300g de massa cozida, 1 ovo estrelado
+
+Each item carries its own `meal_time`; items sharing a resolved time are one
+sitting, and each sitting becomes **its own row at its own hour**
+(`_split_by_meal_time`). Folding that note into one row was wrong twice over — the
+day read as a single 2000 kcal sitting, and every meal-timing feature downstream
+(the coach's "what to eat next", the late-dinner correlations, the per-meal audit)
+saw a day that never happened. The split is per-**item** rather than a nested
+`meals` array so the ~30-field item schema isn't duplicated inside itself; the key
+is stripped before anything is written, so `meals.items` keeps describing food only.
+
+Two consequences worth knowing:
+
+* **Each row gets its own `image_sha`** — `<hash>#1`, `<hash>#2`, … — because that
+  column is the upsert key for both `append_meals` and the audit job's
+  `locate_row_by_sha`, and shared hashes would collapse three meals into one row. A
+  note that logs a **single** meal keeps the bare hash, so nothing already in the
+  sheet needed migrating. De-duplication matches on the **prefix**, so a
+  double-tapped catch-up note is still recognised as already logged.
+* **A split note never matches a template.** A template is one measured dish at one
+  sitting; labelling three different meals with the same name would claim measured
+  numbers for all of them.
 
 ### Source 4 — Bowel-movement note (a boolean per day)
 A plain text note through the **same note Shortcut** — "fiz cocó", "I just pooped",
