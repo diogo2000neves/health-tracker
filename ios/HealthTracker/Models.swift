@@ -151,19 +151,30 @@ struct TodayMeal: Decodable, Identifiable, Hashable {
     let time: String
     let foods: String
     let note: String
-    let template: String
     let calories: Double
     let proteinG: Double
     let carbsG: Double
     let fatG: Double
     let photoUrl: String?
-    /// True once a user has hand-corrected an item via /meals/edit. Absent on an
-    /// older cached payload, so it defaults to false rather than failing to decode.
+    /// True once the meal was edited in the app (/meals/save). Absent on an older
+    /// cached payload, so it defaults to false rather than failing to decode.
     let edited: Bool
+    /// How sure the estimate was (0.1–1). Carried into a repeated meal, whose
+    /// numbers are exactly as good as the meal they were copied from.
+    let confidence: Double
+    /// The meal's version, sent back when saving an edit so the server can refuse
+    /// one made against a stale copy. Nil on an older cached payload.
+    let rev: String?
     let items: [MealItem]
 
     // datetime is unique per meal (down to the second) — a stable list identity.
     var id: String { datetime }
+
+    /// The "yyyy-MM-dd" day the meal was logged on.
+    var day: String { String(datetime.prefix(10)) }
+
+    /// An ingredient the model is still estimating — the list polls until it lands.
+    var hasPendingItems: Bool { items.contains { $0.isPending } }
 
     /// Space-separated photo URLs from the backend (one per image uploaded).
     /// Google Drive webViewLinks are converted to direct thumbnail URLs
@@ -176,7 +187,7 @@ struct TodayMeal: Decodable, Identifiable, Hashable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case datetime, time, foods, note, template, calories, items, edited
+        case datetime, time, foods, note, calories, items, edited, confidence, rev
         case proteinG = "protein_g"
         case carbsG = "carbs_g"
         case fatG = "fat_g"
@@ -189,13 +200,14 @@ struct TodayMeal: Decodable, Identifiable, Hashable {
         time = try c.decode(String.self, forKey: .time)
         foods = try c.decode(String.self, forKey: .foods)
         note = try c.decode(String.self, forKey: .note)
-        template = try c.decode(String.self, forKey: .template)
         calories = try c.decode(Double.self, forKey: .calories)
         proteinG = try c.decode(Double.self, forKey: .proteinG)
         carbsG = try c.decode(Double.self, forKey: .carbsG)
         fatG = try c.decode(Double.self, forKey: .fatG)
         photoUrl = try c.decodeIfPresent(String.self, forKey: .photoUrl)
         edited = try c.decodeIfPresent(Bool.self, forKey: .edited) ?? false
+        confidence = try c.decodeIfPresent(Double.self, forKey: .confidence) ?? 0.5
+        rev = try c.decodeIfPresent(String.self, forKey: .rev)
         items = try c.decode([MealItem].self, forKey: .items)
     }
 }
@@ -203,30 +215,68 @@ struct TodayMeal: Decodable, Identifiable, Hashable {
 /// One ingredient of a meal, carrying its own `nutrients` map — the raw material
 /// for the "which foods gave me this nutrient?" drill-down.
 struct MealItem: Decodable, Hashable, Identifiable {
+    /// The pt-PT name, for display.
     let name: String
+    /// The English name the sheet keys on. Never shown; sent back as-is when the
+    /// item is saved in an edited or repeated meal.
+    let key: String
     let portionG: Double
     let calories: Double
     let proteinG: Double
     let carbsG: Double
     let fatG: Double
     let nutrients: [String: Double]
+    let cookingMethod: String?
+    /// Set only on an ingredient that was described in words and handed to the
+    /// model: `Status.pending` until the estimate lands, `Status.failed` if it never
+    /// could. Its numbers are all zero meanwhile.
+    let status: String?
+
+    enum Status {
+        static let pending = "pending"
+        static let failed = "failed"
+    }
 
     // Not unique within a meal — "potato" and "boiled potato" are separate items
     // that both display as "batata". Anything iterating items keys on position
     // instead; this exists only to satisfy Identifiable.
     var id: String { name }
 
+    var isPending: Bool { status == Status.pending }
+    var isFailed: Bool { status == Status.failed }
+    var isPlaceholder: Bool { status != nil }
+
     enum CodingKeys: String, CodingKey {
-        case name, calories, nutrients
+        case name, key, calories, nutrients, status
         case portionG = "portion_g"
         case proteinG = "protein_g"
         case carbsG = "carbs_g"
         case fatG = "fat_g"
+        case cookingMethod = "cooking_method"
+    }
+
+    init(name: String, key: String, portionG: Double, calories: Double,
+         proteinG: Double, carbsG: Double, fatG: Double,
+         nutrients: [String: Double] = [:], cookingMethod: String? = nil,
+         status: String? = nil) {
+        self.name = name
+        self.key = key
+        self.portionG = portionG
+        self.calories = calories
+        self.proteinG = proteinG
+        self.carbsG = carbsG
+        self.fatG = fatG
+        self.nutrients = nutrients
+        self.cookingMethod = cookingMethod
+        self.status = status
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         name = try c.decode(String.self, forKey: .name)
+        // An older cached payload has no key; the display name is the best
+        // stand-in until the next fetch replaces it.
+        key = try c.decodeIfPresent(String.self, forKey: .key) ?? name
         portionG = try c.decodeIfPresent(Double.self, forKey: .portionG) ?? 0
         calories = try c.decodeIfPresent(Double.self, forKey: .calories) ?? 0
         proteinG = try c.decodeIfPresent(Double.self, forKey: .proteinG) ?? 0
@@ -234,6 +284,21 @@ struct MealItem: Decodable, Hashable, Identifiable {
         fatG = try c.decodeIfPresent(Double.self, forKey: .fatG) ?? 0
         // `nutrients` is omitted for a trace-free food — default to empty.
         nutrients = try c.decodeIfPresent([String: Double].self, forKey: .nutrients) ?? [:]
+        cookingMethod = try c.decodeIfPresent(String.self, forKey: .cookingMethod)
+        status = try c.decodeIfPresent(String.self, forKey: .status)
+    }
+
+    /// This item exactly as the API served it — the `base` /meals/save rescales
+    /// from. JSON-ready, for JSONSerialization.
+    var payload: [String: Any] {
+        var out: [String: Any] = [
+            "name": name, "key": key, "portion_g": portionG, "calories": calories,
+            "protein_g": proteinG, "carbs_g": carbsG, "fat_g": fatG,
+        ]
+        if !nutrients.isEmpty { out["nutrients"] = nutrients }
+        if let cookingMethod { out["cooking_method"] = cookingMethod }
+        if let status { out["status"] = status }
+        return out
     }
 }
 

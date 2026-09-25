@@ -185,7 +185,6 @@ and Swift types.
 |---|---|
 | `daily_summary` | **the source of truth.** One row per local day, 82 columns, grouped into collapsible blocks. Every column is 1:1 with `date`. |
 | `meals` | one row per meal; per-ingredient breakdown in `items` JSON |
-| `templates` | meals weighed on a real scale — measured, not estimated |
 | `analysis` | **derived, rebuilt every run.** Causally aligned: each day's inputs beside the *next* day's outcomes. Correlate here — see below. |
 | `baselines` | **derived.** 28-day mean/SD/z per metric: what's normal *for you* |
 | `schema` | **derived.** The data dictionary — what every column means |

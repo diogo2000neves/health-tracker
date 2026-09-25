@@ -212,9 +212,46 @@ Two consequences worth knowing:
   note that logs a **single** meal keeps the bare hash, so nothing already in the
   sheet needed migrating. De-duplication matches on the **prefix**, so a
   double-tapped catch-up note is still recognised as already logged.
-* **A split note never matches a template.** A template is one measured dish at one
-  sitting; labelling three different meals with the same name would claim measured
-  numbers for all of them.
+
+### Repeating and editing meals in the app (no model involved)
+
+Most meals repeat — the breakfast is oats + whey + peanut butter nearly every day,
+never with quite the same grams. **Templates were tried and retired (2026-09-25)**:
+a named, frozen copy of one meal broke the first morning a banana was added, so in
+practice it was abandoned. Their replacement is built on two facts: the history
+already holds every meal with its grams and nutrients, and the latest version of a
+habit is one edit away from today's.
+
+* **`GET /meals/library`** — `ingest/meal_library.py` groups past meals into
+  *habits* (ingredient-set Jaccard ≥ 0.5 over `food_taxonomy.canonical_name`,
+  fuzzy per item, anchored on each habit's latest member so it can drift), ranked by
+  frequency × recency (2-week half-life) × closeness to the current time of day. It
+  also returns the last 30 days of meals and every ingredient ever eaten (latest
+  occurrence as the basis). The app opens «Adicionar refeição» on this — the user
+  never has to remember *which day* they ate something.
+* **`POST /meals/save`** — the whole item list comes back from the app. A new
+  portion is **rescaled server-side from the item's own values** —
+  macros *and every micronutrient* (`meal_library.rescale`); hand-typed macros
+  (`override`) are the only numbers taken as given. Without `datetime` it logs a
+  NEW meal (`model = "app"`, `image_sha = "app:<client_id>"`, which is the
+  idempotency key); with it, it edits in place and stamps `edited_at`. A `rev`
+  (hash of the items cell) turns an edit made against a stale copy into a 409 —
+  except the identical re-send of a save that already landed, which the app's
+  silent retry produces.
+* **A food not in the history** is sent as free text (`describe`) and stored as a
+  zero-value placeholder item (`status: "pending"`), then estimated by the queue
+  (`/process` with `merge_into`) and swapped in. The placeholder *is* the marker
+  that work is owed, which makes the merge idempotent; the final failed attempt
+  marks it `failed` rather than leaving it pending forever.
+* **`POST /meals/delete`** — idempotent (already gone = 200).
+* **A change to a closed day re-totals it at once** (`_refresh_day_nutrition`,
+  using `src.run_daily.daily_nutrition` itself so the two can't disagree): every
+  nutrition column is written, blanks included, so a removed ingredient also
+  removes its nutrients from the day. `energy_balance_adj_kcal` follows at the next
+  daily run.
+* Every read-modify-write of the `meals` tab holds `_MEALS_LOCK`: rows are
+  addressed by number, and an append + sort between a read and a write would land
+  an edit — or a delete — on the neighbouring meal.
 
 ### Source 4 — Bowel-movement note (a boolean per day)
 A plain text note through the **same note Shortcut** — "fiz cocó", "I just pooped",
@@ -494,7 +531,6 @@ mean `total_cals_out`, which requires activity to vary.
               │ `daily_summary` : one row/day (sleep + recovery + activity +      │
               │                    nutrition + physique + self-report)            │
               │ `meals`         : one row/photo (per-ingredient `items` JSON)     │
-              │ `templates`     : measured, reusable meals                        │
               └────────────────────────────────────────────────────────────────────┘
                      ▲                                            ▲
   Cloud Scheduler    │        weigh-in wakes the job ──┐          │
@@ -806,27 +842,14 @@ token is read-only across `sleep`, `health_metrics_and_measurements` and
   - The daily job re-rolls a trailing `HEALTH_RECONCILE_DAYS` (7) window; set 0
     + `HEALTH_START_DATE=2000-01-01` for a full backfill run.
 - **`meals`**: `datetime | foods | items | calories | protein_g | carbs_g | fat_g |
-  confidence | model | photo_url | portion_g | image_sha | note | template`
+  confidence | model | photo_url | portion_g | image_sha | note | template | edited_at`
   - `note` = the user's optional free-text description (empty for most rows);
     stored for provenance, especially for text-only meals (empty `photo_url`).
-  - `template` = which measured template supplied the numbers (blank = estimated
-    from the photo). See `templates` below.
-- **`templates`**: `name | description | items | portion_g | calories |
-  protein_g | carbs_g | fat_g | created_at | updated_at` — meals the user weighed
-  on a **real scale**, so their `items` (same per-ingredient JSON shape as
-  `meals`) are **measured, not estimated**.
-  - **Created from a note**: logging a weighed meal with a note that asks to save
-    it as a template (any phrasing) persists its items under that name — no extra
-    step in the Shortcut. Re-saving the same name updates it in place.
-  - **Matched automatically**: every analysis gets a compact catalogue of the
-    templates injected into the prompt. If the model recognises the dish it
-    returns the template's name, and the server **swaps its estimate for the
-    measured values** — so a repeat meal yields *identical* numbers every day
-    (confidence `0.95`). `template_scale` handles "only ate half".
-  - **Guardrails**: the model must be confident it's the same dish; a name it
-    invents is rejected (the estimate is kept); the `meals.template` column
-    records every application for audit; the note always wins (it can suppress a
-    match or scale it), and a corrected note re-analyses and replaces the row.
+  - `template` = **retired** (2026-09-25). It recorded which measured template
+    supplied a meal's numbers; nothing writes it any more, but history keeps it
+    and the audit job still skips those rows as kitchen-scale truth. The
+    `templates` tab is no longer read or maintained — see "Repeating and editing
+    meals" in §2. `edited_at` = the meal was edited in the app.
   - `items` = JSON array, one object per ingredient with its portion, macros,
     `cooking_method` and a `nutrients` map (32 possible nutrients, only the
     non-negligible ones stored). The flat columns are the row totals; the daily

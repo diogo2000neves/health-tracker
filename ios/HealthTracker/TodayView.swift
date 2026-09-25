@@ -80,6 +80,16 @@ struct TodayView: View {
             }
         }
         .task { await store.load() }
+        // An ingredient described in words is estimated in the background; keep
+        // re-reading the day until it lands, so it appears without a pull.
+        .task(id: pendingKey) {
+            guard pendingKey != nil else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(20))
+                guard !Task.isCancelled else { return }
+                await reload()
+            }
+        }
         .sheet(isPresented: $showCalendar) {
             NavigationStack {
                 DatePicker("Data", selection: $pickerDate,
@@ -103,6 +113,28 @@ struct TodayView: View {
             }
             .presentationDetents([.medium])
         }
+    }
+
+    /// The meals on screen still waiting for an estimate, or nil when none are.
+    private var pendingKey: String? {
+        let ids = (activeResponse?.meals ?? []).filter(\.hasPendingItems).map(\.datetime)
+        return ids.isEmpty ? nil : ids.joined(separator: "|")
+    }
+
+    /// Re-read what is on screen: today, and the past day being viewed if any.
+    private func reload() async {
+        await store.load()
+        if let date = historicalDate,
+           let fresh = try? await APIClient.shared.today(date: Self.iso(date)) {
+            historicalResponse = fresh
+        }
+    }
+
+    /// After a meal was saved or deleted in the app: the day changed, so the
+    /// coach's cards are stale too.
+    private func mealsChanged() async {
+        store.noteEdit()
+        await reload()
     }
 
     private func backToToday() {
@@ -146,11 +178,11 @@ struct TodayView: View {
                 CalorieHeroCard(response: r)
                 MacrosCard(response: r)
                 FlagsCard(response: r)
-                MealsCard(meals: r.meals, store: store, isReadOnly: isHistorical)
+                MealsCard(meals: r.meals, day: r.date) { await mealsChanged() }
             }
             .padding(16)
         }
-        .refreshable { if !isHistorical { await store.load() } }
+        .refreshable { await reload() }
     }
 }
 
@@ -340,17 +372,34 @@ private struct FlagsCard: View {
 
 private struct MealsCard: View {
     let meals: [TodayMeal]
-    let store: TodayStore
-    let isReadOnly: Bool
+    /// The day on screen ("yyyy-MM-dd"); a meal added here is logged on it.
+    let day: String
+    /// Runs after a meal was added, edited or deleted.
+    let onChanged: () async -> Void
     @State private var selected: TodayMeal?
+    @State private var showAdd = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            SectionHeader(title: "Refeições", systemImage: "fork.knife")
+            HStack {
+                SectionHeader(title: "Refeições", systemImage: "fork.knife")
+                Spacer()
+                Button {
+                    showAdd = true
+                } label: {
+                    Label("Adicionar", systemImage: "plus")
+                        .font(.subheadline.weight(.semibold))
+                }
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.capsule)
+                .controlSize(.small)
+                .tint(Palette.accent)
+            }
 
             if meals.isEmpty {
-                Text(isReadOnly ? "Nenhuma refeição registada neste dia."
-                     : "Ainda nada hoje. Regista uma refeição e ela aparece aqui.")
+                Text(day == MealText.isoDay()
+                     ? "Ainda nada hoje. Toca em «Adicionar» para repetir uma refeição, ou regista-a pelo atalho."
+                     : "Nenhuma refeição registada neste dia.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -371,7 +420,12 @@ private struct MealsCard: View {
         }
         .card()
         .sheet(item: $selected) { meal in
-            MealDetailSheet(meal: meal, store: store, isReadOnly: isReadOnly)
+            MealDetailSheet(meal: meal, onChanged: onChanged)
+        }
+        .sheet(isPresented: $showAdd) {
+            AddMealView(day: day) {
+                Task { await onChanged() }
+            }
         }
     }
 }
@@ -396,6 +450,11 @@ private struct MealRow: View {
                 }
                 Text("P \(Int(meal.proteinG.rounded()))g · H \(Int(meal.carbsG.rounded()))g · G \(Int(meal.fatG.rounded()))g")
                     .font(.caption).foregroundStyle(.secondary)
+                if meal.hasPendingItems {
+                    Label("A estimar um ingrediente…", systemImage: "hourglass")
+                        .font(.caption)
+                        .foregroundStyle(Palette.accentText)
+                }
             }
 
             Spacer(minLength: 0)
@@ -414,231 +473,120 @@ private struct MealRow: View {
     }
 }
 
-	private struct MealDetailSheet: View {
-	    /// Mutable so a saved correction (see EditMealItemSheet) shows up in this
-	    /// already-open sheet immediately, without waiting for `store` to refetch.
-	    @State private var meal: TodayMeal
-	    let store: TodayStore
-	    let isReadOnly: Bool
-	    @Environment(\.dismiss) private var dismiss
-	    @State private var editTarget: EditTarget?
-	    @State private var nutrientTarget: NutrientTarget?
-
-	    init(meal: TodayMeal, store: TodayStore, isReadOnly: Bool = false) {
-	        self._meal = State(initialValue: meal)
-	        self.store = store
-	        self.isReadOnly = isReadOnly
-	    }
-
-	    /// One food item being corrected, identified by its position in `meal.items`
-	    /// (the id /meals/edit expects — item names are not guaranteed unique).
-	    private struct EditTarget: Identifiable {
-	        let id: Int
-	        let item: MealItem
-	    }
-
-	    /// An item tapped to see its full micronutrient profile. Identified by its
-	    /// position, like `EditTarget` — names really are not unique, and less so now
-	    /// that they are translated: "potato" and "boiled potato" are two items in the
-	    /// log that both read "batata" on screen.
-	    private struct NutrientTarget: Identifiable {
-	        let id: Int
-	        let item: MealItem
-	        let title: String
-	    }
-
-	    var body: some View {
-	        NavigationStack {
-	            List {
-	                // Photo(s) from the meal log
-	                let photos = meal.photoURLs
-	                if !photos.isEmpty {
-	                    Section {
-	                        PhotoStrip(urls: photos)
-	                    }
-	                }
-
-	                Section {
-	                    ForEach(Array(meal.items.enumerated()), id: \.offset) { index, item in
-	                        VStack(alignment: .leading, spacing: 4) {
-	                            HStack {
-	                                Text(item.name.capitalized).fontWeight(.medium)
-	                                Spacer()
-	                                Text("\(Int(item.portionG.rounded())) g")
-	                                    .foregroundStyle(.secondary)
-	                            }
-	                            HStack {
-	                                Text("\(Int(item.calories.rounded())) kcal · P \(Int(item.proteinG.rounded())) · H \(Int(item.carbsG.rounded())) · G \(Int(item.fatG.rounded()))")
-	                                    .font(.caption).foregroundStyle(.secondary)
-	                                if !isReadOnly {
-	                                    Spacer()
-	                                    Button("Editar") {
-	                                        editTarget = EditTarget(id: index, item: item)
-	                                    }
-	                                    .font(.caption.weight(.semibold))
-	                                    .buttonStyle(.bordered)
-	                                    .controlSize(.small)
-	                                    .tint(Palette.accent)
-	                                    .fixedSize()
-	                                    .accessibilityLabel("Corrigir \(item.name)")
-	                                }
-	                            }
-	                        }
-	                        .padding(.vertical, 2)
-	                        .contentShape(Rectangle())
-	                        .onTapGesture {
-	                            nutrientTarget = NutrientTarget(id: index, item: item, title: item.name.capitalized)
-	                        }
-	                    }
-	                } header: {
-	                    HStack(spacing: 4) {
-	                        Text("\(Int(meal.calories.rounded())) kcal · \(meal.time)")
-	                        if meal.edited {
-	                            Image(systemName: "pencil.circle.fill")
-	                                .accessibilityLabel("Corrigido manualmente")
-	                        }
-	                    }
-	                }
-	                if !meal.note.isEmpty {
-	                    Section("Nota") { Text(meal.note) }
-	                }
-	            }
-	            .navigationTitle(meal.foods)
-	            .navigationBarTitleDisplayMode(.inline)
-	            .toolbar {
-	                ToolbarItem(placement: .confirmationAction) {
-	                    Button("Fechar") { dismiss() }
-	                }
-	            }
-	        }
-	        .presentationDetents([.medium, .large])
-	        .sheet(item: $editTarget) { target in
-	            EditMealItemSheet(datetime: meal.datetime, itemIndex: target.id, item: target.item) { updated in
-	                meal = updated
-	                store.noteEdit()
-	                Task { await store.load() }
-	            }
-	        }
-	        .sheet(item: $nutrientTarget) { target in
-	            ItemNutrientSheet(item: target.item, title: target.title)
-	        }
-	    }
-	}
-
-/// Hand-correct one ingredient's numbers (e.g. the AI overestimated its protein).
-/// Direct macro entry: every field is a typed-in absolute value, not a delta —
-/// `portionG` is editable too but purely informational, it does not rescale the
-/// macros (see backend /meals/edit).
-private struct EditMealItemSheet: View {
-    let datetime: String
-    let itemIndex: Int
-    let item: MealItem
-    let onSaved: (TodayMeal) -> Void
-
+/// One logged meal: its photos, ingredients and note, with the two things to do
+/// with it — edit it, or log it again today.
+private struct MealDetailSheet: View {
+    let meal: TodayMeal
+    let onChanged: () async -> Void
     @Environment(\.dismiss) private var dismiss
-    @State private var calories: String
-    @State private var protein: String
-    @State private var carbs: String
-    @State private var fat: String
-    @State private var portion: String
-    @State private var isSaving = false
-    @State private var errorMessage: String?
-    @FocusState private var focusedField: Field?
+    @State private var editor: MealEditorMode?
+    @State private var nutrientTarget: NutrientTarget?
 
-    private enum Field: Hashable { case calories, protein, carbs, fat, portion }
-
-    init(datetime: String, itemIndex: Int, item: MealItem, onSaved: @escaping (TodayMeal) -> Void) {
-        self.datetime = datetime
-        self.itemIndex = itemIndex
-        self.item = item
-        self.onSaved = onSaved
-        _calories = State(initialValue: Self.format(item.calories))
-        _protein = State(initialValue: Self.format(item.proteinG))
-        _carbs = State(initialValue: Self.format(item.carbsG))
-        _fat = State(initialValue: Self.format(item.fatG))
-        _portion = State(initialValue: Self.format(item.portionG))
+    /// An item tapped to see its full micronutrient profile. Identified by its
+    /// position — names really are not unique, and less so now that they are
+    /// translated: "potato" and "boiled potato" both read "batata".
+    private struct NutrientTarget: Identifiable {
+        let id: Int
+        let item: MealItem
     }
 
     var body: some View {
         NavigationStack {
             List {
-                Section {
-                    numberRow("Calorias", "kcal", $calories, .calories)
-                    numberRow("Proteína", "g", $protein, .protein)
-                    numberRow("Hidratos", "g", $carbs, .carbs)
-                    numberRow("Gordura", "g", $fat, .fat)
-                    numberRow("Porção", "g", $portion, .portion)
-                } header: {
-                    Text(item.name.capitalized)
-                } footer: {
-                    Text("Escreve os valores corretos para este alimento — vão substituir a estimativa da IA e recalcular os totais da refeição.")
-                }
-                if let errorMessage {
+                let photos = meal.photoURLs
+                if !photos.isEmpty {
                     Section {
-                        Text(errorMessage).foregroundStyle(Palette.criticalText)
+                        PhotoStrip(urls: photos)
                     }
                 }
+
+                Section {
+                    ForEach(Array(meal.items.enumerated()), id: \.offset) { index, item in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text(MealText.sentence(item.name)).fontWeight(.medium)
+                                Spacer()
+                                if item.portionG > 0 {
+                                    Text("\(MealText.grams(item.portionG)) g")
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            if item.isPending {
+                                Label("A estimar…", systemImage: "hourglass")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            } else if item.isFailed {
+                                Label("Não deu para estimar", systemImage: "exclamationmark.triangle.fill")
+                                    .font(.caption).foregroundStyle(Palette.warningText)
+                            } else {
+                                Text("\(Int(item.calories.rounded())) kcal · P \(Int(item.proteinG.rounded())) · H \(Int(item.carbsG.rounded())) · G \(Int(item.fatG.rounded()))")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            nutrientTarget = NutrientTarget(id: index, item: item)
+                        }
+                    }
+                } header: {
+                    HStack(spacing: 4) {
+                        Text("\(Int(meal.calories.rounded())) kcal · \(meal.time)")
+                        if meal.edited {
+                            Image(systemName: "pencil.circle.fill")
+                                .accessibilityLabel("Editada na app")
+                        }
+                    }
+                }
+                if !meal.note.isEmpty {
+                    Section("Nota") { Text(meal.note) }
+                }
             }
-            .navigationTitle("Corrigir \(item.name.capitalized)")
+            .navigationTitle(meal.foods)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancelar") { dismiss() }
-                }
                 ToolbarItem(placement: .confirmationAction) {
-                    if isSaving {
-                        ProgressView()
-                    } else {
-                        Button("Guardar") { Task { await save() } }
-                            .fontWeight(.semibold)
-                    }
+                    Button("Fechar") { dismiss() }
                 }
             }
-            .disabled(isSaving)
+            .safeAreaInset(edge: .bottom) {
+                HStack(spacing: 12) {
+                    Button {
+                        editor = .edit(meal)
+                    } label: {
+                        Label("Editar", systemImage: "slider.horizontal.3")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    Button {
+                        editor = .create(day: MealText.isoDay(), base: meal, versions: [])
+                    } label: {
+                        Label("Repetir hoje", systemImage: "arrow.triangle.2.circlepath")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                .controlSize(.large)
+                .tint(Palette.accent)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(.bar)
+            }
         }
-        .presentationDetents([.medium])
-        .onAppear { focusedField = .calories }
-    }
-
-    @ViewBuilder
-    private func numberRow(_ label: String, _ unit: String, _ value: Binding<String>,
-                           _ field: Field) -> some View {
-        HStack {
-            Text(label)
-            Spacer()
-            TextField("0", text: value)
-                .keyboardType(.decimalPad)
-                .multilineTextAlignment(.trailing)
-                .textFieldStyle(.roundedBorder)
-                .focused($focusedField, equals: field)
-                .frame(width: 90)
-            Text(unit).foregroundStyle(.secondary).font(.caption)
+        .presentationDetents([.medium, .large])
+        .sheet(item: $editor) { mode in
+            NavigationStack {
+                MealEditorView(mode: mode) {
+                    // Close the editor and this sheet: the list behind is where the
+                    // changed day shows, and it reloads now.
+                    editor = nil
+                    dismiss()
+                    Task { await onChanged() }
+                }
+            }
         }
-    }
-
-    private func save() async {
-        isSaving = true
-        errorMessage = nil
-        defer { isSaving = false }
-        do {
-            let updated = try await APIClient.shared.editMealItem(
-                datetime: datetime, itemIndex: itemIndex,
-                calories: Self.parse(calories), protein: Self.parse(protein),
-                carbs: Self.parse(carbs), fat: Self.parse(fat),
-                portionG: Self.parse(portion))
-            onSaved(updated)
-            dismiss()
-        } catch {
-            errorMessage = error.localizedDescription
+        .sheet(item: $nutrientTarget) { target in
+            ItemNutrientSheet(item: target.item, title: MealText.sentence(target.item.name))
         }
-    }
-
-    private static func parse(_ text: String) -> Double? {
-        Double(text.replacingOccurrences(of: ",", with: "."))
-    }
-
-    private static func format(_ value: Double) -> String {
-        value.rounded() == value ? String(Int(value)) : String(format: "%.1f", value)
     }
 }
 
@@ -701,33 +649,7 @@ private struct ItemNutrientSheet: View {
                     }
                 }
 
-                let micros = item.nutrients
-                    .filter { !$0.value.isZero }
-                    .compactMap { (key, val) -> (NutrientDef, Double)? in
-                        NutrientCatalog.byKey[key].map { ($0, val) }
-                    }
-                    .sorted { $0.0.key < $1.0.key }
-                if !micros.isEmpty {
-                    Section("Micronutrientes") {
-                        ForEach(micros, id: \.0.id) { def, val in
-                            HStack {
-                                Text(def.label)
-                                    .font(.subheadline)
-                                Spacer()
-                                Text(def.amount(val))
-                                    .font(.subheadline.monospacedDigit())
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                }
-
-                if micros.isEmpty {
-                    Section {
-                        Text("Este alimento não tem micronutrientes registados.")
-                            .foregroundStyle(.secondary)
-                    }
-                }
+                MicronutrientSection(nutrients: item.nutrients)
             }
             .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)

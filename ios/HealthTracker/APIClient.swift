@@ -148,20 +148,33 @@ struct APIClient {
         return try await send(request, cacheAs: nil)
     }
 
-    /// Hand-correct one ingredient's numbers on an already-logged meal (e.g. the AI
-    /// overestimated a food's protein). Returns the updated meal; the caller still
-    /// refetches `today()` afterward (see TodayStore.load) to keep the day's totals
-    /// and rings in sync rather than hand-mutating the immutable response structs.
-    func editMealItem(datetime: String, itemIndex: Int, calories: Double? = nil,
-                      protein: Double? = nil, carbs: Double? = nil, fat: Double? = nil,
-                      portionG: Double? = nil) async throws -> TodayMeal {
-        var body: [String: Any] = ["datetime": datetime, "item_index": itemIndex]
-        if let calories { body["calories"] = calories }
-        if let protein { body["protein_g"] = protein }
-        if let carbs { body["carbs_g"] = carbs }
-        if let fat { body["fat_g"] = fat }
-        if let portionG { body["portion_g"] = portionG }
-        return try await post("meals/edit", body: body)
+    // MARK: - Meals
+
+    /// What "Adicionar refeição" offers: the user's habits, recent meals and every
+    /// ingredient ever logged. Cached, so the sheet opens with last time's list.
+    func mealLibrary() async throws -> MealLibrary {
+        if useSampleData { return SampleData.mealLibrary }
+        return try await get("meals/library", query: [], cacheAs: "meal_library")
+    }
+
+    /// Save a meal: an edit when `body` carries a `datetime`, otherwise a new meal
+    /// built from past items (see `MealDraft.body`). The caller reloads the day
+    /// afterwards rather than patching the immutable response structs.
+    ///
+    /// Safe under the silent retry in `send`: an edit is an absolute overwrite the
+    /// server recognises when it arrives twice, and a new meal carries the
+    /// `client_id` that makes a second arrival return the first one's row.
+    @discardableResult
+    func saveMeal(_ body: [String: Any]) async throws -> SavedMeal {
+        if useSampleData { return SavedMeal(datetime: "sample") }
+        return try await post("meals/save", body: body, timeout: 45)
+    }
+
+    /// Delete a meal. Idempotent server-side: an already-deleted meal is a 200.
+    @discardableResult
+    func deleteMeal(datetime: String) async throws -> DeletedMeal {
+        if useSampleData { return DeletedMeal(deleted: true, datetime: datetime) }
+        return try await post("meals/delete", body: ["datetime": datetime], timeout: 45)
     }
 
     // MARK: - Disk-cached last-known-good (read synchronously at store init, so the
@@ -177,6 +190,10 @@ struct APIClient {
 
     func cachedNutrients() -> NutrientInfoResponse? {
         useSampleData ? nil : DiskCache.load(NutrientInfoResponse.self, as: "nutrients")
+    }
+
+    func cachedMealLibrary() -> MealLibrary? {
+        useSampleData ? nil : DiskCache.load(MealLibrary.self, as: "meal_library")
     }
 
     /// The last feed the app saw. Read synchronously in `CoachStore.init`, so the
@@ -234,12 +251,13 @@ struct APIClient {
         return try await send(request, cacheAs: cacheAs)
     }
 
-    /// A mutation (/meals/edit, and the coach's refresh + chat).
+    /// A mutation (/meals/save, /meals/delete, and the coach's refresh + chat).
     ///
     /// Retried the same way as `get`, which is only sound because every one of these
-    /// is an absolute overwrite (/meals/edit sets fields to given values), a no-op
-    /// when repeated (/coach/refresh dedups by slot), or explicitly keyed by an
-    /// idempotency token the caller supplies (/coach/chat's `client_turn_id`).
+    /// is an absolute overwrite (an edit in /meals/save sets the whole item list), a
+    /// no-op when repeated (/meals/delete, /coach/refresh dedups by slot), or
+    /// explicitly keyed by an idempotency token the caller supplies (/coach/chat's
+    /// `client_turn_id`, a new meal's `client_id`).
     ///
     /// That last one is not decoration. This retry loop is silent and invisible, so
     /// a POST that is not idempotent gets applied two or three times with nobody

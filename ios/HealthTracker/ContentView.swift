@@ -26,8 +26,8 @@ final class TodayStore {
     /// True while a reload runs behind data that's already on screen — drives a
     /// small, unobtrusive indicator instead of blocking the view.
     var isRefreshing = false
-    /// Bumped whenever the user changes the day's data from inside the app (currently
-    /// a hand-corrected meal item). The root view watches it and asks the coach to
+    /// Bumped whenever the user changes the day's data from inside the app (a meal
+    /// added, edited or deleted). The root view watches it and asks the coach to
     /// regenerate, since its day cards are now describing numbers that changed.
     /// Meals logged the usual way — through the Shortcut — are picked up server-side.
     private(set) var editCount = 0
@@ -188,7 +188,7 @@ struct RootView: View {
             }
         }
         .onChange(of: today.editCount) { _, _ in
-            // A hand-corrected meal changes today's numbers, so the coach's day cards
+            // A meal changed in the app changes today's numbers, so the coach's day cards
             // are out of date.
             coach.mealWasLogged()
         }

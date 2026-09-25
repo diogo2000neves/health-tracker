@@ -29,6 +29,7 @@ enum SampleData {
                                                    from: coachHistoryJSON())
     static let coachReports: CoachReportsList = decode(CoachReportsList.self,
                                                        from: coachReportsJSON())
+    static let mealLibrary: MealLibrary = decode(MealLibrary.self, from: mealLibraryJSON())
 
     /// The acknowledgement of a sent question, so the chat can be exercised end to
     /// end without a backend. Not an answer — chat is queued work, and the sample
@@ -145,9 +146,9 @@ enum SampleData {
 
     /// Three meals of a day in progress (mid-afternoon), each ingredient carrying a
     /// realistic nutrient map so the drill-down has something to show.
-    private static func sampleMeals() -> [[String: Any]] {
+    private static func sampleMeals(day: Int = 0) -> [[String: Any]] {
         [
-            meal("08:20", "Aveia, leite, banana e manteiga de amendoim", note: "", items: [
+            meal("08:20", "Aveia, leite, banana e manteiga de amendoim", note: "", day: day, items: [
                 item("aveia", 60, 228, 8, 40, 4,
                      ["fiber_g": 6, "magnesium_mg": 84, "iron_mg": 2.4, "zinc_mg": 1.5,
                       "phosphorus_mg": 210, "potassium_mg": 210, "vitamin_b1_mg": 0.3]),
@@ -163,7 +164,7 @@ enum SampleData {
                       "niacin_mg": 2.7, "vitamin_b3_mg": 2.7, "monounsaturated_fat_g": 5,
                       "sodium_mg": 85, "potassium_mg": 100]),
             ]),
-            meal("13:15", "Frango grelhado, arroz e brócolos", note: "azeite q.b.", items: [
+            meal("13:15", "Frango grelhado, arroz e brócolos", note: "azeite q.b.", day: day, items: [
                 item("peito de frango grelhado", 180, 297, 56, 0, 7,
                      ["sodium_mg": 130, "potassium_mg": 440, "phosphorus_mg": 360,
                       "zinc_mg": 1.8, "vitamin_b6_mg": 1.1, "vitamin_b3_mg": 24,
@@ -177,7 +178,7 @@ enum SampleData {
                 item("azeite", 10, 88, 0, 0, 10,
                      ["vitamin_e_mg": 1.9, "monounsaturated_fat_g": 7.3, "saturated_fat_g": 1.4]),
             ]),
-            meal("16:40", "Iogurte grego com mirtilos e amêndoas", note: "", items: [
+            meal("16:40", "Iogurte grego com mirtilos e amêndoas", note: "", day: day, items: [
                 item("iogurte grego", 170, 100, 17, 6, 0.7,
                      ["calcium_mg": 190, "vitamin_b12_ug": 1.3, "vitamin_b2_mg": 0.4,
                       "phosphorus_mg": 230, "potassium_mg": 240, "sugar_g": 6,
@@ -190,6 +191,33 @@ enum SampleData {
                       "monounsaturated_fat_g": 8, "potassium_mg": 180]),
             ]),
         ]
+    }
+
+    // MARK: - /meals/library
+
+    /// Today's three meals as habits (each with yesterday's copy as a second
+    /// version), both days as the recent list, and every sample food as an
+    /// ingredient — enough to walk the whole "Adicionar refeição" flow offline.
+    private static func mealLibraryJSON() -> [String: Any] {
+        let today = sampleMeals()
+        let yesterday = sampleMeals(day: -1)
+        let habits: [[String: Any]] = zip(today, yesterday).map { latest, older in
+            ["id": latest["datetime"] ?? "", "meal": latest, "versions": [latest, older],
+             "count": 12, "typical_time": latest["time"] ?? ""]
+        }
+        var seen = Set<String>()
+        var ingredients: [[String: Any]] = []
+        for meal in today {
+            for item in (meal["items"] as? [[String: Any]]) ?? [] {
+                guard let name = item["name"] as? String, seen.insert(name).inserted
+                else { continue }
+                ingredients.append(["key": name, "count": 5,
+                                    "last": meal["datetime"] ?? "", "item": item])
+            }
+        }
+        return ["suggestions": habits,
+                "recent": Array((yesterday + today).reversed()),
+                "ingredients": ingredients]
     }
 
     /// Sum every item's macros and nutrients into the `consumed` map — the same
@@ -312,15 +340,15 @@ enum SampleData {
 
     // MARK: - builders & helpers
 
-    private static func meal(_ time: String, _ foods: String, note: String,
+    private static func meal(_ time: String, _ foods: String, note: String, day: Int = 0,
                              items: [[String: Any]]) -> [String: Any] {
         let cal = items.reduce(0.0) { $0 + (($1["calories"] as? Double) ?? 0) }
         let p = items.reduce(0.0) { $0 + (($1["protein_g"] as? Double) ?? 0) }
         let c = items.reduce(0.0) { $0 + (($1["carbs_g"] as? Double) ?? 0) }
         let f = items.reduce(0.0) { $0 + (($1["fat_g"] as? Double) ?? 0) }
         return [
-            "datetime": "\(isoDay(0))T\(time):00+01:00", "time": time,
-            "foods": foods, "note": note, "template": "",
+            "datetime": "\(isoDay(day))T\(time):00+01:00", "time": time,
+            "foods": foods, "note": note, "confidence": 0.7, "rev": "sample-\(time)",
             "calories": round(cal), "protein_g": round1(p), "carbs_g": round1(c),
             "fat_g": round1(f), "items": items,
         ]
