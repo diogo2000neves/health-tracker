@@ -155,6 +155,8 @@ def api(monkeypatch):
     monkeypatch.setattr(ingest, "_display_taxonomy", lambda: None)
     monkeypatch.setattr(ingest, "_enqueue_process", queued.append)
     monkeypatch.setattr(ingest, "_trigger_coach_refresh", coach.append)
+    resyncs = []
+    monkeypatch.setattr(ingest, "_schedule_daily_resync", resyncs.append)
     # the registry's nutrition block, narrowed to the columns this fake day has
     monkeypatch.setattr(ingest, "names_in", lambda block: [
         "energy_balance_kcal", "total_cals_in", "total_protein_g", "total_carbs_g",
@@ -162,6 +164,7 @@ def api(monkeypatch):
     monkeypatch.setenv("INGEST_TOKEN", "t")
     client = ingest.app.test_client()
     client.sheet, client.queued, client.coach = sheet, queued, coach
+    client.resyncs = resyncs
     return client
 
 
@@ -295,6 +298,8 @@ def test_editing_a_closed_day_rewrites_its_nutrition_columns(api):
     assert day["energy_balance_kcal"] == 190 - 2600
     assert day["total_cals_out"] == 2600       # another source's column: untouched
     assert api.coach == []                      # not today: the coach doesn't care
+    # the calibrated balance is the daily job's: it is owed a run for this day
+    assert api.resyncs == [TWO_DAYS_AGO]
 
 
 def test_editing_today_leaves_daily_summary_alone(api):
@@ -302,6 +307,70 @@ def test_editing_today_leaves_daily_summary_alone(api):
     api.post("/meals/save", headers=HDR, json={
         "datetime": BREAKFAST_ID, "items": _entries(_served(api))[:1]})
     assert api.sheet.tabs["daily_summary"] == before
+    assert api.resyncs == []                   # a day in progress is never totalled
+
+
+# -- the daily sync owed after an edit to a closed day ---------------------------------
+class _FakeTimer:
+    """threading.Timer that fires only when the test says so."""
+    made = []
+
+    def __init__(self, delay, fn, args=()):
+        self.delay, self.fn, self.args = delay, fn, args
+        _FakeTimer.made.append(self)
+
+    def start(self):
+        pass
+
+    def fire(self):
+        self.fn(*self.args)
+
+
+@pytest.fixture
+def resync(monkeypatch):
+    _FakeTimer.made = []
+    started, running = [], {"now": False}
+    monkeypatch.setattr(ingest.threading, "Timer", _FakeTimer)
+    monkeypatch.setattr(ingest, "_resync_timer", None)
+    monkeypatch.setattr(ingest, "_daily_sync_running", lambda: running["now"])
+    monkeypatch.setattr(ingest, "_trigger_daily_sync",
+                        lambda day, reason="": started.append((day, reason)))
+    return started, running
+
+
+def test_saves_made_together_owe_one_daily_run(resync):
+    started, _ = resync
+    ingest._schedule_daily_resync("2026-09-24")    # the forgotten breakfast
+    ingest._schedule_daily_resync("2026-09-24")    # and the dinner, seconds later
+    assert len(_FakeTimer.made) == 1
+    assert _FakeTimer.made[0].delay == ingest.DAILY_RESYNC_DEBOUNCE_S
+    _FakeTimer.made[0].fire()
+    assert started == [("2026-09-24", "a meal edit")]
+    # owed and paid: the next edit owes a new run
+    ingest._schedule_daily_resync("2026-09-24")
+    assert len(_FakeTimer.made) == 2
+
+
+def test_a_run_in_flight_is_waited_out_not_joined(resync):
+    # The run in flight may have read the meals before the save; joining it would
+    # let it write the old totals back with nothing coming after.
+    started, running = resync
+    running["now"] = True
+    ingest._schedule_daily_resync("2026-09-24")
+    _FakeTimer.made[0].fire()
+    assert started == [] and _FakeTimer.made[1].delay == ingest.DAILY_RESYNC_WAIT_S
+    running["now"] = False
+    _FakeTimer.made[1].fire()
+    assert started == [("2026-09-24", "a meal edit")]
+
+
+def test_an_endless_run_does_not_keep_the_owed_run_waiting_forever(resync):
+    started, running = resync
+    running["now"] = True
+    ingest._schedule_daily_resync("2026-09-24")
+    for _ in range(ingest.DAILY_RESYNC_MAX_WAITS + 1):
+        _FakeTimer.made[-1].fire()
+    assert started == [("2026-09-24", "a meal edit")]   # gives up waiting, starts
 
 
 # -- repeating a meal -------------------------------------------------------------------

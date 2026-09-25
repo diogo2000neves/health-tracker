@@ -304,6 +304,14 @@ DEFAULT_TASKS_MAX_ATTEMPTS = 8
 # DAILY_JOB env var.
 DEFAULT_DAILY_JOB = "health-tracker-daily"
 
+# A meal changed on a closed day owes the daily sync a run (see
+# _schedule_daily_resync). Saves this close together share one run — logging a
+# forgotten breakfast and dinner back to back is one sync, not two — and a run
+# already in flight is waited out, re-checked this often, this many times.
+DAILY_RESYNC_DEBOUNCE_S = 10.0
+DAILY_RESYNC_WAIT_S = 60.0
+DAILY_RESYNC_MAX_WAITS = 20
+
 # How long a cached Google API client may sit idle before `_per_thread` throws it
 # away. 25 s is deliberately under the 30 s that measured *alive* on this
 # deployment — read the long version in `_per_thread`, it is the fix for `/today`
@@ -1307,7 +1315,7 @@ def _authorized(req) -> bool:
     return bool(expected) and hmac.compare_digest(given, expected)
 
 
-def _trigger_daily_sync_local(day: str) -> None:
+def _trigger_daily_sync_local(day: str, reason: str = "weigh-in") -> None:
     """Kick the daily job on this machine instead of the Cloud Run Jobs API.
 
     `systemctl start` is a no-op on an already-active unit, so systemd absorbs the
@@ -1327,7 +1335,7 @@ def _trigger_daily_sync_local(day: str) -> None:
             capture_output=True, text=True, timeout=30,
             stdin=subprocess.DEVNULL)
         if result.returncode == 0:
-            app.logger.info("weigh-in for %s woke the daily sync (%s)", day, unit)
+            app.logger.info("%s for %s woke the daily sync (%s)", reason, day, unit)
         else:
             app.logger.warning("daily sync trigger failed (%s): %s",
                                result.returncode, (result.stderr or "")[:200])
@@ -1335,7 +1343,7 @@ def _trigger_daily_sync_local(day: str) -> None:
         app.logger.exception("daily sync trigger failed (backstop will cover it)")
 
 
-def _trigger_daily_sync(day: str) -> None:
+def _trigger_daily_sync(day: str, reason: str = "weigh-in") -> None:
     """Kick the daily job, because the user has just woken up.
 
     The weigh-in IS the wake signal. A scale screenshot for TODAY means: the night
@@ -1354,7 +1362,7 @@ def _trigger_daily_sync(day: str) -> None:
     case of two screenshots sent back to back.
     """
     if _queue_backend() == "local":
-        _trigger_daily_sync_local(day)
+        _trigger_daily_sync_local(day, reason)
         return
 
     project = os.environ.get("GCP_PROJECT")
@@ -1385,12 +1393,77 @@ def _trigger_daily_sync(day: str) -> None:
 
         resp = session.post(f"{base}:run", json={}, timeout=30)
         if resp.ok:
-            app.logger.info("weigh-in for %s woke the daily sync", day)
+            app.logger.info("%s for %s woke the daily sync", reason, day)
         else:
             app.logger.warning("daily sync trigger returned %s: %s",
                                resp.status_code, resp.text[:200])
     except Exception:
         app.logger.exception("daily sync trigger failed (backstop will cover it)")
+
+
+def _daily_sync_running() -> bool:
+    """Whether the daily job is running right now. Local only: a oneshot unit is
+    "activating" for its whole run and "inactive" once done. The Cloud Run path
+    answers this itself, inside _trigger_daily_sync."""
+    if _queue_backend() != "local":
+        return False
+    unit = os.environ.get("DAILY_JOB_UNIT", "health-tracker-daily.service")
+    result = subprocess.run(["systemctl", "--user", "is-active", unit],
+                            capture_output=True, text=True, timeout=30,
+                            stdin=subprocess.DEVNULL)
+    return result.stdout.strip() in ("active", "activating", "reloading")
+
+
+# At most one owed run is pending at a time; see _schedule_daily_resync.
+_resync_lock = threading.Lock()
+_resync_timer: Optional[threading.Timer] = None
+
+
+def _schedule_daily_resync(day: str) -> None:
+    """Owe the daily sync one run, because a meal on a closed day changed.
+
+    _refresh_day_nutrition already rewrote that day's intake, but two columns
+    belong to the daily job: `energy_balance_adj_kcal` (the calibration refit) and
+    the calibration tab itself. Without this they stayed stale until the next
+    morning — logging a forgotten breakfast left the adjusted balance describing
+    the day without it.
+
+    Why not simply start the job: `systemctl start` on a run already in flight is a
+    no-op, and that run may have read the meals BEFORE this save — it would then
+    write the old totals back over the fresh ones and nothing would come after it.
+    So the run is owed rather than fired: a short debounce (so saves made together
+    share one run), then, if a run is in flight, wait for it to finish and start
+    another. An edit arriving while a run is owed is covered by it, since that run
+    has not read anything yet.
+
+    Timers live in the API process: a restart loses an owed run, and the 11:00
+    backstop covers it. Never raises."""
+    global _resync_timer
+    with _resync_lock:
+        if _resync_timer is not None:
+            return
+        _resync_timer = threading.Timer(DAILY_RESYNC_DEBOUNCE_S, _run_owed_resync,
+                                        args=(day, DAILY_RESYNC_MAX_WAITS))
+        _resync_timer.daemon = True
+        _resync_timer.start()
+
+
+def _run_owed_resync(day: str, waits_left: int) -> None:
+    global _resync_timer
+    try:
+        running = _daily_sync_running()
+    except Exception:
+        app.logger.warning("could not ask whether the daily sync runs", exc_info=True)
+        running = False
+    with _resync_lock:
+        if running and waits_left > 0:
+            _resync_timer = threading.Timer(DAILY_RESYNC_WAIT_S, _run_owed_resync,
+                                            args=(day, waits_left - 1))
+            _resync_timer.daemon = True
+            _resync_timer.start()
+            return
+        _resync_timer = None
+    _trigger_daily_sync(day, reason="a meal edit")
 
 
 def _queue_backend() -> str:
@@ -4136,8 +4209,9 @@ def _refresh_day_nutrition(meal_id: str) -> None:
     (The ingest service used to be unable to import `src`: they were separate
     container images. On the laptop both are on PYTHONPATH.) Every nutrition column
     is written, blanks included, because a removed ingredient must also be able to
-    REMOVE a nutrient from the day. `energy_balance_kcal` follows; the calibrated
-    `energy_balance_adj_kcal` is refitted by the next daily run.
+    REMOVE a nutrient from the day. `energy_balance_kcal` follows here; the
+    calibrated `energy_balance_adj_kcal` belongs to the daily job, which is owed a
+    run for it (_schedule_daily_resync).
 
     The day still in progress is skipped: it is never totalled (/today is live).
     Never raises — the meal is already saved, and the daily run heals the rest."""
@@ -4163,6 +4237,7 @@ def _refresh_day_nutrition(meal_id: str) -> None:
                                           else "")
         write_daily(day, columns)
         app.logger.info("re-totalled %s after a meal changed", day)
+        _schedule_daily_resync(day)
     except Exception:
         app.logger.warning("could not re-total the day of %s (the daily run will)",
                            meal_id, exc_info=True)
