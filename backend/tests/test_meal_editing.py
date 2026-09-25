@@ -502,7 +502,20 @@ def test_served_items_carry_their_english_key_and_meals_their_rev(api):
     assert [(i["name"], i["key"]) for i in meal["items"]] == [
         ("aveia", "rolled oats"), ("whey protein", "whey protein")]
     assert meal["rev"] == ingest._meal_rev(_stored(api, BREAKFAST_ID))
-    assert "template" not in meal
+
+
+def test_served_meals_still_satisfy_app_builds_from_before_this_change(api):
+    # The pre-2026-09-25 app decodes these keys as REQUIRED on every meal of
+    # /today (TodayMeal.init(from:)). Dropping one — `template` was — makes the
+    # whole payload fail to decode: today silently stays on stale cache and a
+    # past day bounces back to today. Additions are safe; removals are not.
+    meal = _served(api)
+    for key in ("datetime", "time", "foods", "note", "template", "calories",
+                "protein_g", "carbs_g", "fat_g", "items"):
+        assert key in meal, key
+    assert isinstance(meal["template"], str)
+    for item in meal["items"]:
+        assert isinstance(item["name"], str)
 
 
 def test_the_library_offers_habits_recent_meals_and_ingredients(api):

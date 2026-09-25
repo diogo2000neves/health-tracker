@@ -20,6 +20,9 @@ struct TodayView: View {
     @State private var historicalDate: Date?
     @State private var historicalResponse: TodayResponse?
     @State private var isHistoricalLoading = false
+    /// Why a past day could not be shown. Said out loud: falling back to today in
+    /// silence once hid a decoding break for hours behind a stale cached screen.
+    @State private var historicalError: String?
 
     private var isHistorical: Bool { historicalResponse != nil }
     private var activeResponse: TodayResponse? { historicalResponse ?? store.response }
@@ -90,6 +93,13 @@ struct TodayView: View {
                 await reload()
             }
         }
+        .alert("Não deu para abrir esse dia",
+               isPresented: Binding(get: { historicalError != nil },
+                                    set: { if !$0 { historicalError = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(historicalError ?? "")
+        }
         .sheet(isPresented: $showCalendar) {
             NavigationStack {
                 DatePicker("Data", selection: $pickerDate,
@@ -152,6 +162,7 @@ struct TodayView: View {
                 historicalResponse = try await APIClient.shared.today(date: iso)
             } catch {
                 backToToday()
+                historicalError = error.localizedDescription
             }
             isHistoricalLoading = false
         }

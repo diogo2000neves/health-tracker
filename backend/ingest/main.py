@@ -3035,6 +3035,10 @@ def _today_meals_out(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "time": when[11:16],
             "foods": _display_foods(items, str(row.get("foods") or "").strip()),
             "note": str(row.get("note") or "").strip(),
+            # Retired, but app builds from before 2026-09-25 decode it as REQUIRED:
+            # dropping it made every /today they fetched fail to decode, which they
+            # show as stale cached data and "past days bounce back to today".
+            "template": "",
             "photo_url": str(row.get("photo_url") or "").strip(),
             "edited": bool(str(row.get("edited_at") or "").strip()),
             "confidence": _round_num(row.get("confidence"), 2),
@@ -4418,6 +4422,7 @@ def meals():
             "time": when[11:16],  # "HH:MM" off the ISO string
             "foods": _display_foods(items, str(r.get("foods") or "").strip()),
             "note": str(r.get("note") or "").strip(),
+            "template": "",  # retired; kept for older clients, see _today_meals_out
             **{k: _round_num(r.get(k)) for k in meal_library.MACRO_KEYS},
         })
     meals_out.sort(key=lambda m: m["datetime"])
